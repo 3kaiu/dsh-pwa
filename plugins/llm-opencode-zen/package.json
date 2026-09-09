@@ -1,0 +1,35 @@
+{
+  "name": "@dsh-pwa/llm-opencode-zen",
+  "version": "1.0.0",
+  "description": "OpenCode Zen free models adapter for DeepSeek Harness (lightweight, modernized for dsh@next)",
+  "type": "module",
+  "main": "dist/index.js",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "node build.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-llm": "next",
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/schemastery": "^3.18.1",
+    "eventsource-parser": "^3.1.1"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.2",
+    "typescript": "^5.7.2"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "opencode-zen",
+    "llm",
+    "plugin"
+  ],
+  "license": "MIT"
+}
