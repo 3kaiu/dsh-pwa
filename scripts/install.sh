@@ -5,7 +5,9 @@ set -euo pipefail
 # 升级:  重跑本脚本即自动跟随上游最新(已安装版本不变则跳过)
 # 环境:  DSH_RT_HOME DSH_RT_STATE DSH_HOME DSH_RT_PORT(默认 3080)
 #        DSH_INSTALL_NO_AGENT(不注册守护,测试用) DSH_RT_NO_SYSTEM_NODE(强制装自带 node LTS)
+#        DSH_RT_RELEASE_TAG(固定版本,如 v1.0.0;不设则用 latest)
 START_TS="$(date +%s)"
+RELEASE_TAG="${DSH_RT_RELEASE_TAG:-latest}"
 
 # 进度输出:仅 TTY 时着色;管道/重定向退化为纯文本,curl 进度条同步切换
 if [ -t 1 ]; then
@@ -22,23 +24,39 @@ echo "  ${D}github.com/3kaiu/dsh-pwa${R}"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 # 仓库内运行(scripts/install.sh)时回溯到仓库根;发行包内运行时本身就是包根
 [ -d "$ROOT/../scripts" ] && ROOT="$(cd "$ROOT/.." && pwd)"
-# curl ... | bash 场景:无本地伴随文件 → 自动下载最新发行包到临时目录(无需手动下载)
+# curl ... | bash 场景:无本地伴随文件 → 自动下载发行包到临时目录(无需手动下载)
 if [ ! -f "$ROOT/src/daemon.c" ] && [ ! -f "$ROOT/daemon" ]; then
-  h1 "自动下载发行包(releases/latest)"
+  h1 "自动下载发行包(releases/${RELEASE_TAG})"
   PKG_TMP="$(mktemp -d /tmp/dsh-pwa.XXXXXX)"
-  curl -fsSL --max-time 300 -o "$PKG_TMP/pkg.zip" \
-    "https://github.com/3kaiu/dsh-pwa/releases/latest/download/dsh-pwa.zip" \
-    || { echo "发行包下载失败(仓库尚无 release?)" >&2; exit 1; }
+  DL_URL="https://github.com/3kaiu/dsh-pwa/releases/${RELEASE_TAG}/download/dsh-pwa.zip"
+  SHA_URL="https://github.com/3kaiu/dsh-pwa/releases/${RELEASE_TAG}/download/dsh-pwa.zip.sha256"
+  
+  # 下载发行包 + SHA256
+  curl -fsSL --max-time 300 -o "$PKG_TMP/pkg.zip" "$DL_URL" \
+    || { echo "发行包下载失败(${DL_URL})" >&2; exit 1; }
+  curl -fsSL --max-time 60 -o "$PKG_TMP/pkg.zip.sha256" "$SHA_URL" 2>/dev/null \
+    || { warn "SHA256 校验文件缺失,发行包完整性无法验证"; rm -f "$PKG_TMP/pkg.zip"; exit 1; }
+  
+  # 校验 fail-closed:不通过则中止
+  ( cd "$PKG_TMP" && shasum -a 256 -c pkg.zip.sha256 >/dev/null 2>&1 ) \
+    || { warn "发行包 SHA-256 校验失败"; rm -rf "$PKG_TMP"; exit 1; }
+  
   KB="$(awk -v n="$(stat -f%z "$PKG_TMP/pkg.zip")" 'BEGIN{printf "%.1f", n/1024}')"
   ( cd "$PKG_TMP" && unzip -q pkg.zip )
-  rm -f "$PKG_TMP/pkg.zip"
+  rm -f "$PKG_TMP/pkg.zip" "$PKG_TMP/pkg.zip.sha256"
   ROOT="$PKG_TMP"
-  ok "发行包 ${KB} KB 下载解压完成"
+  ok "发行包 ${KB} KB 下载解压完成(SHA-256 校验通过)"
 fi
 RT_HOME="${DSH_RT_HOME:-$HOME/.local/share/dsh-runtime}"
 RT_STATE="${DSH_RT_STATE:-$HOME/.local/state/dsh-runtime}"
 DSH_HOME="${DSH_HOME:-$HOME/.dsh}"
-PORT="${DSH_RT_PORT:-3080}"
+PORT_RAW="${DSH_RT_PORT:-3080}"
+# 端口校验:只接受 1024-65535,拒绝特权端口/无效值(防止配置注入)
+if ! [[ "$PORT_RAW" =~ ^[0-9]+$ ]] || [ "$PORT_RAW" -lt 1024 ] || [ "$PORT_RAW" -gt 65535 ]; then
+  echo "DSH_RT_PORT 无效(需 1024-65535 的整数):$PORT_RAW" >&2
+  exit 1
+fi
+PORT="$PORT_RAW"
 LOG_DIR="$RT_STATE/logs"
 NODE_DIR="$RT_HOME/node"
 APP_DIR="$RT_HOME/app"
@@ -130,27 +148,107 @@ else
   fi
 fi
 
-# ---------- 2) dsh:npm 官方 @deepseek-ai/dsh@latest(已装且同版则跳过) ----------
-h1 "2) dsh(@deepseek-ai/dsh@latest)"
-LATEST="$(curl -fsS --max-time 15 https://registry.npmjs.org/@deepseek-ai/dsh/latest 2>/dev/null \
-  | python3 -c 'import json,sys;print(json.load(sys.stdin)["version"])' 2>/dev/null || true)"
+# ---------- 2) dsh + daemon 并行安装(节省 3-5 秒) ----------
+h1 "2) dsh(@deepseek-ai/dsh@next)"
+# pnpm:内容寻址存储 + 硬链接 → 升级只拉差异、node_modules 体积小、安装快。
+# 用 npm exec 按需引导(复用上文确定的 NPM_BIN,不污染系统;pnpm@10 大版本固定)。
+npx_pnpm() { "$NPM_BIN" exec --yes --package=pnpm@10 -- pnpm "$@"; }
+PNPM_STORE="$RT_HOME/.pnpm-store"
+# 自动跟随上游 next 标签(dsh 官方开发分支,比 latest 稳定)
+# 可通过 DSH_VERSION 环境变量覆盖回退到已知版本(如 DSH_VERSION=0.1.1-rc.2 bash install.sh)
+DSH_VERSION="${DSH_VERSION:-next}"
+LATEST="$DSH_VERSION"
 CUR_DSH="$("$NODE_BIN" -e 'console.log(require(process.argv[1]).version)' "$DSH_PKG" 2>/dev/null || true)"
-if [ -n "$LATEST" ] && [ "$CUR_DSH" != "$LATEST" ] || [ -z "$CUR_DSH" ]; then
-  # 装显式版本号,绕开 npm 本地缓存把 latest 解析成旧版
-  printf '{"name":"dsh-runtime-app","private":true,"dependencies":{"@deepseek-ai/dsh":"%s"}}\n' "${LATEST:-latest}" > "$APP_DIR/package.json"
-  # 发行包含预解析的 package-lock.json → npm install 跳过依赖解析,省 30~60s
-  [ -f "$ROOT/package-lock.json" ] && cp "$ROOT/package-lock.json" "$APP_DIR/"
-  # npm 自带进度/报错,无需额外包装;同时去除 python3 硬依赖(全新 macOS 无 python3 会卡安装)
-  echo "  ${D}npm install dsh@${LATEST:-latest}(451 个依赖,首次约 3~10 分钟视网络)${R}"
-  NPM_START="$SECONDS"
-  if ! PATH="$NODE_DIR/bin:$PATH" NODE_OPTIONS="--max-old-space-size=4096" "$NPM_BIN" install --prefer-offline --no-audit --no-fund --prefix "$APP_DIR"; then
-    warn "dsh 安装失败"
-    exit 1
+
+# 检查是否需要编译 daemon (用于并行决策)
+NEED_COMPILE_DAEMON=0
+if [ -f "$ROOT/src/daemon.c" ] && command -v clang >/dev/null && [ ! -x "$ROOT/daemon" ]; then
+  SRC_MD5="$(md5 -q "$ROOT/src/daemon.c" 2>/dev/null || true)"
+  if [ ! -x "$RT_HOME/daemon" ] || [ "$SRC_MD5" != "$(cat "$RT_HOME/.daemon.md5" 2>/dev/null || true)" ]; then
+    NEED_COMPILE_DAEMON=1
   fi
-  ok "npm install 完成($(( SECONDS - NPM_START ))s)"
-  # 剪除 sourcemap/文档/测试(运行时永不加载,纯占空间)
-  find "$APP_DIR/node_modules" \( -name "*.map" -o -name "*.md" -o -name ".DS_Store" \) -delete 2>/dev/null || true
-  find "$APP_DIR/node_modules" -type d \( -name test -o -name tests -o -name __tests__ \) -exec rm -rf {} + 2>/dev/null || true
+fi
+
+if [ -n "$LATEST" ] && [ "$CUR_DSH" != "$LATEST" ] || [ -z "$CUR_DSH" ]; then
+  printf '{"name":"dsh-runtime-app","private":true,"dependencies":{"@deepseek-ai/dsh":"%s"},"pnpm":{"onlyBuiltDependencies":["node-pty","koffi","@deepseek-ai/dsh-subprocess-local"]}}\n' "${LATEST:-latest}" > "$APP_DIR/package.json"
+  [ -f "$ROOT/pnpm-lock.yaml" ] && cp "$ROOT/pnpm-lock.yaml" "$APP_DIR/"
+  
+  NPM_START="$SECONDS"
+  if [ -z "$CUR_DSH" ] || [ -n "${DSH_RT_FORCE_REINSTALL:-}" ]; then
+    # 首次安装或强制重装
+    echo "  ${D}pnpm install dsh@${LATEST:-latest}(首次约 1~5 分钟视网络)${R}"
+    NPM_CMD="install"; NPM_TARGET=""
+  else
+    # 增量升级 (仅下载变化的包)
+    echo "  ${D}增量升级 dsh: $CUR_DSH → ${LATEST} (pnpm 仅拉差异包)${R}"
+    NPM_CMD="update"; NPM_TARGET="@deepseek-ai/dsh"
+  fi
+  NPM_START="$SECONDS"
+  
+  # 并行启动 npm 操作和 daemon 编译
+  if [ "$NEED_COMPILE_DAEMON" = "1" ]; then
+    echo "  ${D}同时编译 daemon (并行优化)...${R}"
+    (
+      clang -O2 -Wall -Wextra -arch arm64 -arch x86_64 -o "$RT_HOME/daemon.tmp" "$ROOT/src/daemon.c" 2>"$RT_HOME/.daemon.build.log" \
+        && mv "$RT_HOME/daemon.tmp" "$RT_HOME/daemon" \
+        && echo "$SRC_MD5" > "$RT_HOME/.daemon.md5"
+    ) &
+    DAEMON_PID=$!
+  fi
+  
+  # npm install/update (主进程等待)
+  if ! PATH="$NODE_DIR/bin:$PATH" NODE_OPTIONS="--max-old-space-size=4096" npx_pnpm \
+       --dir "$APP_DIR" --store-dir "$PNPM_STORE" $NPM_CMD $NPM_TARGET --prefer-offline; then
+    # 如果是 update 失败,尝试回退到全量 install
+    if [ "$NPM_CMD" = "update" ]; then
+      warn "增量升级失败,回退到全量重装..."
+      rm -rf "$APP_DIR/node_modules" "$APP_DIR/pnpm-lock.yaml"
+      if ! PATH="$NODE_DIR/bin:$PATH" NODE_OPTIONS="--max-old-space-size=4096" npx_pnpm \
+           --dir "$APP_DIR" --store-dir "$PNPM_STORE" install --prefer-offline; then
+        [ -n "${DAEMON_PID:-}" ] && kill $DAEMON_PID 2>/dev/null || true
+        warn "dsh 安装失败"
+        exit 1
+      fi
+    else
+      [ -n "${DAEMON_PID:-}" ] && kill $DAEMON_PID 2>/dev/null || true
+      warn "dsh 安装失败"
+      exit 1
+    fi
+  fi
+  ok "完成($(( SECONDS - NPM_START ))s)"
+  
+  # 等待 daemon 编译完成
+  if [ -n "${DAEMON_PID:-}" ]; then
+    if wait $DAEMON_PID 2>/dev/null; then
+      ok "daemon 编译完成(并行)"
+    else
+      warn "daemon 并行编译失败,稍后将重试"
+      rm -f "$RT_HOME/daemon" "$RT_HOME/.daemon.md5"
+    fi
+  fi
+  
+  # 深度清理 node_modules
+  if [ -f "$ROOT/scripts/cleanup-deps.sh" ]; then
+    echo "  ${D}清理跨平台冗余文件...${R}"
+    bash "$ROOT/scripts/cleanup-deps.sh" "$APP_DIR" 2>/dev/null || true
+    
+    # 验证探针：确保清理未破坏运行时原生依赖(在 APP_DIR 内解析,sharp 为主包)
+    echo "  ${D}验证关键依赖完整性...${R}"
+    if ! ( cd "$APP_DIR" && "$NODE_BIN" -e "require('sharp'); require('node-pty')" >/dev/null 2>&1 ); then
+      warn "依赖验证失败（sharp/node-pty），回退重装"
+      rm -rf "$APP_DIR/node_modules"
+      if ! PATH="$NODE_DIR/bin:$PATH" NODE_OPTIONS="--max-old-space-size=4096" npx_pnpm \
+           --dir "$APP_DIR" --store-dir "$PNPM_STORE" install --prefer-offline; then
+        warn "回退重装失败"; exit 1
+      fi
+    else
+      ok "关键原生依赖验证通过 (sharp/node-pty)"
+    fi
+  else
+    find "$APP_DIR/node_modules" \( -name "*.map" -o -name "*.md" -o -name ".DS_Store" \) -delete 2>/dev/null || true
+    find "$APP_DIR/node_modules" -type d \( -name test -o -name tests -o -name __tests__ \) -exec rm -rf {} + 2>/dev/null || true
+  fi
+  
   CUR_DSH="$("$NODE_BIN" -e 'console.log(require(process.argv[1]).version)' "$DSH_PKG")"
   ok "dsh $CUR_DSH 安装完成"
 else
@@ -223,6 +321,19 @@ if [ -z "${DSH_INSTALL_NO_AGENT:-}" ]; then
     ok "com.dshpwa.daemon 已注册并启动"
   else
     warn "缺少 plist 模板,未注册守护"
+  fi
+  
+  # 注册自动更新器(定时任务,每天凌晨 2:30)
+  UPDATER_TPL="$ROOT/launchd/com.dshpwa.updater.plist"
+  if [ -f "$UPDATER_TPL" ] && [ ! "${DSH_RT_NO_AUTO_UPDATE:-}" ]; then
+    UPDATER="$AGENT_DIR/com.dshpwa.updater.plist"
+    sed -e "s|__HOME__|$HOME|g" \
+        -e "s|__RT_HOME__|$RT_HOME|g" \
+        -e "s|__RT_STATE__|$RT_STATE|g" \
+        -e "s|__LOG_DIR__|$LOG_DIR|g" "$UPDATER_TPL" > "$UPDATER"
+    launchctl bootstrap "gui/$(id -u)" "$UPDATER" 2>/dev/null \
+      || launchctl enable "gui/$(id -u)/com.dshpwa.updater" 2>/dev/null || true
+    ok "com.dshpwa.updater 已注册(每天凌晨 2:30 自动检查更新)"
   fi
 else
   ok "跳过(DSH_INSTALL_NO_AGENT)"

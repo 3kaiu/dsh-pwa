@@ -16,30 +16,47 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-      - name: 编译守护(arm64,ad-hoc 签名)
-        run: clang -O2 -Wall -Wextra -o /tmp/daemon src/daemon.c && codesign --force -s - /tmp/daemon
-      - name: 生成 package-lock.json(预解析依赖树,用户安装跳过解析省 30~60s)
+      - name: 编译守护(universal binary,ad-hoc 签名)
+        run: clang -O2 -Wall -Wextra -arch arm64 -arch x86_64 -o /tmp/daemon src/daemon.c && codesign --force -s - /tmp/daemon
+      - name: 生成 pnpm-lock.yaml(预解析依赖树,用户安装跳解析省时;与 install.sh 同配置)
         run: |
-          LATEST=$(npm view @deepseek-ai/dsh version 2>/dev/null || echo "latest")
+          # 自动跟随上游 next 标签(dsh 官方开发分支)
+          DSH_VERSION="${DSH_VERSION:-next}"
+          npm i -g pnpm@10 >/dev/null 2>&1
           mkdir -p /tmp/dsh-lock
-          echo '{"dependencies":{"@deepseek-ai/dsh":"'$LATEST'"}}' > /tmp/dsh-lock/package.json
-          cd /tmp/dsh-lock && npm install --package-lock-only --no-audit --no-fund --loglevel=error
+          printf '{"name":"dsh-lock","private":true,"dependencies":{"@deepseek-ai/dsh":"%s"},"pnpm":{"onlyBuiltDependencies":["node-pty","koffi","@deepseek-ai/dsh-subprocess-local"]}}\n' "$DSH_VERSION" > /tmp/dsh-lock/package.json
+          cd /tmp/dsh-lock && pnpm install --lockfile-only --ignore-scripts --loglevel=error
           mkdir -p /tmp/pkg
-          cp /tmp/dsh-lock/package-lock.json /tmp/pkg/package-lock.json
-      - name: 打包(install.sh + daemon + daemon.c + plist + lock)
+          cp /tmp/dsh-lock/pnpm-lock.yaml /tmp/pkg/pnpm-lock.yaml
+      - name: 检查 lock 差异(依赖树变化预警)
         run: |
-          mkdir -p /tmp/pkg/launchd
+          if [ -f pnpm-lock.yaml ] && ! diff -q pnpm-lock.yaml /tmp/pkg/pnpm-lock.yaml >/dev/null 2>&1; then
+            echo "⚠️ pnpm-lock.yaml 有变化,请检查 dsh 依赖树更新"
+            echo "--- 当前仓库版本 ---"
+            head -20 pnpm-lock.yaml || true
+            echo "--- 新生成版本 ---"
+            head -20 /tmp/pkg/pnpm-lock.yaml || true
+            echo "Diff 摘要:"
+            diff -u pnpm-lock.yaml /tmp/pkg/pnpm-lock.yaml | head -50 || true
+          else
+            echo "✓ pnpm-lock.yaml 无变化"
+          fi
+      - name: 打包(install.sh + daemon + daemon.c + plist + lock + cleanup)
+        run: |
+          mkdir -p /tmp/pkg/launchd /tmp/pkg/scripts
           cp /tmp/daemon /tmp/pkg/daemon
           cp scripts/install.sh /tmp/pkg/install.sh
+          cp scripts/cleanup-deps.sh /tmp/pkg/scripts/cleanup-deps.sh
           cp src/daemon.c /tmp/pkg/daemon.c
           cp launchd/com.dshpwa.daemon.plist /tmp/pkg/launchd/
           cd /tmp/pkg && zip -qr dsh-pwa.zip .
+          shasum -a 256 dsh-pwa.zip > dsh-pwa.zip.sha256
       - name: 发布到 GitHub Releases(下载链接)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" /tmp/pkg/dsh-pwa.zip \
+          gh release create "${{ github.ref_name }}" /tmp/pkg/dsh-pwa.zip /tmp/pkg/dsh-pwa.zip.sha256 \
             --repo "$GITHUB_REPOSITORY" \
             --title "dsh-pwa ${{ github.ref_name }}" \
             --notes-file "$GITHUB_WORKSPACE/.github/RELEASE_NOTES.md" \
-            || gh release upload "${{ github.ref_name }}" /tmp/pkg/dsh-pwa.zip --repo "$GITHUB_REPOSITORY" --clobber
+            || gh release upload "${{ github.ref_name }}" /tmp/pkg/dsh-pwa.zip /tmp/pkg/dsh-pwa.zip.sha256 --repo "$GITHUB_REPOSITORY" --clobber

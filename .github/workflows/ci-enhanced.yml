@@ -1,0 +1,115 @@
+name: CI Enhanced
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: 编译 + 冒烟测试
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: 编译守护进程 (universal binary)
+        run: |
+          clang -O2 -Wall -Wextra -Werror \
+            -arch arm64 -arch x86_64 \
+            -o /tmp/daemon src/daemon.c
+      
+      - name: 代码签名
+        run: codesign --force -s - /tmp/daemon
+      
+      - name: 验证二进制架构
+        run: |
+          file /tmp/daemon
+          lipo -info /tmp/daemon
+          stat -f%z /tmp/daemon
+      
+      - name: 一键安装冒烟测试
+        run: bash scripts/smoke-test.sh
+      
+      - name: 安全验证套件
+        run: bash tests/security-verification.sh
+
+  static-analysis:
+    name: 静态分析
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Shellcheck (Bash 脚本检查)
+        run: |
+          brew install shellcheck
+          shellcheck scripts/*.sh tests/*.sh || true
+      
+      - name: Clang Static Analyzer
+        run: |
+          clang --analyze \
+            -Xanalyzer -analyzer-output=text \
+            -Wall -Wextra \
+            src/daemon.c 2>&1 | tee static-analysis.log || true
+      
+      - name: 上传分析结果
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: static-analysis
+          path: static-analysis.log
+
+  performance:
+    name: 性能基准
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: 安装依赖
+        run: brew install hyperfine
+      
+      - name: 编译并安装守护进程
+        run: |
+          clang -O2 -Wall -Wextra -Werror \
+            -arch arm64 -arch x86_64 \
+            -o /tmp/daemon src/daemon.c
+          mkdir -p ~/.local/share/dsh-runtime
+          cp /tmp/daemon ~/.local/share/dsh-runtime/daemon
+          codesign --force -s - ~/.local/share/dsh-runtime/daemon
+      
+      - name: 启动守护进程 (冒烟测试)
+        run: bash scripts/smoke-test.sh
+      
+      - name: 性能基准测试
+        run: bash scripts/benchmark.sh || true
+      
+      - name: 上传基准结果
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: performance-benchmark
+          path: /tmp/benchmark-*.md
+
+  binary-analysis:
+    name: 二进制分析
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: 编译守护进程
+        run: |
+          clang -O2 -Wall -Wextra -Werror \
+            -arch arm64 -arch x86_64 \
+            -o /tmp/daemon src/daemon.c
+      
+      - name: 二进制体积分析
+        run: bash scripts/analyze-binary.sh /tmp/daemon
+      
+      - name: 检查体积回归
+        run: |
+          SIZE=$(stat -f%z /tmp/daemon)
+          SIZE_KB=$((SIZE / 1024))
+          echo "Binary size: ${SIZE_KB} KB"
+          if [ "$SIZE_KB" -gt 90 ]; then
+            echo "::warning::Binary size increased to ${SIZE_KB} KB (expected <90KB)"
+          fi

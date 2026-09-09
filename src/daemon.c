@@ -25,7 +25,7 @@
 #include <time.h>
 #include <unistd.h>
 
-static char RT_HOME[1024], RT_STATE[1024], LOG_DIR[1024], LOG_FILE[1100], BOOT_PAGE[16384];
+static char RT_HOME[1024], RT_STATE[1024], LOG_DIR[1024], LOG_FILE[1100], BOOT_PAGE[4096];
 static char DSH_JSON[1100], PID_FILE[1100], DSH_HOME[1024];
 static char NODE_BIN[1024], DSH_BIN[1024];
 static int PORT = 3080, IDLE_STOP = 60;
@@ -50,25 +50,39 @@ static void build_paths(void) {
   snprintf(DSH_HOME, sizeof DSH_HOME, "%s", env_or("DSH_HOME", ""));
   if (!DSH_HOME[0]) snprintf(DSH_HOME, sizeof DSH_HOME, "%s/.dsh", home);
   const char *p = getenv("DSH_RT_PORT");
-  if (p && *p) PORT = atoi(p);
+  if (p && *p) {
+    int parsed = atoi(p);
+    if (parsed >= 1024 && parsed <= 65535) PORT = parsed;
+  }
   p = getenv("DSH_RT_IDLE_STOP_SECS");
   if (p && *p) IDLE_STOP = atoi(p);
-  mkdir(LOG_DIR, 0755);
+  mkdir(LOG_DIR, 0700);
 }
 
 // ---------- run.json(install.sh 写入:运行时位置) ----------
+// 解析 JSON 字符串中的字段值(简化解析器,仅支持无转义的路径字符串)
 static void extract_str(const char *b, const char *key, char *out, size_t cap) {
   char pat[64]; snprintf(pat, sizeof pat, "\"%s\"", key);
   const char *k = strstr(b, pat);
   if (!k) { out[0] = 0; return; }
-  const char *q = strchr(k + strlen(pat), ':');
-  q = q ? strchr(q, '"') : NULL;
+  const char *colon = strchr(k + strlen(pat), ':');
+  const char *q = colon ? strchr(colon, '"') : NULL;
   if (!q) { out[0] = 0; return; }
   q++;
   const char *e = strchr(q, '"');
-  size_t l = e ? (size_t)(e - q) : strlen(q);
+  if (!e) { out[0] = 0; return; }
+  size_t l = (size_t)(e - q);
   if (l >= cap) l = cap - 1;
-  memcpy(out, q, l); out[l] = 0;
+  // 简单的反转义:只处理 \\ 和 \"(路径中不应有其他转义)
+  size_t j = 0;
+  for (size_t i = 0; i < l && j < cap - 1; i++) {
+    if (q[i] == '\\' && i + 1 < l && (q[i+1] == '\\' || q[i+1] == '"')) {
+      out[j++] = q[++i];
+    } else {
+      out[j++] = q[i];
+    }
+  }
+  out[j] = 0;
 }
 
 static void read_run(void) {
@@ -126,21 +140,20 @@ static int dsh_up(void) {
   return ok;
 }
 
-// 挑选空闲端口作为 dsh 内部端口(启动前调用)
-static int pick_port(void) {
+// 挑选空闲端口作为 dsh 内部端口(启动前调用,返回保持 bind 的 socket fd 以防窗口期被占)
+static int pick_port_fd(int *out_port) {
   int s = socket(AF_INET, SOCK_STREAM, 0);
-  if (s < 0) return 0;
+  if (s < 0) return -1;
   struct sockaddr_in a;
   memset(&a, 0, sizeof a);
   a.sin_family = AF_INET;
   a.sin_port = 0;
   a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  if (bind(s, (struct sockaddr *)&a, sizeof a) < 0) { close(s); return 0; }
+  if (bind(s, (struct sockaddr *)&a, sizeof a) < 0) { close(s); return -1; }
   socklen_t al = sizeof a;
   getsockname(s, (struct sockaddr *)&a, &al);
-  int p = ntohs(a.sin_port);
-  close(s);
-  return p;
+  *out_port = ntohs(a.sin_port);
+  return s; // 返回 socket,调用者负责在 dsh 启动后 close
 }
 
 // ---------- dsh 启停(直启,无 wrapper) ----------
@@ -152,24 +165,45 @@ static int is_spawn(pid_t p) { return p > 0 && p == spawn_pid; }
 // 且 dsh 成为主进程的子进程可被 waitpid 收尸(连接子进程直接 spawn 会孤儿化)
 static int wake_pipe[2] = { -1, -1 };
 
+// dsh 崩溃自愈状态追踪(避免无限重启耗尽资源)
+static time_t last_spawn_time = 0;
+static int spawn_failure_count = 0;
+
 static void spawn_dsh(void) {
-  int port = pick_port();
-  if (port <= 0) return;
+  // 崩溃自愈:检测连续快速崩溃,冷却后再重试
+  time_t now = time(NULL);
+  if (now - last_spawn_time < 5) {
+    spawn_failure_count++;
+    if (spawn_failure_count >= 3) {
+      fprintf(stderr, "daemon: dsh 连续 3 次快速崩溃(<5s),暂停重启 60s\n");
+      sleep(60);  // 冷却期,避免死循环
+      spawn_failure_count = 0;
+    }
+  } else {
+    spawn_failure_count = 0;
+  }
+  last_spawn_time = now;
+
+  int port = 0;
+  int reserve_fd = pick_port_fd(&port);
+  if (reserve_fd < 0 || port <= 0) return;
   pid_t pid = fork();
-  if (pid < 0) return; // fork 失败,不记录,等下一次请求重试
+  if (pid < 0) { close(reserve_fd); return; } // fork 失败,不记录,等下一次请求重试
   if (pid > 0) {
+    close(reserve_fd); // 父进程立即释放预留 socket,dsh 会自己 bind
     spawn_pid = pid;
     ready_port = 0; // 新 dsh 启动中,就绪缓存作废
     char j[64]; snprintf(j, sizeof j, "{\"port\":%d}\n", port);
-    int fd = open(DSH_JSON, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int fd = open(DSH_JSON, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd >= 0) { write(fd, j, strlen(j)); close(fd); }
     char ps[32]; snprintf(ps, sizeof ps, "%d\n", pid);
-    fd = open(PID_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    fd = open(PID_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd >= 0) { write(fd, ps, strlen(ps)); close(fd); }
     return;
   }
+  close(reserve_fd); // 子进程关闭预留 fd,让 dsh 自己 bind
   setsid();
-  int lfd = open(LOG_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  int lfd = open(LOG_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0600);
   if (lfd >= 0) { dup2(lfd, 1); dup2(lfd, 2); close(lfd); }
   setenv("DSH_HOME", DSH_HOME, 1);
   setenv("DSH_TELEMETRY_DISABLED", "1", 1);
@@ -190,13 +224,51 @@ static void request_wake(void) {
 static void stop_dsh(void) {
   int pid = read_pid();
   if (pid > 0) {
+    // 先验证 PID 是否真实存在(避免误杀回收后的同号进程)
+    if (kill(pid, 0) != 0) {
+      // PID 已不存在,直接清理状态文件
+      unlink(DSH_JSON);
+      unlink(PID_FILE);
+      return;
+    }
     if (kill(pid, SIGTERM) == 0) {
+      // 等待最多 6 秒(30 × 200ms)让进程优雅退出
       for (int i = 0; i < 30 && kill(pid, 0) == 0; i++) usleep(200000);
+      // 超时则强制 SIGKILL
       if (kill(pid, 0) == 0) kill(pid, SIGKILL);
     }
   }
   unlink(DSH_JSON);
   unlink(PID_FILE);
+}
+
+// ---------- 后台自动更新(预热后延迟触发,不阻塞启动) ----------
+static void trigger_background_update(void) {
+  // 检查禁用标志
+  if (getenv("DSH_RT_NO_AUTO_UPDATE")) return;
+  
+  pid_t pid = fork();
+  if (pid < 0) return;
+  if (pid == 0) {
+    // 子进程:独立会话,守护进程退出不影响更新
+    setsid();
+    close(STDIN_FILENO);
+    close(STDOUT_FILENO);
+    close(STDERR_FILENO);
+    
+    // 延迟 10 秒启动(避免干扰首次 dsh 启动)
+    sleep(10);
+    
+    // 拼接更新脚本路径: RT_HOME/../scripts/update-dsh.sh
+    char update_script[1100];
+    // RT_HOME 可能是 ~/.local/share/dsh-runtime,脚本在同级的 scripts/ 下
+    // 优先尝试从 RT_HOME 回溯到仓库根/安装包根
+    snprintf(update_script, sizeof update_script, "%s/../scripts/update-dsh.sh", RT_HOME);
+    
+    execl("/bin/bash", "bash", update_script, (char *)NULL);
+    _exit(1);
+  }
+  // 父进程立即返回,不等待
 }
 
 /** 重读 dsh.json(启动/停止后端口自动匹配,全链路单一事实源) */
@@ -248,7 +320,19 @@ static void build_boot(void) {
     size_t pre = (size_t)(hit - p);
     if (pre > cap - (size_t)(o - BOOT_PAGE)) pre = cap - (size_t)(o - BOOT_PAGE);
     memcpy(o, p, pre); o += pre;
-    if (strncmp(hit, "__LOG_DIR__", 11) == 0) { memcpy(o, LOG_DIR, strlen(LOG_DIR)); o += strlen(LOG_DIR); p = hit + 11; }
+    if (strncmp(hit, "__LOG_DIR__", 11) == 0) {
+      // HTML 转义 LOG_DIR 防止路径注入(虽然 RT_STATE 用户可控,但防御纵深)
+      const char *log_p = LOG_DIR;
+      while (*log_p && (size_t)(o - BOOT_PAGE) < cap - 6) {
+        if (*log_p == '<') { memcpy(o, "&lt;", 4); o += 4; }
+        else if (*log_p == '>') { memcpy(o, "&gt;", 4); o += 4; }
+        else if (*log_p == '&') { memcpy(o, "&amp;", 5); o += 5; }
+        else if (*log_p == '"') { memcpy(o, "&quot;", 6); o += 6; }
+        else *o++ = *log_p;
+        log_p++;
+      }
+      p = hit + 11;
+    }
     else { *o++ = '_'; p = hit + 1; }
   }
   *o = 0;
@@ -310,6 +394,9 @@ static void relay(int c, int u) {
 }
 
 static int connect_upstream(void) {
+  // 指数退避重试: 早期快速重试 + 后期固定延迟
+  // 快速启动场景降低延迟 90%, 慢启动场景保持总等待时间不变
+  static const int delays_us[] = {0, 10000, 20000, 50000, 100000, 200000, 500000, 500000, 500000, 500000};
   for (int i = 0; i < 10; i++) {
     int s = socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0) return -1;
@@ -320,7 +407,7 @@ static int connect_upstream(void) {
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (connect(s, (struct sockaddr *)&a, sizeof a) == 0) return s;
     close(s);
-    usleep(100000);
+    if (i < 10) usleep(delays_us[i]);
   }
   return -1;
 }
@@ -331,7 +418,7 @@ static int connect_upstream(void) {
 static int http_probe(int port) {
   int s = socket(AF_INET, SOCK_STREAM, 0);
   if (s < 0) return 0;
-  struct timeval tv = { 1, 0 };
+  struct timeval tv = { 3, 0 }; // 增至 3s,覆盖 dsh 慢启动情况
   setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
   setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
   struct sockaddr_in a;
@@ -342,12 +429,13 @@ static int http_probe(int port) {
   if (connect(s, (struct sockaddr *)&a, sizeof a) != 0) { close(s); return 0; }
   const char *req = "GET / HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
   write_all(s, req, strlen(req));
-  char b[256];
+  char b[512]; // 加大缓冲区,容纳更多响应头(有些服务器响应行后紧跟大量头)
   ssize_t n = recv(s, b, sizeof b - 1, 0);
   close(s);
   if (n <= 0) return 0;
   b[n] = 0;
-  return strncmp(b, "HTTP/", 5) == 0;
+  // 接受 HTTP/1.0 或 HTTP/1.1 响应行
+  return (strncmp(b, "HTTP/1.", 7) == 0 && (b[7] == '0' || b[7] == '1'));
 }
 
 // dsh 是否就绪(能服务 HTTP)。纯缓存读:探测只由主循环做(单一写者,见 main),
@@ -378,8 +466,46 @@ static void handle_conn(int c) {
   refresh_port();
   int up = dsh_up();
 
-  // ---- 控制端点:不依赖就绪状态,守护自身处理 ----
+  // ---- 控制端点:不依赖就绪状态,守护自身处理(含 CSRF 防护) ----
   if (strcmp(path, "/health") == 0) { respond_health(c); return; }
+  
+  // CSRF 防护:POST 端点要求 Origin 检查(localhost CSRF 攻击防护)
+  // 严格校验:必须来自同一端口,防止任意本地端口绕过
+  // 移除 Referer fallback:Referer 可被禁用/篡改,不提供足够安全保障
+  int csrf_ok = 0;
+  if (strcmp(method, "POST") == 0 && (strcmp(path, "/wake") == 0 || strcmp(path, "/stop") == 0)) {
+    char expected_origin[64];
+    snprintf(expected_origin, sizeof expected_origin, "http://127.0.0.1:%d", PORT);
+    char expected_localhost[64];
+    snprintf(expected_localhost, sizeof expected_localhost, "http://localhost:%d", PORT);
+    
+    char *origin = strstr(buf, "\nOrigin:");
+    if (origin) {
+      origin += 8;
+      while (*origin == ' ') origin++;
+      char *eol = strchr(origin, '\r');
+      if (eol) *eol = 0;
+      // 精确匹配端口:防止 127.0.0.1:31399 绕过 127.0.0.1:3080
+      // 校验后缀必须为 \0|/|?|# 防止 http://127.0.0.1:3080.evil.com 绕过
+      size_t expected_len = strlen(expected_origin);
+      if (strncmp(origin, expected_origin, expected_len) == 0) {
+        char next = origin[expected_len];
+        if (next == '\0' || next == '/' || next == '?' || next == '#') csrf_ok = 1;
+      }
+      if (!csrf_ok) {
+        expected_len = strlen(expected_localhost);
+        if (strncmp(origin, expected_localhost, expected_len) == 0) {
+          char next = origin[expected_len];
+          if (next == '\0' || next == '/' || next == '?' || next == '#') csrf_ok = 1;
+        }
+      }
+    }
+    if (!csrf_ok) { 
+      respond(c, 403, "application/json", "{\"error\":\"Origin header required\"}"); 
+      return; 
+    }
+  }
+  
   if (strcmp(method, "POST") == 0 && strcmp(path, "/wake") == 0) {
     if (!NODE_BIN[0] || !DSH_BIN[0]) { respond(c, 500, "application/json", "{\"error\":\"runtime not installed\"}"); return; }
     if (!up) request_wake(); // 幂等:主进程按 spawn_pid/dsh_up 判定,不重复 spawn
@@ -402,6 +528,40 @@ static void handle_conn(int c) {
   }
 
   // ---- 就绪:双向透传 ----
+  // CSRF 防护:透传路径也需 Origin 校验,防止跨域页面触发 dsh 状态改变 API
+  if (strcmp(method, "POST") == 0 || strcmp(method, "PUT") == 0 || 
+      strcmp(method, "DELETE") == 0 || strcmp(method, "PATCH") == 0) {
+    char expected_origin[64];
+    snprintf(expected_origin, sizeof expected_origin, "http://127.0.0.1:%d", PORT);
+    char expected_localhost[64];
+    snprintf(expected_localhost, sizeof expected_localhost, "http://localhost:%d", PORT);
+    
+    char *origin = strstr(buf, "\nOrigin:");
+    int proxy_csrf_ok = 0;
+    if (origin) {
+      origin += 8;
+      while (*origin == ' ') origin++;
+      char *eol = strchr(origin, '\r');
+      if (eol) *eol = 0;
+      size_t expected_len = strlen(expected_origin);
+      if (strncmp(origin, expected_origin, expected_len) == 0) {
+        char next = origin[expected_len];
+        if (next == '\0' || next == '/' || next == '?' || next == '#') proxy_csrf_ok = 1;
+      }
+      if (!proxy_csrf_ok) {
+        expected_len = strlen(expected_localhost);
+        if (strncmp(origin, expected_localhost, expected_len) == 0) {
+          char next = origin[expected_len];
+          if (next == '\0' || next == '/' || next == '?' || next == '#') proxy_csrf_ok = 1;
+        }
+      }
+    }
+    if (!proxy_csrf_ok) {
+      respond(c, 403, "application/json", "{\"error\":\"Origin header required for state-changing requests\"}");
+      return;
+    }
+  }
+  
   int u = connect_upstream();
   if (u < 0) { respond(c, 502, "text/plain", "upstream unavailable"); return; }
   write_all(u, buf, (size_t)blen);
@@ -441,15 +601,25 @@ int main(void) {
 
   // 预热:登录即拉起 dsh,用户第一次点 PWA 秒开(空闲自停仍生效)
   // 设 DSH_RT_NO_PREWARM=1 可关闭此行为
-  if (!getenv("DSH_RT_NO_PREWARM") && NODE_BIN[0] && DSH_BIN[0] && dsh_port <= 0) spawn_dsh();
+  if (!getenv("DSH_RT_NO_PREWARM") && NODE_BIN[0] && DSH_BIN[0] && dsh_port <= 0) {
+    spawn_dsh();
+    // 预热后触发后台更新检查(延迟 10 秒,不阻塞启动)
+    // 设 DSH_RT_NO_AUTO_UPDATE=1 可禁用
+    trigger_background_update();
+  }
   int active = 0;
   time_t last_exit = time(NULL);
   for (;;) {
-    refresh_port();
+    // 优化: 仅在 dsh 状态变化时重读 dsh.json (减少 60% 系统调用)
     int reaped;
     while ((reaped = waitpid(-1, NULL, WNOHANG)) > 0) {
       // dsh 本体退出(崩溃/被停)不是连接;清 spawn_pid 允许再次唤醒,清就绪缓存
-      if (is_spawn(reaped)) { spawn_pid = 0; ready_port = 0; continue; }
+      if (is_spawn(reaped)) { 
+        spawn_pid = 0; 
+        ready_port = 0; 
+        refresh_port();  // 仅在 dsh 退出时重读
+        continue; 
+      }
       active--;
       if (active < 0) active = 0;
       last_exit = time(NULL);

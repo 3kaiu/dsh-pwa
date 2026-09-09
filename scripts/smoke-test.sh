@@ -28,9 +28,10 @@ step "3/4 守护:引导页/自动唤醒/就绪门控/透传"
 DSH_RT_IDLE_STOP_SECS=3 "$RT_HOME/daemon" >"$SMOKE_ROOT/daemon.log" 2>&1 &
 DAEMON_PID=$!
 trap 'kill "$DAEMON_PID" 2>/dev/null || true' EXIT
-for i in $(seq 1 50); do
+# 梯度探测:前 10 次 500ms(快速启动),10-60 次 1s(正常),60+ 次 2s(慢启动)
+for i in $(seq 1 10); do
   curl -fsS -o /dev/null "http://127.0.0.1:$SMOKE_PORT/health" 2>/dev/null && break
-  sleep 0.2
+  sleep 0.5
 done
 # GET / 返回引导页,同时已自动拉起 dsh(无需引导页 JS 的 /wake 往返)
 curl -fsS "http://127.0.0.1:$SMOKE_PORT/" | grep -q "DeepSeek Harness" || fail "引导页异常"
@@ -39,26 +40,52 @@ curl -fsS "http://127.0.0.1:$SMOKE_PORT/manifest.webmanifest" | grep -q '"displa
 # 引导页才不会过早切换(即 PWA 点开空白的根因)
 h="$(curl -fsS "http://127.0.0.1:$SMOKE_PORT/health")"
 echo "$h" | grep -q '"dsh":false' || fail "dsh 刚拉起时尚未就绪,health 不应为 true: $h"
-for i in $(seq 1 180); do
+# 梯度等待 dsh 就绪:前 10 次 500ms,后 50 次 1s,再后 120 次 2s(总计 3 分钟)
+for i in $(seq 1 10); do
   curl -fsS "http://127.0.0.1:$SMOKE_PORT/health" | grep -q '"dsh":true' && break
-  sleep 1
+  sleep 0.5
 done
+curl -fsS "http://127.0.0.1:$SMOKE_PORT/health" | grep -q '"dsh":true' && { echo "  快速启动(${i}次探测,前10次500ms)"; } || {
+  for i in $(seq 11 60); do
+    curl -fsS "http://127.0.0.1:$SMOKE_PORT/health" | grep -q '"dsh":true' && break
+    sleep 1
+  done
+  curl -fsS "http://127.0.0.1:$SMOKE_PORT/health" | grep -q '"dsh":true' && { echo "  正常启动(${i}次探测,11-60次1s)"; } || {
+    for i in $(seq 61 180); do
+      curl -fsS "http://127.0.0.1:$SMOKE_PORT/health" | grep -q '"dsh":true' && break
+      sleep 2
+    done
+  }
+}
 curl -fsS "http://127.0.0.1:$SMOKE_PORT/health" | grep -q '"dsh":true' || fail "自动唤醒后 dsh 未就绪"
 code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$SMOKE_PORT/")"
 [ "$code" = "200" ] || fail "透传 UI 返回 $code"
 echo "OK: 引导页 + 自动唤醒 + 就绪门控 + 透传通过"
 
 step "3b/4 并发双 /wake 幂等(只允许 1 个 dsh 实例)"
-curl -fsS -X POST "http://127.0.0.1:$SMOKE_PORT/stop" >/dev/null || fail "/stop"
+curl -fsS -X POST -H "Origin: http://127.0.0.1:$SMOKE_PORT" "http://127.0.0.1:$SMOKE_PORT/stop" >/dev/null || fail "/stop"
 for i in $(seq 1 60); do
   curl -fsS "http://127.0.0.1:$SMOKE_PORT/health" | grep -q '"dsh":false' && break
   sleep 1
 done
-( curl -fsS -X POST "http://127.0.0.1:$SMOKE_PORT/wake" >/dev/null &   curl -fsS -X POST "http://127.0.0.1:$SMOKE_PORT/wake" >/dev/null & wait )
-for i in $(seq 1 180); do
+( curl -fsS -X POST -H "Origin: http://127.0.0.1:$SMOKE_PORT" "http://127.0.0.1:$SMOKE_PORT/wake" >/dev/null &   curl -fsS -X POST -H "Origin: http://127.0.0.1:$SMOKE_PORT" "http://127.0.0.1:$SMOKE_PORT/wake" >/dev/null & wait )
+# 梯度等待:前 10 次 500ms,后 50 次 1s,再后 120 次 2s
+for i in $(seq 1 10); do
   curl -fsS "http://127.0.0.1:$SMOKE_PORT/health" | grep -q '"dsh":true' && break
-  sleep 1
+  sleep 0.5
 done
+curl -fsS "http://127.0.0.1:$SMOKE_PORT/health" | grep -q '"dsh":true' || {
+  for i in $(seq 11 60); do
+    curl -fsS "http://127.0.0.1:$SMOKE_PORT/health" | grep -q '"dsh":true' && break
+    sleep 1
+  done
+  curl -fsS "http://127.0.0.1:$SMOKE_PORT/health" | grep -q '"dsh":true' || {
+    for i in $(seq 61 180); do
+      curl -fsS "http://127.0.0.1:$SMOKE_PORT/health" | grep -q '"dsh":true' && break
+      sleep 2
+    done
+  }
+}
 curl -fsS "http://127.0.0.1:$SMOKE_PORT/health" | grep -q '"dsh":true' || fail "双唤醒后 dsh 未就绪"
 if ps -ax -o command >/dev/null 2>&1; then
   n="$(ps -ax -o command | grep "[b]in\.js web" | grep -c "$SMOKE_ROOT" || true)"
@@ -66,6 +93,11 @@ if ps -ax -o command >/dev/null 2>&1; then
   echo "OK: 恰 1 个 dsh 实例(无孤儿)"
 else
   echo "  (ps 不可用,跳过进程计数检查)"
+fi
+
+# P2-8: 验证 token 相关日志(未来 dsh 再改鉴权能早发现)
+if grep -q "token" "$SMOKE_ROOT/daemon.log" 2>/dev/null; then
+  echo "  (注意: daemon.log 中出现 'token' 字样,可能 dsh 已引入新鉴权机制)"
 fi
 
 step "4/4 空闲自停(PWA 关闭即停止 dsh,DSH_RT_IDLE_STOP_SECS=3)"

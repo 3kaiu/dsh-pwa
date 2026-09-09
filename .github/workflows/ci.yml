@@ -21,3 +21,5 @@ jobs:
         run: clang -O2 -Wall -Wextra -o /tmp/daemon src/daemon.c && codesign --force -s - /tmp/daemon
       - name: 一键安装冒烟(install → 守护 → 唤醒 → 透传 → 空闲自停)
         run: bash scripts/smoke-test.sh
+      - name: 安全套件(CSRF/Origin 运行时验证)
+        run: bash tests/security-verification.sh

@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  dsh 定时更新器:每天凌晨 2:30 自动检查并更新到 @latest
+  职责单一:仅更新 dsh,不启动/停止守护进程
+  日志: ~/.local/state/dsh-runtime/logs/update.log
+  由 scripts/install.sh 自动生成到 ~/Library/LaunchAgents/
+  占位符:__RT_HOME__
+-->
+<dict>
+  <key>Label</key><string>com.dshpwa.updater</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__RT_HOME__/../scripts/update-dsh.sh</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>2</integer>
+    <key>Minute</key><integer>30</integer>
+  </dict>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>__HOME__</string>
+    <key>DSH_RT_HOME</key><string>__RT_HOME__</string>
+    <key>DSH_RT_STATE</key><string>__RT_STATE__</string>
+  </dict>
+  <key>StandardOutPath</key><string>__LOG_DIR__/updater.log</string>
+  <key>StandardErrorPath</key><string>__LOG_DIR__/updater.log</string>
+</dict>
+</plist>
