@@ -136,7 +136,13 @@ mkdir -p "$LOG_DIR"
 DSH_VERSION="${DSH_VERSION:-latest}"
 
 # 先把 dist-tag 解析成真实版本号再比较(直接拿 "latest" 与本地如 "0.1.5" 比较永不相等,会恒判需更新)
-REMOTE="$("$NPM_BIN" view "@deepseek-ai/dsh@$DSH_VERSION" version 2>/dev/null | tail -1 || true)"
+# 网络调用必须自带超时:本脚本在 npm view 之前就持 $RT_HOME/.install.lock,而守护 update_locked()
+# 在持锁期间拒绝拉起 dsh —— npm 无超时参数时,registry 黑洞(丢包而非拒绝)会让锁被无限期持有,
+# PWA 就一直停在引导页。实测(黑洞 registry 10.255.255.1:81):无参数 >40s 未返回;
+# --fetch-timeout=20000 --fetch-retries=1 在 3.8s 内按预期中止。
+# 20s × 2 次 ≈ 40s 上限:检查失败只是「保持当前版本」,下轮(每日 2:30 / 12h 节流)再试,代价可接受。
+# 注意:只给「检查」加超时,不给下面的 pnpm update 加 —— 更新本身耗时长,外部打断会留下半更新树。
+REMOTE="$("$NPM_BIN" view --fetch-timeout=20000 --fetch-retries=1 "@deepseek-ai/dsh@$DSH_VERSION" version 2>/dev/null | tail -1 || true)"
 if [ -z "$REMOTE" ]; then
   log "! $(date '+%Y-%m-%d %H:%M:%S') 无法获取远程版本(网络失败?),保持 $CUR"
   exit 0
