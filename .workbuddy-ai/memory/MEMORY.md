@@ -19,14 +19,22 @@ Conventional Commits，中文 subject。历史风格举例：
 clang -O2 -Wall -Wextra -Werror -o /tmp/dsh_verify src/daemon.c   # 必须零告警
 shellcheck -S warning scripts/*.sh tests/*.sh tests/lib/*.sh      # 与 CI 同范围
 for f in scripts/*.sh tests/*.sh tests/lib/*.sh; do bash -n "$f"; done
-bats tests/unit/                                                   # 当前 42 项
+bats tests/unit/                                                   # 当前 43 项
+# workflow：PyYAML 真实解析 + 21 个 run block 语法检查
+# 注意本机 `ruby` 被 rbenv 指向未安装的 3.1.0 而不可用；用**系统** python3（带 PyYAML），
+# 托管版 python 没有 PyYAML。
+/opt/homebrew/opt/python@3.13/libexec/bin/python3 -c "import yaml,glob;[yaml.safe_load(open(p)) for p in glob.glob('.github/workflows/*.yml')]"
+node ~/.workbuddy-ai/skills/ci-gate-hardening/scripts/check_run_blocks.mjs .github/workflows
 ```
 再加一轮运行时 curl 回归（`/health`、`/stop`、`/wake`、Origin/Host 校验、cookie 校验）。
 
-**约定**：脚本/测试里所有访问 `127.0.0.1` 的 curl 都必须带 `--max-time N`，并绕过代理
-（`--noproxy '*'`；`benchmark.sh` 因只压本机而改用顶部 `unset http_proxy …`）。
-此不变量已固化为门禁：`install-validation.bats` 的
-`every loopback curl in CI-executed shell scripts carries a timeout`。
+**约定**：
+- 脚本/测试/workflow 里所有 curl 都必须带 `--max-time N`；回环请求还要绕过代理
+  （`--noproxy '*'`，或脚本只压本机时顶部 `unset http_proxy …`）。
+- 每个 workflow job 都必须显式声明 `timeout-minutes`（不声明＝GitHub 默认 **360min**）。
+- 以上两条都已固化为门禁，见 `install-validation.bats` 的
+  `every curl in CI-executed scripts and workflows carries a timeout` 与
+  `every workflow job declares timeout-minutes`。
 
 ## 踩过的坑（通用 shell / CI 陷阱）
 1. **`file -b` 对 universal/fat 二进制逐架构输出一行** → `grep -c arm64` 恒为 2，`= 1` 永不成立。判断架构要用子串匹配：`[[ "$(file -b "$BIN")" == *"$(uname -m)"* ]]`。
@@ -50,6 +58,14 @@ bats tests/unit/                                                   # 当前 42 �
    改为 `substr` 取首字符逐个判断。教训：**门禁要对它声称覆盖的每种写法都植入违规验证**，
    只测一两种形状会得到「通过」的假结论（前两次探针恰好用了坏字符类能匹配的形状）。
    同理，按主机名（`127.0.0.1`/`localhost`）过滤会漏掉写成变量的 URL（`curl -fsS "$ENDPOINT"`）。
+10. **workflow job 不声明 `timeout-minutes` ⇒ 默认 360min**：一步卡住白烧 6 小时 runner。
+    本仓库既有约定是显式声明，已固化为门禁。判定时**只认 4 空格缩进的 job 级声明**
+    （step 级是 8 空格，不能算数），且只在 `jobs:` 之后计数（否则 `on:` 下的
+    `push:`/`pull_request:` 会被当成 job）。
+11. **BSD grep 的 `\|` 不是「或」而是字面量**（技能里记过，我仍踩了两次）：`grep '^a:\|^b:'`
+    在 macOS 上静默无输出。**一律用 `grep -E`**。
+12. **不要用管道判定结果**：`gh run watch --exit-status | grep | head -N` 拿到的是 `head`
+    的退出码（恒 0），run 还在 `in_progress` 也会「通过」。要 `cmd > log 2>&1; echo $?`。
 
 ## daemon 安全模型（勿回退）
 - CSRF：Origin / Host 头**精确匹配**，防跨站与 DNS rebinding。
