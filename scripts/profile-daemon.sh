@@ -3,7 +3,11 @@
 # 使用 macOS 内置工具进行零依赖性能分析
 set -euo pipefail
 
-DAEMON_PID=$(pgrep -f "daemon" | head -1 || echo "")
+# 精确匹配守护二进制路径,而非裸 "daemon"(裸词会误命中 docker daemon、mDNSResponder 等
+# 任意含 daemon 的进程,拿到错误 PID 后所有 ps/heap/lsof 分析都指向无关进程)。
+# 与 smoke-test.sh 同一模式:RT_HOME 默认 ~/.local/share/dsh-runtime。
+RT_HOME="${DSH_RT_HOME:-$HOME/.local/share/dsh-runtime}"
+DAEMON_PID="$(pgrep -f "$RT_HOME/daemon" | head -1 || true)"
 if [ -z "$DAEMON_PID" ]; then
   echo "❌ 守护进程未运行" >&2
   echo "提示: 运行 'curl -fsS http://127.0.0.1:3080/health' 触发 launchd socket activation 拉起守护进程" >&2

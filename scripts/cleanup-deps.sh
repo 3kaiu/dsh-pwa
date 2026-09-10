@@ -13,6 +13,7 @@ fi
 
 echo "开始清理跨平台冗余文件..."
 BEFORE=$(du -sm "$APP_DIR/node_modules" 2>/dev/null | awk '{print $1}')
+BEFORE="${BEFORE:-0}"   # du 失败/目录瞬时消失时兜底,避免下方 $(( )) 因空值语法报错退出
 
 # 1. node-pty: 删除 Win32/Linux 预编译二进制 (~23MB)
 if [ -d "$APP_DIR/node_modules/node-pty/prebuilds" ]; then
@@ -55,9 +56,14 @@ for pkg_doc in "typescript/doc" "lodash/doc" "moment/doc"; do
 done
 
 AFTER=$(du -sm "$APP_DIR/node_modules" 2>/dev/null | awk '{print $1}')
+AFTER="${AFTER:-0}"
 SAVED=$((BEFORE - AFTER))
 
 echo "清理完成:"
 echo "  清理前: ${BEFORE}MB"
 echo "  清理后: ${AFTER}MB"
-echo "  节省空间: ${SAVED}MB ($(awk "BEGIN {printf \"%.1f\", $SAVED*100/$BEFORE}")%)"
+if [ "$BEFORE" -gt 0 ]; then
+  echo "  节省空间: ${SAVED}MB ($(awk "BEGIN {printf \"%.1f\", $SAVED*100/$BEFORE}")%)"
+else
+  echo "  节省空间: ${SAVED}MB"   # BEFORE=0 时不做百分比(除零)
+fi

@@ -223,7 +223,12 @@ PY
   h="$(curl -fsS --max-time 10 "http://127.0.0.1:$SA_PORT/health")" || fail "二次激活请求失败"
   echo "$h" | grep -q '"dsh":false' || fail "二次激活 health 异常: $h"
   pgrep -f "$RT_HOME/daemon" >/dev/null || fail "守护未被再次拉起(ThrottleInterval 生效?)"
-  echo "OK: socket activation 端到端通过(激活 → 自退 → 再激活)"
+  # 零常驻兜底:此次激活后无任何连接且未运行 dsh(dsh.json 已清),IDLE_STOP(3s)后守护应自退。
+  # 缺该分支时,任何不触发 /wake 的连接(如仅探测 /health)都会让守护永久驻留,违背零常驻。
+  for _ in $(seq 1 30); do pgrep -f "$RT_HOME/daemon" >/dev/null || break; sleep 0.5; done
+  pgrep -f "$RT_HOME/daemon" >/dev/null \
+    && fail "空闲且未运行 dsh 时守护未自退(零常驻兜底失效)"
+  echo "OK: socket activation 端到端通过(激活 → 自退 → 再激活 → 空闲自退)"
   sa_teardown
 else
   # 无 GUI launchd 会话(如 CI runner):显式 SKIP + 状态文件,绝不静默假装通过。

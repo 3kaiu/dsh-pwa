@@ -342,7 +342,7 @@ fi
 # 7.3 检查符号表清理
 if [ -f "$TMPD/daemon" ]; then
   SIZE=$(stat -f%z "$TMPD/daemon")
-  # Universal binary 大约 70-100KB
+  # Universal binary 当前约 117KB(双架构 + 内嵌引导页)
   if [ "$SIZE" -lt 150000 ]; then
     ok "daemon 二进制大小合理($SIZE 字节)"
   else

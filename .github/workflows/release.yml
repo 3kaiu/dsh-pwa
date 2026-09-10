@@ -15,7 +15,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: 编译守护(universal binary,ad-hoc 签名)
         run: clang -O2 -Wall -Wextra -arch arm64 -arch x86_64 -o /tmp/daemon src/daemon.c && codesign --force -s - /tmp/daemon
       - name: 生成 pnpm-lock.yaml(预解析依赖树,用户安装跳解析省时;与 install.sh 同配置)
@@ -28,18 +28,29 @@ jobs:
           cd /tmp/dsh-lock && pnpm install --lockfile-only --ignore-scripts --loglevel=error
           mkdir -p /tmp/pkg
           cp /tmp/dsh-lock/pnpm-lock.yaml /tmp/pkg/pnpm-lock.yaml
-      - name: 检查 lock 差异(依赖树变化预警)
+      - name: 校验生成的 pnpm-lock.yaml(依赖树可解析性门禁)
         run: |
-          if [ -f pnpm-lock.yaml ] && ! diff -q pnpm-lock.yaml /tmp/pkg/pnpm-lock.yaml >/dev/null 2>&1; then
-            echo "⚠️ pnpm-lock.yaml 有变化,请检查 dsh 依赖树更新"
-            echo "--- 当前仓库版本 ---"
-            head -20 pnpm-lock.yaml || true
-            echo "--- 新生成版本 ---"
-            head -20 /tmp/pkg/pnpm-lock.yaml || true
-            echo "Diff 摘要:"
-            diff -u pnpm-lock.yaml /tmp/pkg/pnpm-lock.yaml | head -50 || true
+          set -euo pipefail
+          # 本仓库不追踪 pnpm-lock.yaml(发行包内的 lock 由上一步现场生成),因此不存在
+          # “仓库版本 vs 生成版本”的 diff 对象——旧步骤恒走 else 打印“无变化”,属误导。
+          # 改为真实可用的门禁:lock 必须生成成功且非空,否则安装端会退回现场解析(慢但可用),
+          # 把它当异常暴露而非静默;并打印解析到的 dsh 版本便于审计。
+          if [ ! -s /tmp/pkg/pnpm-lock.yaml ]; then
+            echo "::error::pnpm-lock.yaml 未生成或为空(lockfile-only 解析失败)"
+            exit 1
+          fi
+          echo "✓ pnpm-lock.yaml 已生成($(wc -l < /tmp/pkg/pnpm-lock.yaml | tr -d ' ') 行)"
+          echo "解析到的 dsh 版本:"
+          grep -E "deepseek-ai/dsh@" /tmp/pkg/pnpm-lock.yaml | head -3 || true
+          if [ -f pnpm-lock.yaml ]; then
+            if diff -q pnpm-lock.yaml /tmp/pkg/pnpm-lock.yaml >/dev/null 2>&1; then
+              echo "✓ 与仓库追踪版本一致"
+            else
+              echo "⚠️ 与仓库追踪的 pnpm-lock.yaml 存在差异(依赖树更新),摘要:"
+              diff -u pnpm-lock.yaml /tmp/pkg/pnpm-lock.yaml | head -50 || true
+            fi
           else
-            echo "✓ pnpm-lock.yaml 无变化"
+            echo "(仓库未追踪 pnpm-lock.yaml,跳过 diff;发行包内 lock 以本步骤生成结果为准)"
           fi
       - name: 冒烟测试(打包前置:install → 守护 → 唤醒 → 透传 → 空闲自停)
         # release 也可能在无 GUI 会话的 runner 上跑:smoke-test.sh 对 socket activation 段
@@ -53,6 +64,10 @@ jobs:
           cp scripts/cleanup-deps.sh /tmp/pkg/scripts/cleanup-deps.sh
           cp scripts/update-dsh.sh /tmp/pkg/scripts/update-dsh.sh
           cp src/daemon.c /tmp/pkg/daemon.c
+          # 一致性记录:记录预编译 daemon 对应的 daemon.c 指纹。install.sh 预编译分支会把它
+          # 落到 RT_HOME/.daemon.md5,使「发行包装机 → 后续源码安装」的免编译判断保持一致
+          # (源码路径兼容:包内 daemon.c 在包根,仓库内为 src/daemon.c)。
+          ( cd /tmp/pkg && md5 -q daemon.c > .daemon.md5 )
           cp launchd/com.dshpwa.daemon.plist /tmp/pkg/launchd/
           cp launchd/com.dshpwa.updater.plist /tmp/pkg/launchd/
           cd /tmp/pkg && zip -qr dsh-pwa.zip .

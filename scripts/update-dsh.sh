@@ -210,6 +210,15 @@ if [ "$UPDATE_OK" = "1" ] && [ "$NEW" = "$REMOTE" ]; then
   # 清理跨平台冗余依赖(与 install.sh 保持一致;cleanup-deps.sh 需要传入 app 目录)
   if [ -f "$RT_HOME/scripts/cleanup-deps.sh" ]; then
     bash "$RT_HOME/scripts/cleanup-deps.sh" "$APP_DIR" >> "$UPDATE_LOG" 2>&1 || true
+    # 原生依赖探针(与 install.sh 同源):cleanup 删了 sharp 的 WASM 回退与 node-pty 跨平台
+    # 二进制,若某架构原生绑定缺失,dsh 图像/终端功能会运行时失败。从 dsh 包目录解析
+    # (pnpm 隔离布局下 sharp/node-pty 是传递依赖)。更新本身已成功,故不回滚版本,但把问题
+    # 显式记入日志并提示重装,而非静默留下半坏的依赖树。
+    if ( cd "$APP_DIR/node_modules/@deepseek-ai/dsh" && "$NODE_BIN" -e "require('sharp'); require('node-pty')" ) >/dev/null 2>&1; then
+      log "  $(date '+%Y-%m-%d %H:%M:%S') 关键原生依赖验证通过(sharp/node-pty)"
+    else
+      log "! $(date '+%Y-%m-%d %H:%M:%S') 清理后原生依赖验证失败(sharp/node-pty),建议重跑 install.sh 修复"
+    fi
   fi
   # 刷新 run.json:dsh bin 路径可能随版本变化(单一事实源,守护直启依赖它)
   DSH_BIN="$("$NODE_BIN" -e '

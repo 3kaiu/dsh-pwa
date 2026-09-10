@@ -49,7 +49,7 @@ DSH_RT_RELEASE_TAG=v1.0.0 bash install.sh
   - node-pty Win32/Linux 预编译二进制 (~23MB)
   - @img/sharp WASM 备用方案 (~9MB)
   - sourcemap/文档/测试文件 (~2MB)
-- **daemon 极简:** 85KB universal binary (arm64 + x86_64)，运行时仅占 ~1.3MB RSS,且仅在活跃会话期间存在(零常驻,空闲即退出)
+- **daemon 极简:** 117KB universal binary (arm64 + x86_64)，运行时仅占 ~1.3MB RSS,且仅在活跃会话期间存在(零常驻,空闲即退出)
 
 ## 卸载
 
@@ -105,7 +105,7 @@ launchctl print "gui/$(id -u)/com.dshpwa.daemon"      # launchd 注册状态
 ```bash
 bash scripts/smoke-test.sh              # 隔离目录真实安装 → 幂等重跑 → 端口占用检测 → 守护(引导页/自动唤醒/就绪门控/token 握手/透传) → 并发双唤醒幂等 → 空闲自停 → socket activation 端到端(激活→自退→再激活)
 bash tests/security-verification.sh     # 验证所有安全控制是否按预期工作(33 项断言)
-bats tests/unit/                        # 单元测试:安装校验 + 守护黑盒用例(24 项,不依赖真实 dsh)
+bats tests/unit/                        # 单元测试:安装校验(9 项)+ 守护黑盒用例(30 项,不依赖真实 dsh),共 39 项
 ```
 
 ## 参考文档

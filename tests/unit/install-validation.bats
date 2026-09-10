@@ -48,7 +48,7 @@ teardown() {
 
 @test "daemon binary size within limit (<150KB)" {
   # 阈值与 tests/security-verification.sh 的 150000 字节保持一致;
-  # universal 双架构 + 内嵌引导页的当前体积约 116KB(旧 90KB 断言已过期)
+  # universal 双架构 + 内嵌引导页的当前体积约 117KB(旧 90KB 断言已过期)
   clang -O2 -arch arm64 -arch x86_64 \
     -o /tmp/daemon-size-test "$ROOT/src/daemon.c"
   SIZE=$(stat -f%z /tmp/daemon-size-test 2>/dev/null || stat -c%s /tmp/daemon-size-test)
@@ -70,4 +70,24 @@ teardown() {
 @test "smoke-test.sh passes bash -n" {
   run bash -n "$ROOT/scripts/smoke-test.sh"
   [ "$status" -eq 0 ]
+}
+
+@test "all bats test names are ASCII-only (guard)" {
+  # 守护用例:bats 1.14 在 macOS 自带 bash 3.2 下对多字节测试名有缺陷——含中文的 @test 名会
+  # 报 "unknown test name" 且整个文件 0 用例被执行(静默假绿,CI 仍"通过")。扫描所有 .bats
+  # 的 @test 名,出现任何非 ASCII 字节立即失败,避免测试套件被无声清空。
+  bad=0
+  for f in "$ROOT"/tests/unit/*.bats; do
+    while IFS= read -r line; do
+      case "$line" in
+        @test*)
+          if printf '%s' "$line" | LC_ALL=C grep -q '[^ -~]'; then
+            echo "  非 ASCII 测试名(会导致 bats 静默 0 用例): $f: $line" >&2
+            bad=1
+          fi
+          ;;
+      esac
+    done < "$f"
+  done
+  [ "$bad" -eq 0 ]
 }

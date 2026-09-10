@@ -380,6 +380,19 @@ static void scan_token(void) {
   token_scan_off += (n > 64) ? n - 64 : 0; // 保留尾部,防模式跨读取窗口被劈开
 }
 
+// token 是否可安全嵌入 JSON 字符串字面量:仅允许 [A-Za-z0-9_-]。
+// scan_token 采集时已限定字符集,此处再显式校验一遍作为纵深防御——万一未来放宽采集规则
+// (如允许 '.' 之外的可疑字符),含引号/反斜杠/控制字符的 token 会破坏 /health 的 JSON 结构,
+// 此时宁可不带 token 字段(引导页按"无 token"路径处理),也不下发畸形 JSON。
+static int token_json_safe(void) {
+  if (!dsh_token[0]) return 0;
+  for (const char *p = dsh_token; *p; p++) {
+    if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'z') ||
+          (*p >= 'A' && *p <= 'Z') || *p == '_' || *p == '-')) return 0;
+  }
+  return 1;
+}
+
 // PID 复用核对(仅对「非本进程 spawn」的 pid 调用):dsh 崩溃后其 PID 可被系统回收并分配给
 // 无关进程,此时 kill(pid,0) 恒通过,照旧发信号会误杀无辜者(且 kill(-pid) 打的是整个进程组)。
 // proc_pidpath(3)(macOS 专有)取 pid 对应进程的可执行真实路径,与 realpath(NODE_BIN) 比较:
@@ -515,7 +528,9 @@ static void trigger_background_update(void) {
 static void refresh_port(void) { dsh_port = read_state_port(); }
 
 // ---------- 引导页(任意路径在 dsh 未运行时都会得到它) ----------
-static const char TPL[] =
+// 模板拆成占位符前后两段:中间由 build_boot() 填入 HTML 转义后的 LOG_DIR。
+// (旧实现把 __LOG_DIR__ 嵌在单一 TPL 里手写扫描 "__" 前缀,逻辑复杂且对未知 "__" 处理含糊)
+static const char TPL_HEAD[] =
   "<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
   "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
   "<link rel=\"manifest\" href=\"/manifest.webmanifest\">"
@@ -537,7 +552,9 @@ static const char TPL[] =
   "</style></head><body><div class=\"card\"><div class=\"ring\" id=\"ring\"></div>"
   "<h1>DeepSeek Harness</h1><div id=\"status\">正在连接…</div>"
   "<div id=\"err\"></div><button class=\"btn\" id=\"retry\">重试</button>"
-  "<div id=\"log\">日志目录: __LOG_DIR__</div></div><script>"
+  "<div id=\"log\">日志目录: ";
+static const char TPL_TAIL[] =
+  "</div></div><script>"
   "var fired=false,t0=Date.now(),notok=0;"
   "function $(id){return document.getElementById(id)}"
   "function tick(){fetch('/health').then(function(r){return r.json()}).then(function(h){"
@@ -562,32 +579,24 @@ static const char TPL[] =
   "document.getElementById('retry').onclick=function(){$('err').style.display='none';this.style.display='none';fired=false;t0=Date.now();notok=0;tick()};tick()})"
   "</script></body></html>";
 
-static void build_boot(void) {
-  const char *p = TPL;
-  char *o = BOOT_PAGE;
-  const size_t cap = sizeof BOOT_PAGE - 1;
-  while (*p && (size_t)(o - BOOT_PAGE) < cap) {
-    const char *hit = strstr(p, "__");
-    if (!hit) { size_t l = strlen(p); if (l > cap - (size_t)(o - BOOT_PAGE)) l = cap - (size_t)(o - BOOT_PAGE); memcpy(o, p, l); o += l; break; }
-    size_t pre = (size_t)(hit - p);
-    if (pre > cap - (size_t)(o - BOOT_PAGE)) pre = cap - (size_t)(o - BOOT_PAGE);
-    memcpy(o, p, pre); o += pre;
-    if (strncmp(hit, "__LOG_DIR__", 11) == 0) {
-      // HTML 转义 LOG_DIR 防止路径注入(虽然 RT_STATE 用户可控,但防御纵深)
-      const char *log_p = LOG_DIR;
-      while (*log_p && (size_t)(o - BOOT_PAGE) < cap - 6) {
-        if (*log_p == '<') { memcpy(o, "&lt;", 4); o += 4; }
-        else if (*log_p == '>') { memcpy(o, "&gt;", 4); o += 4; }
-        else if (*log_p == '&') { memcpy(o, "&amp;", 5); o += 5; }
-        else if (*log_p == '"') { memcpy(o, "&quot;", 6); o += 6; }
-        else *o++ = *log_p;
-        log_p++;
-      }
-      p = hit + 11;
-    }
-    else { *o++ = '_'; p = hit + 1; }
+// HTML 转义(防路径注入:RT_STATE 用户可控,防御纵深)。o 容量不足时安全截断并 NUL 收尾。
+static void html_escape(const char *s, char *o, size_t cap) {
+  size_t j = 0;
+  for (; *s && j + 6 < cap; s++) {
+    if (*s == '<') { memcpy(o + j, "&lt;", 4); j += 4; }
+    else if (*s == '>') { memcpy(o + j, "&gt;", 4); j += 4; }
+    else if (*s == '&') { memcpy(o + j, "&amp;", 5); j += 5; }
+    else if (*s == '"') { memcpy(o + j, "&quot;", 6); j += 6; }
+    else o[j++] = *s;
   }
-  *o = 0;
+  o[j] = 0;
+}
+
+// 引导页 = TPL_HEAD + 转义后的 LOG_DIR + TPL_TAIL(唯一占位符;直接拼接,无手写扫描)
+static void build_boot(void) {
+  char esc[2048];
+  html_escape(LOG_DIR, esc, sizeof esc);
+  snprintf(BOOT_PAGE, sizeof BOOT_PAGE, "%s%s%s", TPL_HEAD, esc, TPL_TAIL);
 }
 
 // ---------- HTTP ----------
@@ -611,9 +620,10 @@ static void respond_health(int c) {
   int ready = dsh_ready();
   int pid = ready ? read_pid() : 0;
   int n = -1;
-  if (ready && dsh_token[0])
+  if (ready && token_json_safe())
     // token 仅在本机回环端口经同源 fetch 可读(无 CORS 头,跨域页面读不到),
-    // 信任级别与日志文件里的 token URL 相同;dsh 0.1.5+ 引导页用它完成 /?token= 握手
+    // 信任级别与日志文件里的 token URL 相同;dsh 0.1.5+ 引导页用它完成 /?token= 握手。
+    // token_json_safe 已保证字符集可安全嵌入(见其定义),无需转义。
     n = snprintf(body, sizeof body, "{\"dsh\":true,\"port\":%d,\"pid\":%d,\"token\":\"%s\"}", dsh_port, pid, dsh_token);
   if (n < 0 || (size_t)n >= sizeof body)
     snprintf(body, sizeof body, "{\"dsh\":%s,\"port\":%d,\"pid\":%d}",
@@ -735,6 +745,25 @@ static const char *find_header(const char *buf, const char *name) {
   return NULL;
 }
 
+// Cookie 头里精确查找名为 name 的 cookie(名字必须整体等于 name 且紧跟 '=')。
+// 支持多 cookie(';' 分隔)与前导空白;只在 Cookie 头所在行内扫描。
+// 不能用前缀匹配:strncmp(ck,"dsh-auth",8) 会把 dsh-auth-evil=… / dsh-authentication=… 误放行。
+static int has_cookie(const char *buf, const char *name) {
+  const char *ck = find_header(buf, "Cookie");
+  if (!ck) return 0;
+  const char *end = strchr(ck, '\r');
+  if (!end) end = strchr(ck, '\n');
+  if (!end) end = ck + strlen(ck);
+  size_t nl = strlen(name);
+  const char *p = ck;
+  while (p < end) {
+    while (p < end && (*p == ' ' || *p == '\t' || *p == ';' || *p == ',')) p++;
+    if (p + nl + 1 <= end && strncmp(p, name, nl) == 0 && p[nl] == '=') return 1;
+    while (p < end && *p != ';') p++;
+  }
+  return 0;
+}
+
 // Origin 精确匹配本守护端口:防异端口绕过(如 127.0.0.1:31399 冒充 3080);
 // 后缀仅允许结束 / ? #,防 http://127.0.0.1:3080.evil.com 前缀绕过。
 // 值部分大小写敏感原样比较(与旧实现一致);字段名大小写不敏感。
@@ -776,13 +805,32 @@ static int host_ok(const char *buf) {
 }
 
 // ---------- 单连接处理(fork 出的子进程) ----------
+// 读取完整请求头(至空行 CRLFCRLF 或缓冲区满),返回已读字节数;0=连接关闭/出错。
+// 单次 recv 只拿到部分头(TCP 分片)或头 >8KB 被截断时,host_ok/origin_ok/find_header
+// 会误判 → 合法请求被 403、请求行/query 解析错位。循环读到空行即止:
+// GET 无体,读到空行立即返回;POST 体留给 relay 继续透传(不在此阻塞等体)。
+static int read_request_head(int c, char *buf, size_t cap) {
+  size_t off = 0;
+  if (cap == 0) return 0;
+  buf[0] = 0;
+  while (off < cap - 1) {
+    ssize_t n = recv(c, buf + off, cap - 1 - off, 0);
+    if (n < 0) { if (errno == EINTR) continue; break; }
+    if (n == 0) break;
+    off += (size_t)n;
+    buf[off] = 0;
+    if (strstr(buf, "\r\n\r\n") || strstr(buf, "\n\n")) break; // 头结束(容忍裸 LF)
+  }
+  buf[off] = 0;
+  return (int)off;
+}
+
 static void handle_conn(int c) {
   struct timeval tv = { 2, 0 };
   setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
   char buf[8192];
-  int blen = (int)recv(c, buf, sizeof buf - 1, 0);
+  int blen = read_request_head(c, buf, sizeof buf);
   if (blen <= 0) return;
-  buf[blen] = 0;
 
   // Host 校验(防 DNS rebinding):所有请求(引导页/控制端点/透传)统一在最前面拦截,
   // 不匹配本守护端口一律 403——rebinding 攻击者控制的 Host 是 evil.com,浏览器正常路径
@@ -865,10 +913,10 @@ static void handle_conn(int c) {
   // 例外:引导页自己的握手 fetch('/?token=…') 同样是无 cookie 的 GET /,若不豁免会被本拦截
   // 挡回引导页 → Set-Cookie 永远拿不到 → 引导页无限 reload。query 以 token= 开头(引导页与
   // dsh 官方 URL 均如此)才放行透传;?other=… 之类无 token 的仍回引导页。
-  // Cookie 头字段名大小写不敏感(find_header);cookie 名 dsh-auth 本身大小写敏感,原样比较。
+  // Cookie 头字段名大小写不敏感(find_header);cookie 名 dsh-auth 本身大小写敏感,精确匹配
+  // (has_cookie:名字整体等于 dsh-auth 且紧跟 '=',支持多 cookie,防 dsh-auth-evil 前缀绕过)。
   if (strcmp(method, "GET") == 0 && strcmp(path, "/") == 0 && strncmp(query, "token=", 6) != 0) {
-    const char *ck = find_header(buf, "Cookie");
-    if (!ck || strncmp(ck, "dsh-auth", 8) != 0) {
+    if (!has_cookie(buf, "dsh-auth")) {
       respond(c, 200, "text/html; charset=utf-8", BOOT_PAGE);
       return;
     }
@@ -1042,6 +1090,13 @@ int main(void) {
           }
         }
       }
+    } else if (activated && dsh_port <= 0 && spawn_pid == 0 && active == 0 &&
+               now - last_use_m > IDLE_STOP) {
+      // 零常驻兜底:激活后从未拉起 dsh(如仅探测 /health、runtime 未安装、更新期拒绝 spawn)
+      // 且已无任何连接,空闲超 IDLE_STOP 即自退交还 socket。缺此分支时,任何不触发 /wake
+      // 的连接都会让守护永久驻留(违背零常驻设计)。launchd 会在下次连接时重新拉起。
+      fprintf(stderr, "daemon: 空闲且未运行 dsh,自退(launchd 将接管 socket)\n");
+      exit(0);
     }
     // dsh 0.1.5+ 启动 token 扫描:dsh 在跑(本进程 spawn 或重启收养)且未捕获时增量扫日志
     // (最多追 120s:再晚说明是旧版无 token 机制,放弃以免整场空扫;收养场景窗口从守护启动算起)

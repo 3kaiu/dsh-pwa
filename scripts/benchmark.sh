@@ -32,10 +32,11 @@ echo ""
 
 # 2. 冷启动延迟 (停止 -> 唤醒)
 echo "2. 冷启动延迟 (stop -> wake):"
-echo "  (需要 Origin 头，跳过自动化测试)"
+echo "  (需真实 dsh 且会干扰在用会话，故仅给出手动步骤)"
 echo "  手动测试:"
-echo "    curl -X POST -H 'Origin: http://127.0.0.1:$PORT' $ENDPOINT/../stop"
-echo "    time curl -fsS $ENDPOINT"
+echo "    curl -X POST -H 'Origin: http://127.0.0.1:$PORT' http://127.0.0.1:$PORT/stop"
+echo "    time curl -fsS http://127.0.0.1:$PORT/    # 触发自动唤醒,计时到引导页返回"
+echo "    # dsh 就绪耗时: until curl -fsS http://127.0.0.1:$PORT/health | grep -q '\"dsh\":true'; do sleep 0.2; done"
 echo ""
 
 # 3. 并发性能

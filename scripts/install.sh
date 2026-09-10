@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# 安装产物默认仅属主可读(状态/日志目录另有显式 chmod 0700 兜底,见下)
+umask 077
 # dsh-pwa 一键安装:运行时(node 复用系统或装最新 LTS + 官方 dsh@latest)+ 守护 + LaunchAgent。
 # 用法:  bash install.sh          (仓库根 / 发行包根;包内含预编译 daemon 则免 clang)
 # 升级:  重跑本脚本即自动跟随上游最新(已安装版本不变则跳过)
@@ -25,7 +27,7 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 # 仓库内运行(scripts/install.sh)时回溯到仓库根;发行包内运行时本身就是包根
 [ -d "$ROOT/../scripts" ] && ROOT="$(cd "$ROOT/.." && pwd)"
 # curl ... | bash 场景:无本地伴随文件 → 自动下载发行包到临时目录(无需手动下载)
-if [ ! -f "$ROOT/src/daemon.c" ] && [ ! -f "$ROOT/daemon" ]; then
+if [ ! -f "$ROOT/src/daemon.c" ] && [ ! -f "$ROOT/daemon.c" ] && [ ! -f "$ROOT/daemon" ]; then
   h1 "自动下载发行包(releases/${RELEASE_TAG})"
   PKG_TMP="$(mktemp -d /tmp/dsh-pwa.XXXXXX)"
   # 立即注册清理:下载/解压/校验任一步失败都不泄漏临时目录
@@ -73,6 +75,11 @@ for _P in "$HOME" "$RT_HOME" "$RT_STATE"; do
 done
 # daemon 编译统一参数(两处编译路径共用;universal binary 双架构,Intel Mac 也产出 arm64+x86_64)
 DAEMON_CFLAGS=(-O2 -Wall -Wextra -arch arm64 -arch x86_64)
+# daemon 源码路径兼容:仓库内为 src/daemon.c;发行包内为包根 daemon.c(两种布局都识别)
+DAEMON_SRC=""
+for _c in "$ROOT/src/daemon.c" "$ROOT/daemon.c"; do
+  [ -f "$_c" ] && { DAEMON_SRC="$_c"; break; }
+done
 NODE_DIR="$RT_HOME/node"
 APP_DIR="$RT_HOME/app"
 NODE_BIN="$NODE_DIR/bin/node"
@@ -80,9 +87,9 @@ NPM_BIN="$NODE_DIR/bin/npm"
 DSH_PKG="$APP_DIR/node_modules/@deepseek-ai/dsh/package.json"
 ARCH="$(uname -m | sed 's/x86_64/x64/')"
 mkdir -p "$RT_HOME" "$RT_STATE" "$LOG_DIR" "$NODE_DIR" "$APP_DIR" "$DSH_HOME"
-# 含 token 的状态/日志目录必须 0700:umask 022 下 mkdir -p 建出 0755,且对已存在目录
-# 不会收紧权限(daemon 的 mkdir(LOG_DIR,0700) 对已存在目录静默失败)→ 显式 chmod 兜底,
-# 同时修复存量目录
+# 含 token 的状态/日志目录必须 0700:mkdir -p 对已存在目录不会收紧权限(daemon 的
+# mkdir(LOG_DIR,0700) 对已存在目录静默失败),脚本顶部 umask 077 只保护新建 → 显式 chmod
+# 兜底并修复存量目录
 chmod 0700 "$RT_STATE" "$LOG_DIR"
 
 # 安装锁(并发互斥:双击连点/重复安装时后到者等待;仅属主进程已死才可抢占——
@@ -129,6 +136,28 @@ for _ in $(seq 1 300); do
 done
 [ "$LOCKED" = "1" ] || { echo "等待安装锁超时(300s),请稍后重试" >&2; exit 1; }
 trap 'rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null || true; [ -n "${PKG_TMP:-}" ] && rm -rf "$PKG_TMP"' EXIT
+
+# 活动会话协调:升级/重装会替换 node_modules,正在运行的 dsh 从半更新的依赖树读代码会崩溃或
+# 行为异常。与 update-dsh.sh 同源策略:先探测守护 /health,若 dsh 在跑则经 /stop 优雅停掉,
+# 并等它真正退出后再动依赖树。本脚本此刻已持有 .install.lock,守护 update_locked() 会拒绝
+# 重新拉起 dsh,因此停下后不会被引导页立刻唤醒(等本次装完自然恢复)。
+# /health 不可达(未安装/守护未激活)→ dsh 必然没在跑,直接返回。
+stop_active_dsh() {
+  local port="${1:-3080}" health=""
+  health="$(curl -s -m 2 "http://127.0.0.1:$port/health" 2>/dev/null || true)"
+  printf '%s' "$health" | grep -q '"dsh"[[:space:]]*:[[:space:]]*true' || return 0
+  echo "  ${D}检测到 dsh 正在运行,先优雅停止(避免从半更新的依赖树启动)...${R}"
+  curl -fsS --max-time 5 -X POST -H "Origin: http://127.0.0.1:$port" \
+    "http://127.0.0.1:$port/stop" >/dev/null 2>&1 || true
+  # 等待停止完成(daemon 侧 stop_dsh 最长 6s;给 7s 余量后不再阻塞)
+  for _ in $(seq 1 14); do
+    health="$(curl -s -m 2 "http://127.0.0.1:$port/health" 2>/dev/null || true)"
+    printf '%s' "$health" | grep -q '"dsh"[[:space:]]*:[[:space:]]*true' || return 0
+    sleep 0.5
+  done
+  warn "dsh 仍在运行(停止超时),继续安装;守护持锁期间不会重新拉起"
+  return 0
+}
 
 # ---------- 1) Node:优先复用系统已有 node(fnm/volta/nvm/PATH 均可,>=22 且带 npm);
 #                否则安装 nodejs.org 最新 LTS(DSH_RT_NO_SYSTEM_NODE=1 强制走此路径) ----------
@@ -209,8 +238,8 @@ CUR_DSH="$("$NODE_BIN" -e 'console.log(require(process.argv[1]).version)' "$DSH_
 
 # 检查是否需要编译 daemon (用于并行决策)
 NEED_COMPILE_DAEMON=0
-if [ -f "$ROOT/src/daemon.c" ] && command -v clang >/dev/null && [ ! -x "$ROOT/daemon" ]; then
-  SRC_MD5="$(md5 -q "$ROOT/src/daemon.c" 2>/dev/null || true)"
+if [ -n "$DAEMON_SRC" ] && command -v clang >/dev/null && [ ! -x "$ROOT/daemon" ]; then
+  SRC_MD5="$(md5 -q "$DAEMON_SRC" 2>/dev/null || true)"
   if [ ! -x "$RT_HOME/daemon" ] || [ "$SRC_MD5" != "$(cat "$RT_HOME/.daemon.md5" 2>/dev/null || true)" ]; then
     NEED_COMPILE_DAEMON=1
   fi
@@ -219,6 +248,7 @@ fi
 if [ -n "$LATEST" ] && [ "$CUR_DSH" != "$LATEST" ] || [ -z "$CUR_DSH" ]; then
   printf '{"name":"dsh-runtime-app","private":true,"dependencies":{"@deepseek-ai/dsh":"%s"},"pnpm":{"onlyBuiltDependencies":["node-pty","koffi","@deepseek-ai/dsh-subprocess-local"]}}\n' "${LATEST:-latest}" > "$APP_DIR/package.json"
   [ -f "$ROOT/pnpm-lock.yaml" ] && cp "$ROOT/pnpm-lock.yaml" "$APP_DIR/"
+  stop_active_dsh "$PORT"   # 依赖树即将被替换:先停掉正在运行的 dsh
   
   NPM_START="$SECONDS"
   if [ -z "$CUR_DSH" ] || [ -n "${DSH_RT_FORCE_REINSTALL:-}" ]; then
@@ -235,7 +265,7 @@ if [ -n "$LATEST" ] && [ "$CUR_DSH" != "$LATEST" ] || [ -z "$CUR_DSH" ]; then
   if [ "$NEED_COMPILE_DAEMON" = "1" ]; then
     echo "  ${D}同时编译 daemon (并行优化)...${R}"
     (
-      clang "${DAEMON_CFLAGS[@]}" -o "$RT_HOME/daemon.tmp" "$ROOT/src/daemon.c" 2>"$RT_HOME/.daemon.build.log" \
+      clang "${DAEMON_CFLAGS[@]}" -o "$RT_HOME/daemon.tmp" "$DAEMON_SRC" 2>"$RT_HOME/.daemon.build.log" \
         && mv "$RT_HOME/daemon.tmp" "$RT_HOME/daemon" \
         && echo "$SRC_MD5" > "$RT_HOME/.daemon.md5"
     ) &
@@ -321,17 +351,28 @@ ok "dsh=$DSH_BIN"
 # ---------- 4) 守护二进制(发行包预编译优先;否则本地 clang 编译;均 ad-hoc 签名) ----------
 h1 "4) 守护(按需唤醒,~1.3MB RSS)"
 install_daemon() { chmod +x "$RT_HOME/daemon"; codesign --force -s - "$RT_HOME/daemon" 2>/dev/null || true; }
-if [ -x "$ROOT/daemon" ] && [ "$(file -b "$ROOT/daemon" | grep -c "$(uname -m)")" = "1" ]; then
+# 架构兼容判定:macOS `file` 对 universal 二进制逐架构各输出一行("arm64" 出现多次),
+# 故不能用 `grep -c "$(uname -m)" = 1`——恒为 2,预编译分支永不命中,发行包被迫本地重编译
+# (违背"免本地编译"承诺,且无 clang 的机器直接退化)。改用子串匹配:含本机架构即可用。
+if [ -x "$ROOT/daemon" ] && [[ "$(file -b "$ROOT/daemon" 2>/dev/null)" == *"$(uname -m)"* ]]; then
   cp "$ROOT/daemon" "$RT_HOME/daemon"; install_daemon
+  # 一致性记录:优先用发行包随附的 .daemon.md5(release.yml 依打包源码生成);缺失则就地
+  # 计算源码指纹。使后续源码安装能据此判断免编译,而非因缺记录反复重编译。
+  if [ -f "$ROOT/.daemon.md5" ]; then
+    cp "$ROOT/.daemon.md5" "$RT_HOME/.daemon.md5"
+  elif [ -n "$DAEMON_SRC" ]; then
+    SRC_MD5="$(md5 -q "$DAEMON_SRC" 2>/dev/null || true)"
+    [ -n "$SRC_MD5" ] && printf '%s\n' "$SRC_MD5" > "$RT_HOME/.daemon.md5"
+  fi
   ok "发行包预编译($(uname -m))"
-elif [ -f "$ROOT/src/daemon.c" ] && command -v clang >/dev/null; then
-  SRC_MD5="$(md5 -q "$ROOT/src/daemon.c" 2>/dev/null || true)"
+elif [ -n "$DAEMON_SRC" ] && command -v clang >/dev/null; then
+  SRC_MD5="$(md5 -q "$DAEMON_SRC" 2>/dev/null || true)"
   if [ -x "$RT_HOME/daemon" ] && [ "$SRC_MD5" != "" ] && [ "$SRC_MD5" = "$(cat "$RT_HOME/.daemon.md5" 2>/dev/null || true)" ]; then
     install_daemon
     ok "守护已是最新(daemon.c 未变,免编译)"
   else
     echo "  ${D}clang 编译中 ...${R}"
-    clang "${DAEMON_CFLAGS[@]}" -o "$RT_HOME/daemon" "$ROOT/src/daemon.c" || { warn "守护编译失败"; exit 1; }
+    clang "${DAEMON_CFLAGS[@]}" -o "$RT_HOME/daemon" "$DAEMON_SRC" || { warn "守护编译失败"; exit 1; }
     [ -n "$SRC_MD5" ] && printf '%s\n' "$SRC_MD5" > "$RT_HOME/.daemon.md5"
     install_daemon
     ok "本地 clang 编译完成"
@@ -369,7 +410,7 @@ if [ "${DSH_INSTALL_NO_AGENT:-}" != "1" ]; then
         -e "s|__RT_STATE__|$RT_STATE|g" \
         -e "s|__LOG_DIR__|$LOG_DIR|g" \
         -e "s|__DSH_RT_PORT__|$PORT|g" "$TPL" > "$AGENT"
-    # plist 含路径拓扑(非密钥),但仍收 0600 最小暴露(默认 umask 022 会生成 0644)
+    # plist 含路径拓扑(非密钥),仍显式收 0600 最小暴露
     chmod 600 "$AGENT"
     # 清理旧名残留(改名前的 com.dshlauncher.daemon),避免旧守护占住端口
     launchctl bootout "gui/$(id -u)/com.dshlauncher.daemon" 2>/dev/null || true
