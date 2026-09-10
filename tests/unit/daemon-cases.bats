@@ -524,6 +524,67 @@ PY
   [ -f "$FAKE_DSH_MARKER" ] || { echo "  /health 报 dsh:true 但伪 dsh 未真正执行(marker 缺失)" >&2; return 1; }
 }
 
+@test "boot page re-fires /wake until dsh becomes ready" {
+  # 回归:引导页旧实现用 fired 守卫只 POST 一次 /wake —— 单次丢包,或服务端在更新期丢弃唤醒
+  # (spawn_dsh 的 install.lock 分支),页面就永久卡在「正在唤醒…」。新实现最多每 2s 重发一次。
+  # 这里真跑页面 JS:从 GET / 抽出 <script>,在 node 里用桩(fetch/document/Date.now/setTimeout)
+  # 驱动 tick() 若干轮并统计 /wake 次数 —— 断言行为而非对源码做字符串匹配
+  # (字符串门禁抓不住「守卫又加回来」这类回归)。
+  NODE="$(command -v node || true)"
+  [ -n "$NODE" ] || { echo "  node 不可用,无法驱动页面 JS" >&2; return 1; }
+  start_daemon_env '{"node":"/nonexistent/dsh-unit-node","dsh":"/nonexistent/dsh-unit-dsh"}'
+  curl -s "http://127.0.0.1:$PORT/" > "$BATS_TEST_TMPDIR/boot.html"
+  grep -q "DeepSeek Harness" "$BATS_TEST_TMPDIR/boot.html" \
+    || { echo "  GET / 未返回引导页(见 $BATS_TEST_TMPDIR/boot.html)" >&2; return 1; }
+  cat > "$BATS_TEST_TMPDIR/boot-harness.js" <<'JS'
+const fs = require('fs'), vm = require('vm');
+const html = fs.readFileSync(process.argv[2], 'utf8');
+const m = html.match(/<script>([\s\S]*?)<\/script>/);
+if (!m) { console.error('no <script> block'); process.exit(2); }
+let wakes = 0, healths = 0, domReady = null;
+const els = {};
+const mkEl = () => ({ style: {}, className: '', textContent: '', onclick: null });
+global.document = {
+  getElementById: (id) => (els[id] || (els[id] = mkEl())),
+  addEventListener: (ev, fn) => { if (ev === 'DOMContentLoaded') domReady = fn; },
+};
+global.window = { addEventListener: () => {} };
+global.navigator = {};
+global.location = { reload: () => {} };
+global.setTimeout = () => 0;   // 桩掉自调度,改由 harness 显式驱动 tick,避免无限循环
+global.setInterval = () => 0;
+global.fetch = (u) => {
+  const s = String(u);
+  if (s.indexOf('/health') === 0) { healths++; return Promise.resolve({ json: () => Promise.resolve({ dsh: false }) }); }
+  if (s === '/wake') { wakes++; return Promise.resolve({}); }
+  return Promise.resolve({});
+};
+let now = 1000000;
+Date.now = () => now;          // 假时钟:每轮前进 3s,跨过 2s 重发节流窗口
+vm.runInThisContext(m[1]);
+const flush = () => new Promise((r) => setImmediate(r));
+(async () => {
+  if (!domReady) { console.error('no DOMContentLoaded handler'); process.exit(3); }
+  domReady();                                    // 首次 tick 由页面自己发起
+  for (let i = 0; i < 6; i++) {
+    await flush();
+    now += 3000;
+    if (typeof globalThis.tick === 'function') globalThis.tick();
+  }
+  await flush();
+  console.log('wakes=' + wakes + ' healths=' + healths);
+})();
+JS
+  run "$NODE" "$BATS_TEST_TMPDIR/boot-harness.js" "$BATS_TEST_TMPDIR/boot.html"
+  [ "$status" -eq 0 ] || { echo "  页面 JS 驱动失败: $output" >&2; return 1; }
+  healths="$(printf '%s' "$output" | sed -n 's/.*healths=\([0-9]*\).*/\1/p')"
+  wakes="$(printf '%s' "$output" | sed -n 's/.*wakes=\([0-9]*\).*/\1/p')"
+  [ "${healths:-0}" -ge 3 ] \
+    || { echo "  轮询未推进(healths=$healths),harness 可能失效" >&2; return 1; }
+  [ "${wakes:-0}" -ge 3 ] \
+    || { echo "  7 轮 tick(每轮间隔 3s)只发出 ${wakes:-0} 次 /wake,引导页未重发唤醒" >&2; return 1; }
+}
+
 @test "lowercase origin header with correct value is accepted" {
   # 头字段名应大小写不敏感(RFC 7230):小写 origin: + 正确值不得被误拒为 CSRF(应 200 而非 403)
   start_daemon_env '{"node":"/nonexistent/dsh-unit-node","dsh":"/nonexistent/dsh-unit-dsh"}'

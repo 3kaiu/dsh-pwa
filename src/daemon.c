@@ -232,10 +232,13 @@ static int spawn_failure_count = 0;
 static time_t cooldown_until = 0; // 崩溃冷却截止(非阻塞:到期前拒绝拉起,主循环照常服务引导页)
 
 // 更新期被丢弃的唤醒:update_locked() 拒绝 spawn 时置位,主循环在锁释放后自行重试。
-// 必要性:引导页 JS 只在首次进入时 POST 一次 /wake(BOOT_PAGE 的 fired 守卫),之后仅轮询
-// /health,而 /health 不触发 spawn(只有 /wake 与页面请求会)。若那唯一一次唤醒恰好撞上
-// update-dsh.sh 持 .install.lock(守护启动后 10s 触发,持锁直到 npm view 返回),唤醒就被
-// 丢弃且无人重试 → 页面永久停在「正在唤醒…」。
+// 为什么重试责任在服务端(而不是等客户端再发一次 /wake):
+//   - /health 不触发 spawn,只有 /wake 与页面请求会。任何只轮询 /health 的客户端
+//     (冒烟测试即如此)在被拒后永远不会再发唤醒;
+//   - 已安装的 PWA 可能仍提供缓存中的旧引导页(旧版只发一次 /wake);
+//   - 被丢弃这件事只有服务端知道,客户端无从判断该不该重试。
+// 场景:守护启动后 10s 触发 update-dsh.sh,它持 .install.lock 直到 npm view 返回;
+// 此窗口内到达的 /wake 会被 spawn_dsh() 放弃,若无重试则页面永久停在「正在唤醒…」。
 // 实测:CI 冒烟 3b(并发双 /wake)在被拒后仅轮询 /health,卡满 300s 超时;同一提交重跑即绿,
 // 说明是依赖 npm view 时长的时序型缺陷,不是稳定失败。
 static int wake_pending = 0;
@@ -289,7 +292,8 @@ static void spawn_dsh(void) {
     // 更新持有 install.lock:本轮放弃 spawn(spawn_pid 保持 0,下次 /wake/页面请求自然重试);
     // /health 继续如实报 dsh:false,引导页 tick 持续轮询,更新完成后任一新请求即可拉起。
     // 只做一次非阻塞检查,绝不等待锁释放。
-    // 同时记 pending:客户端未必再发 /wake(引导页只发一次),锁释放后由主循环自愈重试。
+    // 同时记 pending:客户端未必再发 /wake(只轮询 /health 的客户端、以及缓存了旧版引导页的
+    // PWA 都不会),锁释放后由主循环自愈重试。
     fprintf(stderr, "daemon: 更新进行中(install.lock 持有存活 pid),本轮不拉起 dsh\n");
     wake_pending = 1;
     return;
@@ -567,7 +571,7 @@ static const char TPL_HEAD[] =
   "<div id=\"log\">日志目录: ";
 static const char TPL_TAIL[] =
   "</div></div><script>"
-  "var fired=false,t0=Date.now(),notok=0;"
+  "var lastWake=0,t0=Date.now(),notok=0;"
   "function $(id){return document.getElementById(id)}"
   "function tick(){fetch('/health').then(function(r){return r.json()}).then(function(h){"
   "if(h.dsh){"
@@ -580,7 +584,13 @@ static const char TPL_TAIL[] =
   "notok=0;$('ring').className='ring done';$('status').textContent='已就绪,正在进入…';setTimeout(function(){"
   "h.token?fetch('/?token='+encodeURIComponent(h.token)).catch(function(){}).finally(function(){location.reload()}):location.reload()},150);return}"
   "notok=0;"
-  "if(!fired){fired=true;$('status').textContent='正在唤醒…';fetch('/wake',{method:'POST'})}"
+  // /wake 重发(最多每 2s 一次),不再只发一次:
+  //   1) 单次 POST 丢包(瞬时网络错误)时旧实现永久卡在引导页——fetch 的 rejection 无人处理;
+  //   2) 服务端可能主动丢弃唤醒(update-dsh.sh 持 .install.lock 期间 spawn_dsh() 放弃本轮),
+  //      旧实现把自愈完全押在「客户端再发一次」上,而这里恰好只发一次。
+  // 守护侧 request_wake 幂等(主进程按 spawn_pid/dsh_up 判定,多个唤醒至多 spawn 一次),
+  // 故 2s 重发不产生重复实例;dsh 就绪后页面即跳转,重发自然停止。
+  "var nw=Date.now();if(nw-lastWake>2000){lastWake=nw;$('status').textContent='正在唤醒…';fetch('/wake',{method:'POST'}).catch(function(){})}"
   "var s=Math.floor((Date.now()-t0)/1000);"
   "$('status').textContent='正在启动 DeepSeek Harness…'+(s>=3?'(已等待 '+s+' 秒)':'');"
   "if(s>=600){$('err').style.display='block';$('err').textContent='启动超时(超过 10 分钟)。日志: '+document.getElementById('log').textContent;$('retry').style.display='block'}"
@@ -588,7 +598,7 @@ static const char TPL_TAIL[] =
   "document.addEventListener('DOMContentLoaded',function(){"
   "setInterval(function(){try{fetch('/ping',{method:'POST',keepalive:true})}catch(e){}},10000);" // 在场心跳:页开着即续租(hidden 也照发,后台≠关闭)
   "window.addEventListener('pagehide',function(){try{if(navigator.sendBeacon)navigator.sendBeacon('/goodbye','')}catch(e){}try{fetch('/goodbye',{method:'POST',keepalive:true})}catch(e){}});" // 关闭信标:守护 GOODBYE_GRACE 后快停;reload 会立刻重连自动解除
-  "document.getElementById('retry').onclick=function(){$('err').style.display='none';this.style.display='none';fired=false;t0=Date.now();notok=0;tick()};tick()})"
+  "document.getElementById('retry').onclick=function(){$('err').style.display='none';this.style.display='none';lastWake=0;t0=Date.now();notok=0;tick()};tick()})"
   "</script></body></html>";
 
 // HTML 转义(防路径注入:RT_STATE 用户可控,防御纵深)。o 容量不足时安全截断并 NUL 收尾。
