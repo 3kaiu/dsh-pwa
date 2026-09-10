@@ -74,6 +74,11 @@ teardown() {
     kill "$FAKE_DSH_PID" 2>/dev/null || true
     FAKE_DSH_PID=""
   fi
+  if [ -n "${VICTIM_PID:-}" ]; then
+    kill "$VICTIM_PID" 2>/dev/null || true
+    wait "$VICTIM_PID" 2>/dev/null || true
+    VICTIM_PID=""
+  fi
   stop_daemon_env
 }
 
@@ -912,4 +917,74 @@ PY
     sleep 0.2
   done
   [ "$revived" = "1" ] || { echo "  /wake 未重新拉起 dsh(或 pid 未变化)(日志见 $TMP_ENV/daemon.log)" >&2; return 1; }
+}
+
+@test "stop skips signaling when dsh.pid points at non-node process (PID reuse guard)" {
+  # stop_dsh 发信号前必须核对可执行路径(proc_pidpath)。黑盒近似「PID 被回收给无关进程」的
+  # 最坏场景:dsh 就绪后把 dsh.pid 覆写为另一个活进程(sleep)的 pid——kill(pid,0) 恒通过,
+  # 旧实现会误发 SIGTERM/SIGKILL 打死无辜进程。新实现发现其可执行文件非 node 后应跳过信号、
+  # 只清状态文件并记日志:受害 sleep 必须存活,状态文件被清,日志出现复用判定。
+  PY="$(command -v python3 || true)"
+  [ -n "$PY" ] || { echo "  python3 不可用" >&2; return 1; }
+  cat > "$BATS_TEST_TMPDIR/fake-dsh-reuse.py" <<'PY'
+#!/usr/bin/env python3
+import os, socket, sys
+args = sys.argv
+port = 0
+for i in range(len(args) - 1):
+    if args[i] == "--port":
+        port = int(args[i + 1])
+sys.stdout.write("dsh web: http://127.0.0.1:%d/?token=reuseTok9\n" % port)
+sys.stdout.flush()
+ppid = os.getppid()
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port))
+s.listen(16)
+s.settimeout(1.0)
+while True:
+    if os.getppid() != ppid:
+        break
+    try:
+        c, _ = s.accept()
+    except socket.timeout:
+        continue
+    except OSError:
+        break
+    try:
+        c.recv(1024)
+        c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+    except OSError:
+        pass
+    c.close()
+PY
+  start_daemon_env "{\"node\":\"$PY\",\"dsh\":\"$BATS_TEST_TMPDIR/fake-dsh-reuse.py\"}"
+  run curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "Origin: http://127.0.0.1:$PORT" \
+    "http://127.0.0.1:$PORT/wake"
+  assert_status "200"
+  daemon_wait_health "$PORT" true 5 || { echo "  伪 dsh 未就绪(日志见 $TMP_ENV/daemon.log)" >&2; return 1; }
+  # 受害进程:sleep 模拟「PID 被回收后的无关进程」(kill -0 恒通过但可执行文件非 node);
+  # 注意后续操作需在 IDLE_STOP(2s) 窗口内完成,避免空闲停机路径先以真实 dsh pid 抢先执行
+  sleep 60 &
+  VICTIM_PID=$!
+  # 覆写 dsh.pid 模拟 PID 复用(真实场景:dsh 已死、其 PID 被分配给 sleep)
+  printf '%s\n' "$VICTIM_PID" > "$DSH_RT_STATE/dsh.pid"
+  run curl -s -o /dev/null -w '%{http_code}' --max-time 3 -X POST \
+    -H "Origin: http://127.0.0.1:$PORT" \
+    "http://127.0.0.1:$PORT/stop"
+  assert_status "200"
+  ok=""
+  for _ in $(seq 1 30); do
+    # 受害进程必须存活(未被误杀);状态文件被清;日志出现 PID 复用判定
+    if kill -0 "$VICTIM_PID" 2>/dev/null \
+       && [ ! -f "$DSH_RT_STATE/dsh.pid" ] \
+       && [ ! -f "$DSH_RT_STATE/dsh.json" ] \
+       && grep -q '疑似被复用' "$TMP_ENV/daemon.log" 2>/dev/null; then
+      ok=1
+      break
+    fi
+    sleep 0.2
+  done
+  [ "$ok" = "1" ] || { echo "  stop_dsh 对非 node pid 未跳过信号(受害进程被误杀或状态未清,日志见 $TMP_ENV/daemon.log)" >&2; return 1; }
 }

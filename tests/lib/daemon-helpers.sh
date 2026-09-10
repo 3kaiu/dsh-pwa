@@ -5,6 +5,7 @@
 #   - scripts/smoke-test.sh
 #   - tests/security-verification.sh
 #   - tests/unit/daemon-cases.bats
+#   - tests/auto-update-verify.sh(仅用 pick_free_port)
 #
 # 约定(与 daemon 读取一致的环境变量,由调用方 export):
 #   DSH_RT_HOME / DSH_RT_STATE / DSH_HOME / DSH_RT_PORT

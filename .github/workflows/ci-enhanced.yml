@@ -51,6 +51,9 @@ jobs:
       - name: 安全验证套件
         run: bash tests/security-verification.sh
 
+      - name: 自动更新功能验证套件
+        run: bash tests/auto-update-verify.sh
+
   static-analysis:
     name: 静态分析
     runs-on: macos-latest

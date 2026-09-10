@@ -31,6 +31,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <launch.h>
+#include <libproc.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
@@ -378,19 +380,57 @@ static void scan_token(void) {
   token_scan_off += (n > 64) ? n - 64 : 0; // 保留尾部,防模式跨读取窗口被劈开
 }
 
+// PID 复用核对(仅对「非本进程 spawn」的 pid 调用):dsh 崩溃后其 PID 可被系统回收并分配给
+// 无关进程,此时 kill(pid,0) 恒通过,照旧发信号会误杀无辜者(且 kill(-pid) 打的是整个进程组)。
+// proc_pidpath(3)(macOS 专有)取 pid 对应进程的可执行真实路径,与 realpath(NODE_BIN) 比较:
+// dsh 以 node 启动(exec NODE_BIN),两边都是解析后的真实路径(NODE_BIN 可能是 fnm/mise 等
+// 符号链接);realpath 不可用时(NODE_BIN 查不到)退化为 basename 匹配 "node" 兜底。
+// 返回:1=与 node 一致;0=不一致(PID 疑似被复用);-1=检查失败(进程恰在检查瞬间消失等,
+// 或 proc_pidpath 不可用)→ 调用方 fail-open 保持旧 kill(pid,0) 行为。
+// pbuf(可选,带回检测到的可执行路径供日志展示,失败时置空)。
+static int pid_is_node(int pid, char *pbuf, size_t pcap) {
+  char pb[1024];
+  ssize_t n = proc_pidpath(pid, pb, sizeof pb);
+  if (pbuf) pbuf[0] = 0;
+  if (n <= 0 || (size_t)n >= sizeof pb) return -1;
+  pb[n] = 0; // proc_pidpath 不保证 NUL 结尾
+  if (pbuf) snprintf(pbuf, pcap, "%s", pb);
+  char rn[PATH_MAX];
+  if (realpath(NODE_BIN, rn)) return strcmp(pb, rn) == 0;
+  const char *bn = strrchr(pb, '/');
+  return strcmp(bn ? bn + 1 : pb, "node") == 0;
+}
+
 static void stop_dsh(void) {
   int pid = read_pid();
   // 本函数收割 dsh 后必须同步清 spawn_pid:主循环靠 waitpid(-1)+is_spawn 清它,
   // 若这里已收走尸体而 spawn_pid 残留,下次 /wake 会误判"在启动中"而永不拉起。
   // (连接子进程里清的是 fork 继承的副本,无害;父进程靠主循环收僵尸时清。)
-  if (pid > 0 && pid == spawn_pid) spawn_pid = 0;
+  int was_spawn = (pid > 0 && pid == spawn_pid);
+  if (was_spawn) spawn_pid = 0;
   if (pid > 0) {
-    // 先验证 PID 是否真实存在(避免误杀回收后的同号进程)
+    // 先验证 PID 是否真实存在:已死则直接清理状态文件
     if (kill(pid, 0) != 0) {
-      // PID 已不存在,直接清理状态文件
       unlink(DSH_JSON);
       unlink(PID_FILE);
       return;
+    }
+    // PID 复用加固:kill(pid,0) 只证明「存在」,不证明「还是那个进程」。本进程亲自 spawn 的
+    // 子进程(dsh)身份由 fork+exec 一次性锁定,存活即 dsh 本体,无需再验(exec 单向,子进程
+    // 不可能变成无关进程);只有 pid 非自己 spawn(残留/被篡改的 dsh.pid、重启收养)时才用
+    // proc_pidpath(3) 核对可执行路径与 node 一致——匹配才发信号;不匹配 = PID 被回收给了
+    // 无关进程 → 只清状态文件并记日志(误杀危害 > 漏杀,漏杀有引导页自愈兜底)。
+    // 检查失败(进程恰在瞬间消失等)→ fail-open 保持旧行为(兼容)。
+    if (!was_spawn) {
+      char exe[1024];
+      int match = pid_is_node(pid, exe, sizeof exe);
+      if (match < 0) match = 1;
+      if (!match) {
+        fprintf(stderr, "daemon: 停止 dsh 时 pid %d 可执行路径[%s]非 node(PID 疑似被复用),只清理状态文件\n", pid, exe);
+        unlink(DSH_JSON);
+        unlink(PID_FILE);
+        return;
+      }
     }
     // dsh 经 setsid 自成进程组(node + pty 子进程同组):负 PID 整组发信号,防 pty 孤儿残留
     if (kill(-pid, SIGTERM) == 0 || kill(pid, SIGTERM) == 0) {
@@ -932,10 +972,18 @@ int main(void) {
   for (;;) {
     double now = mono_now();
     // 优化: 仅在 dsh 状态变化时重读 dsh.json (减少 60% 系统调用)
-    int reaped;
-    while ((reaped = waitpid(-1, NULL, WNOHANG)) > 0) {
+    int reaped, reaped_st;
+    while ((reaped = waitpid(-1, &reaped_st, WNOHANG)) > 0) {
       // dsh 本体退出(崩溃/被停)不是连接;清 spawn_pid 允许再次唤醒,清就绪缓存
       if (is_spawn(reaped)) {
+        // 排障日志:dsh 退出方式(正常退出码 / 信号)对崩溃自愈与停机诊断有用。
+        // 主动停机路径由 stop_dsh 先收尸(spawn_pid 已清零),故这里只覆盖崩溃/被外部杀等被动退出
+        if (WIFEXITED(reaped_st))
+          fprintf(stderr, "daemon: dsh 已退出(pid %d,退出码 %d),清理状态\n", reaped, WEXITSTATUS(reaped_st));
+        else if (WIFSIGNALED(reaped_st))
+          fprintf(stderr, "daemon: dsh 已退出(pid %d,信号 %d),清理状态\n", reaped, WTERMSIG(reaped_st));
+        else
+          fprintf(stderr, "daemon: dsh 已退出(pid %d),清理状态\n", reaped);
         spawn_pid = 0;
         ready_port = 0;
         reset_token(); // 进程已死,launch token 随之作废

@@ -2,21 +2,21 @@
 
 **测试日期:** 2026-09-09  
 **测试人员:** 待定  
-**状态:** ✅ 代码就绪，待安装测试
+**状态:** ✅ 核心逻辑已自动化回归(tests/auto-update-verify.sh,CI 门禁);需真实环境的破坏性项保持人工验收
 
 ---
 
 ## 预检清单
 
 ### 编译验证
-- [x] daemon.c 编译通过（零警告）
-- [x] daemon 大小 85KB（universal binary）
-- [x] daemon 包含 arm64 + x86_64 架构
+- [x] daemon.c 编译通过（零警告） ✅ 已自动化(见 tests/security-verification.sh 测试 7)
+- [x] daemon 大小 85KB（universal binary） ✅ 已自动化(见 tests/security-verification.sh 测试 7)
+- [x] daemon 包含 arm64 + x86_64 架构 ✅ 已自动化(见 tests/security-verification.sh 测试 7)
 
 ### 脚本验证
-- [x] update-dsh.sh 语法检查通过
-- [x] update-dsh.sh 使用 mkdir 原子锁（macOS 兼容）
-- [x] com.dshpwa.updater.plist XML 格式正确
+- [x] update-dsh.sh 语法检查通过 ✅ 已自动化(见 tests/auto-update-verify.sh 测试 10)
+- [x] update-dsh.sh 使用 mkdir 原子锁（macOS 兼容） ✅ 已自动化(见 tests/auto-update-verify.sh 测试 5/6)
+- [x] com.dshpwa.updater.plist XML 格式正确 ✅ 已自动化(见 tests/auto-update-verify.sh 测试 1)
 - [x] install.sh 包含 updater 注册逻辑
 
 ### 环境变量
@@ -27,6 +27,9 @@
 ---
 
 ## 功能测试（需要真实环境）
+
+> 可自动化的验收点已落地为 tests/auto-update-verify.sh(隔离目录 + 假 npm/pnpm,不触网),
+> CI 门禁运行;以下仅保留需真实安装/断网/改真实 package.json 的破坏性项。
 
 ### 测试 1：后台异步更新
 
@@ -65,7 +68,7 @@ rm -rf ~/.local/share/dsh-runtime ~/.local/state/dsh-runtime
 
 ---
 
-### 测试 3：文件锁机制
+### 测试 3：文件锁机制 ✅ 已自动化(见 tests/auto-update-verify.sh 测试 5 并发互斥 / 测试 6 僵尸锁)
 
 **步骤:**
 ```bash
@@ -111,7 +114,7 @@ launchctl list | grep dshpwa
 
 ---
 
-### 测试 5：更新日志轮转
+### 测试 5：更新日志轮转 ✅ 已自动化(见 tests/auto-update-verify.sh 测试 9;实现阈值 2MB,轮转为 update.log.1)
 
 **步骤:**
 ```bash
@@ -155,7 +158,7 @@ open http://127.0.0.1:3080
 
 ---
 
-### 测试 7：版本验证
+### 测试 7：版本验证 ✅ 干跑升级路径已自动化(见 tests/auto-update-verify.sh 测试 3/4);真实 registry 升级仍需手动
 
 **步骤:**
 ```bash
@@ -185,7 +188,7 @@ tail -20 ~/.local/state/dsh-runtime/logs/update.log
 
 ---
 
-### 测试 8：僵尸锁清理
+### 测试 8：僵尸锁清理 ✅ 已自动化(见 tests/auto-update-verify.sh 测试 6)
 
 **步骤:**
 ```bash
