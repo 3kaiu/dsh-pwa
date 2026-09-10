@@ -91,3 +91,35 @@ teardown() {
   done
   [ "$bad" -eq 0 ]
 }
+
+@test "every loopback curl in CI-executed shell scripts carries a timeout" {
+  # 回环 curl 必须带 --max-time / -m:守护「已 bind 未 listen」时 macOS 直接丢弃 SYN(不回 RST),
+  # 无超时的 curl 会一直挂到作业级 timeout-minutes(30min),把真实缺陷掩盖成「卡住」——
+  # 本次 CI 排查正是被这种「只看到卡住、看不到原因」拖慢的。
+  # awk 先合并反斜杠续行,避免「curl 在一行、URL 在下一行」时漏检。
+  # 命中 127.0.0.1 与 localhost(daemon 的 host_ok/origin_ok 两者都放行,将来可能有人写 localhost)。
+  # 范围仅 shell 脚本;bats 用例不纳入:其 curl 都在 daemon_wait_health(自带 --max-time 2)
+  # 确认守护已监听之后,且守护已死时是连接拒绝(快速失败)而非挂起。
+  offenders="$(
+    for f in "$ROOT"/scripts/*.sh "$ROOT"/tests/*.sh "$ROOT"/tests/lib/*.sh; do
+      awk -v F="$f" '
+        function bad(l,   t) {
+          t = l; sub(/^[ \t]+/, "", t)
+          if (substr(t, 1, 1) == "#") return 0
+          if (t !~ /curl/) return 0
+          if (t !~ /127\.0\.0\.1/ && t !~ /localhost/) return 0
+          if (t ~ /--max-time[= ][0-9]/ || t ~ /-m [0-9]/) return 0
+          return 1
+        }
+        { l = (buf == "" ? $0 : buf " " $0); buf = "" }
+        l ~ /\\$/ { sub(/\\$/, "", l); buf = l; next }
+        bad(l) { printf "%s:%d: %s\n", F, FNR, l }
+        END { if (buf != "" && bad(buf)) printf "%s: %s\n", F, buf }
+      ' "$f"
+    done
+  )"
+  if [ -n "$offenders" ]; then
+    printf '  无超时的回环 curl(请补 --max-time):\n%s\n' "$offenders" >&2
+  fi
+  [ -z "$offenders" ]
+}

@@ -10,7 +10,7 @@ RT_HOME="${DSH_RT_HOME:-$HOME/.local/share/dsh-runtime}"
 DAEMON_PID="$(pgrep -f "$RT_HOME/daemon" | head -1 || true)"
 if [ -z "$DAEMON_PID" ]; then
   echo "❌ 守护进程未运行" >&2
-  echo "提示: 运行 'curl -fsS http://127.0.0.1:3080/health' 触发 launchd socket activation 拉起守护进程" >&2
+  echo "提示: 运行 'curl -fsS --max-time 5 http://127.0.0.1:3080/health' 触发 launchd socket activation 拉起守护进程" >&2
   exit 1
 fi
 

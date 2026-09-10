@@ -121,7 +121,8 @@ jobs:
           BPID=$!
           trap 'kill "$BPID" 2>/dev/null || true' EXIT
           for _ in $(seq 1 20); do
-            curl -fsS -o /dev/null "http://127.0.0.1:3080/health" 2>/dev/null && break
+            # 带超时:守护「已 bind 未 listen」时 macOS 丢弃 SYN,无超时的 curl 会挂死整个 job
+            curl -fsS --max-time 2 -o /dev/null "http://127.0.0.1:3080/health" 2>/dev/null && break
             sleep 0.5
           done
           if DSH_RT_PORT=3080 bash scripts/benchmark.sh; then

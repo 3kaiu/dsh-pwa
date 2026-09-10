@@ -11,6 +11,14 @@ PASS=0; FAIL=0
 # shellcheck source=/dev/null
 source "$ROOT/tests/lib/daemon-helpers.sh"
 
+# 回环请求约定:所有访问 127.0.0.1 的 curl 都带 --max-time + --noproxy '*'(理由同 smoke-test.sh):
+#   --max-time:守护「已 bind 未 listen」时 macOS 丢弃 SYN,无超时的 curl 会挂到作业级 30min 超时;
+#   --noproxy:curl 默认把 127.0.0.1 交给 http_proxy,「守护已死」会返回代理的 502 而非连接拒绝。
+# 本节断言比对精确状态码,故失败时 HTTP_CODE 的取值必须可信:
+#   000 = 连不上 / 挂满超时(真实失败); 502 = 请求被代理拦截(环境问题,非守护行为)。
+# 另注:本脚本 set -e,`X=$(curl ...)` 未加 `|| true` 时 curl 失败会直接终止整个脚本
+# (后面的用例不再执行、守护也不会被 daemon_stop 清理),故赋值一律带 `|| true`,由断言报错。
+
 # 颜色输出
 if [ -t 1 ]; then
   G=$'\033[32m'; R=$'\033[31m'; B=$'\033[1m'; D=$'\033[2m'; RST=$'\033[0m'
@@ -91,7 +99,7 @@ if daemon_compile "$TMPD/daemon" -arch arm64 -arch x86_64; then
   # 等待 daemon 就绪(梯度退避,6s 上限)
   if daemon_wait_health "$TEST_PORT" any 6; then
   # 测试1: 缺少 Origin 应返回 403
-  HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$TEST_PORT/wake" 2>/dev/null)
+  HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 --noproxy '*' -X POST "http://127.0.0.1:$TEST_PORT/wake" 2>/dev/null || true)
   if [ "$HTTP_CODE" = "403" ]; then
     ok "CSRF 运行时：无 Origin 返回 403"
   else
@@ -99,9 +107,9 @@ if daemon_compile "$TMPD/daemon" -arch arm64 -arch x86_64; then
   fi
   
   # 测试2: 错误端口应返回 403（端口严格校验）
-  HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 --noproxy '*' -X POST \
     -H "Origin: http://127.0.0.1:$((TEST_PORT + 1))" \
-    "http://127.0.0.1:$TEST_PORT/wake" 2>/dev/null)
+    "http://127.0.0.1:$TEST_PORT/wake" 2>/dev/null || true)
   if [ "$HTTP_CODE" = "403" ]; then
     ok "CSRF 运行时：错误端口返回 403（端口严格校验）"
   else
@@ -109,9 +117,9 @@ if daemon_compile "$TMPD/daemon" -arch arm64 -arch x86_64; then
   fi
   
   # 测试3: 正确 Origin 应返回 200
-  HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 --noproxy '*' -X POST \
     -H "Origin: http://127.0.0.1:$TEST_PORT" \
-    "http://127.0.0.1:$TEST_PORT/wake" 2>/dev/null)
+    "http://127.0.0.1:$TEST_PORT/wake" 2>/dev/null || true)
   if [ "$HTTP_CODE" = "200" ]; then
     ok "CSRF 运行时：正确 Origin 返回 200"
   else
@@ -119,9 +127,9 @@ if daemon_compile "$TMPD/daemon" -arch arm64 -arch x86_64; then
   fi
 
   # 测试4: 恶意 Host(DNS rebinding 模拟)应返回 403
-  HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+  HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 --noproxy '*' \
     -H "Host: evil.com" \
-    "http://127.0.0.1:$TEST_PORT/health" 2>/dev/null)
+    "http://127.0.0.1:$TEST_PORT/health" 2>/dev/null || true)
   if [ "$HTTP_CODE" = "403" ]; then
     ok "Host 校验：恶意 Host(evil.com)返回 403"
   else
@@ -129,8 +137,8 @@ if daemon_compile "$TMPD/daemon" -arch arm64 -arch x86_64; then
   fi
 
   # 测试5: 正常 Host(127.0.0.1:PORT)应返回 200
-  HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
-    "http://127.0.0.1:$TEST_PORT/health" 2>/dev/null)
+  HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 --noproxy '*' \
+    "http://127.0.0.1:$TEST_PORT/health" 2>/dev/null || true)
   if [ "$HTTP_CODE" = "200" ]; then
     ok "Host 校验：正常 Host(127.0.0.1:$TEST_PORT)返回 200"
   else

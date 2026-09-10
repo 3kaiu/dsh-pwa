@@ -17,6 +17,15 @@ step() { echo; echo "== $* =="; }
 # shellcheck source=/dev/null
 source "$ROOT/tests/lib/daemon-helpers.sh"
 
+# 回环请求约定:本脚本所有访问 127.0.0.1 的 curl 都必须同时带下面两个参数。
+#   --max-time:守护「已 bind 未 listen」时 macOS 直接丢弃 SYN(不回 RST),无超时的 curl
+#     会一直挂到作业级 timeout-minutes(30min),把真实缺陷掩盖成「卡住」——本次排查的起点
+#     正是这种「只看到卡住、看不到原因」。实测该状态:挂满 --max-time 后 rc=28 且
+#     http_code=000(而非空串),失败信息因此仍然准确。
+#   --noproxy '*':curl 默认会把 127.0.0.1 的请求交给 http_proxy(实测 curl 8.7.1 打印
+#     "Uses proxy env variable http_proxy"),此时「守护已死」拿到的是代理的 502 而不是
+#     连接拒绝(000),断言与报错全部失真。代理存在与否不应改变本套件的结论。
+# 注意:仅回环请求加 --noproxy;install.sh 子进程仍需走代理访问 nodejs.org/npm registry。
 step "1/5 install(真实安装:node 最新 LTS + dsh latest)"
 bash "$INSTALL" || fail "install"
 [ -x "$RT_HOME/daemon" ] || fail "daemon 未安装"
@@ -66,11 +75,12 @@ trap 'daemon_stop "$DAEMON_PID" 2>/dev/null || true' EXIT
 # 梯度探测:前 10 次 500ms(快速启动),10-60 次 1s(正常),60+ 次 2s(慢启动)
 daemon_wait_health "$SMOKE_PORT" any 5 || fail "daemon 未就绪"
 # GET / 返回引导页,同时已自动拉起 dsh(无需引导页 JS 的 /wake 往返)
-curl -fsS "http://127.0.0.1:$SMOKE_PORT/" | grep -q "DeepSeek Harness" || fail "引导页异常"
-curl -fsS "http://127.0.0.1:$SMOKE_PORT/manifest.webmanifest" | grep -q '"display"' || fail "manifest 异常"
+curl -fsS --max-time 5 --noproxy '*' "http://127.0.0.1:$SMOKE_PORT/" | grep -q "DeepSeek Harness" || fail "引导页异常"
+curl -fsS --max-time 5 --noproxy '*' "http://127.0.0.1:$SMOKE_PORT/manifest.webmanifest" | grep -q '"display"' || fail "manifest 异常"
 # /health 报"就绪"(能服务 HTTP)而非"进程活着":启动窗口内必须为 false,
 # 引导页才不会过早切换(即 PWA 点开空白的根因)
-h="$(curl -fsS "http://127.0.0.1:$SMOKE_PORT/health")"
+# 断言取 body:curl 失败时 body 为空 → 下面 grep 失败并打印空值,报错依然可读
+h="$(curl -fsS --max-time 5 --noproxy '*' "http://127.0.0.1:$SMOKE_PORT/health" || true)"
 echo "$h" | grep -q '"dsh":false' || fail "dsh 刚拉起时尚未就绪,health 不应为 true: $h"
 # 梯度等待 dsh 就绪:前 10 次 500ms,后 50 次 1s,再后 2s(总计约 3 分钟)
 daemon_wait_health "$SMOKE_PORT" true 300 1 || fail "自动唤醒后 dsh 未就绪"
@@ -81,7 +91,7 @@ daemon_wait_health "$SMOKE_PORT" true 300 1 || fail "自动唤醒后 dsh 未就�
 TOKEN=""
 for _ in $(seq 1 20); do
   T="$(grep -o 'token=[A-Za-z0-9_-]*' "$RT_STATE/logs/dsh.log" 2>/dev/null | head -1 | cut -d= -f2 || true)"
-  if [ -n "$T" ] && curl -fsS "http://127.0.0.1:$SMOKE_PORT/health" | grep -q "\"token\":\"$T\""; then
+  if [ -n "$T" ] && curl -fsS --max-time 5 --noproxy '*' "http://127.0.0.1:$SMOKE_PORT/health" | grep -q "\"token\":\"$T\""; then
     TOKEN="$T"; break
   fi
   sleep 0.5
@@ -91,31 +101,33 @@ LOG_TOK="$(grep -o 'token=[A-Za-z0-9_-]*' "$RT_STATE/logs/dsh.log" 2>/dev/null |
 [ -z "$LOG_TOK" ] || [ -n "$TOKEN" ] || fail "/health 未携带已捕获的 token(引导页无法完成鉴权握手)"
 if [ -n "$TOKEN" ]; then
   # PWA 冷启动场景:就绪但无 dsh-auth cookie 的 GET / 必须得到引导页(而非 dsh 的 401)
-  no_cookie="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$SMOKE_PORT/")"
+  no_cookie="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 --noproxy '*' "http://127.0.0.1:$SMOKE_PORT/" || true)"
   [ "$no_cookie" = "200" ] || fail "无 cookie 的 GET / 返回 $no_cookie(应为引导页 200,PWA 冷启动会 401)"
-  curl -fsS "http://127.0.0.1:$SMOKE_PORT/" | grep -q "DeepSeek Harness" \
+  curl -fsS --max-time 5 --noproxy '*' "http://127.0.0.1:$SMOKE_PORT/" | grep -q "DeepSeek Harness" \
     || fail "无 cookie 的 GET / 应返回引导页(供 PWA 完成 token 握手)"
   # 就绪后 manifest 也必须是守护自己的(PWA 安装身份不得绑定 dsh 内部端口)
-  curl -fsS "http://127.0.0.1:$SMOKE_PORT/manifest.webmanifest" | grep -q '"start_url":"/"' \
+  curl -fsS --max-time 5 --noproxy '*' "http://127.0.0.1:$SMOKE_PORT/manifest.webmanifest" | grep -q '"start_url":"/"' \
     || fail "就绪后 manifest 未由守护应答(PWA 会绑到 dsh 行为)"
   # 握手必须真的透传到 dsh 换取会话:只断言 200 测不出 F1 类死循环 bug(引导页也是 200),
   # 必须断言响应携带 Set-Cookie: dsh-auth(dsh 0.1.5+ 的持久会话 cookie)
-  curl -fsS -o /dev/null -D "$SMOKE_ROOT/handshake.headers" -c "$SMOKE_ROOT/cookies.txt" \
+  curl -fsS --max-time 5 --noproxy '*' -o /dev/null -D "$SMOKE_ROOT/handshake.headers" -c "$SMOKE_ROOT/cookies.txt" \
     "http://127.0.0.1:$SMOKE_PORT/?token=$TOKEN" \
     || fail "token 握手失败(dsh 0.1.5+ 鉴权)"
   grep -qi '^set-cookie:.*dsh-auth' "$SMOKE_ROOT/handshake.headers" \
     || fail "token 握手响应未携带 Set-Cookie: dsh-auth(握手疑似被引导页拦截,引导页会无限 reload): $(tr -d '\r' < "$SMOKE_ROOT/handshake.headers" | head -5 | tr '\n' ' ')"
-  code="$(curl -s -o /dev/null -w '%{http_code}' -b "$SMOKE_ROOT/cookies.txt" "http://127.0.0.1:$SMOKE_PORT/")"
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 --noproxy '*' -b "$SMOKE_ROOT/cookies.txt" "http://127.0.0.1:$SMOKE_PORT/" || true)"
 else
-  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$SMOKE_PORT/")"
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 --noproxy '*' "http://127.0.0.1:$SMOKE_PORT/" || true)"
 fi
 [ "$code" = "200" ] || fail "透传 UI 返回 $code(token=${TOKEN:0:6}...)"
 echo "OK: 引导页 + 自动唤醒 + 就绪门控 + 透传${TOKEN:+(token 鉴权)}通过"
 
 step "3b/5 并发双 /wake 幂等(只允许 1 个 dsh 实例)"
-curl -fsS -X POST -H "Origin: http://127.0.0.1:$SMOKE_PORT" "http://127.0.0.1:$SMOKE_PORT/stop" >/dev/null || fail "/stop"
+curl -fsS --max-time 5 --noproxy '*' -X POST -H "Origin: http://127.0.0.1:$SMOKE_PORT" "http://127.0.0.1:$SMOKE_PORT/stop" >/dev/null || fail "/stop"
 daemon_wait_health "$SMOKE_PORT" false 60 || fail "stop 后 dsh 未停止"
-( curl -fsS -X POST -H "Origin: http://127.0.0.1:$SMOKE_PORT" "http://127.0.0.1:$SMOKE_PORT/wake" >/dev/null &   curl -fsS -X POST -H "Origin: http://127.0.0.1:$SMOKE_PORT" "http://127.0.0.1:$SMOKE_PORT/wake" >/dev/null & wait )
+# 两个 /wake 并发:守护在连接子进程里只写 1 字节命令即返回,响应本身是毫秒级;
+# 失败不在此处断言(wait 无参恒返回 0),由下面的就绪等待给出可读结论。
+( curl -fsS --max-time 5 --noproxy '*' -X POST -H "Origin: http://127.0.0.1:$SMOKE_PORT" "http://127.0.0.1:$SMOKE_PORT/wake" >/dev/null &   curl -fsS --max-time 5 --noproxy '*' -X POST -H "Origin: http://127.0.0.1:$SMOKE_PORT" "http://127.0.0.1:$SMOKE_PORT/wake" >/dev/null & wait )
 # 梯度等待:前 10 次 500ms,后 50 次 1s,再后 2s
 daemon_wait_health "$SMOKE_PORT" true 300 || fail "双唤醒后 dsh 未就绪"
 if ps -ax -o command >/dev/null 2>&1; then
@@ -210,13 +222,13 @@ PY
   sleep 0.5
   if pgrep -f "$RT_HOME/daemon" >/dev/null; then fail "bootstrap 后守护不应立即运行(无 RunAtLoad)"; fi
   # 首个 TCP 连接 → launchd 拉起守护(launch_activate_socket 接管 fd)
-  h="$(curl -fsS --max-time 10 "http://127.0.0.1:$SA_PORT/health")" || fail "连接未触发守护激活"
+  h="$(curl -fsS --max-time 10 --noproxy '*' "http://127.0.0.1:$SA_PORT/health")" || fail "连接未触发守护激活"
   echo "$h" | grep -q '"dsh":false' || fail "激活后 health 异常: $h"
   pgrep -f "$RT_HOME/daemon" >/dev/null || fail "守护未被 launchd 拉起"
   grep -q "socket-activated" "$SA_LOG_DIR/daemon.log" 2>/dev/null \
     || fail "守护未走 launch_activate_socket 路径(日志缺 socket-activated)"
   # /goodbye → GOODBYE_GRACE=1s 快停 → stop_dsh → exit(0) 自退,launchd 重新接管 socket
-  curl -fsS --max-time 10 -X POST -H "Origin: http://127.0.0.1:$SA_PORT" \
+  curl -fsS --max-time 10 --noproxy '*' -X POST -H "Origin: http://127.0.0.1:$SA_PORT" \
     "http://127.0.0.1:$SA_PORT/goodbye" >/dev/null || fail "/goodbye 请求失败"
   for _ in $(seq 1 30); do pgrep -f "$RT_HOME/daemon" >/dev/null || break; sleep 0.5; done
   if pgrep -f "$RT_HOME/daemon" >/dev/null; then fail "goodbye 后守护未自退(activated 模式应 exit(0))"; fi
@@ -224,7 +236,7 @@ PY
     fail "自退后残留状态未清理"
   fi
   # 再次连接 → 再次激活(ThrottleInterval=1 保证冷启动可循环)
-  h="$(curl -fsS --max-time 10 "http://127.0.0.1:$SA_PORT/health")" || fail "二次激活请求失败"
+  h="$(curl -fsS --max-time 10 --noproxy '*' "http://127.0.0.1:$SA_PORT/health")" || fail "二次激活请求失败"
   echo "$h" | grep -q '"dsh":false' || fail "二次激活 health 异常: $h"
   pgrep -f "$RT_HOME/daemon" >/dev/null || fail "守护未被再次拉起(ThrottleInterval 生效?)"
   # 零常驻兜底:此次激活后无任何连接且未运行 dsh(dsh.json 已清),IDLE_STOP(3s)后守护应自退。
