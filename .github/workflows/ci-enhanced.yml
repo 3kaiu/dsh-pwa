@@ -57,6 +57,9 @@ jobs:
   static-analysis:
     name: 静态分析
     runs-on: macos-latest
+    # 与 build-and-test(30)/release(25)保持一致:不声明则回落到 GitHub 默认 360min,
+    # 任何一步卡住都会白烧 6 小时 runner。本 job 实测约 17s,15min 已是两个数量级余量。
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -92,6 +95,8 @@ jobs:
   performance:
     name: 性能基准
     runs-on: macos-latest
+    # 同上:本 job 含 brew install hyperfine + 基准运行,实测约 18s;20min 足够且封顶。
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -141,6 +146,8 @@ jobs:
   binary-analysis:
     name: 二进制分析
     runs-on: macos-latest
+    # 同上:本 job 仅编译 + otool/nm 分析,实测约 10s。
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 

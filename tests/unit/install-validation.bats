@@ -133,3 +133,30 @@ teardown() {
   fi
   [ -z "$offenders" ]
 }
+
+@test "every workflow job declares timeout-minutes" {
+  # 不声明 timeout-minutes 的 job 会回落到 GitHub 默认 **360min**:任何一步卡住都会白烧
+  # 6 小时 runner。本仓库既有约定是显式声明(build-and-test 30 / static-analysis 15 /
+  # performance 20 / binary-analysis 10 / release 25),新增 job 必须跟上。
+  # 只认 4 空格缩进的 job 级声明(step 级是 8 空格)——否则某个 step 上的 timeout
+  # 会把「job 缺声明」蒙混过去。injobs 只在 jobs: 之后计数,避免把 on: 下的
+  # push:/pull_request: 误当成 job。
+  bad=0
+  for f in "$ROOT"/.github/workflows/*.yml; do
+    awk -v F="$f" '
+      /^jobs:[ \t]*$/ { injobs = 1; next }
+      /^[^ \t]/ { injobs = 0 }
+      injobs {
+        if ($0 ~ /^  [A-Za-z_][A-Za-z0-9_-]*:[ \t]*$/) { jobs++; names = names " " $1 }
+        else if ($0 ~ /^    timeout-minutes:[ \t]*[0-9]+[ \t]*$/) tmo++
+      }
+      END {
+        if (jobs != tmo) {
+          printf "  %s: job 数=%d 但 job 级 timeout-minutes 数=%d(应覆盖:%s)\n", F, jobs, tmo, names
+          exit 1
+        }
+      }
+    ' "$f" || bad=1
+  done
+  [ "$bad" -eq 0 ]
+}
