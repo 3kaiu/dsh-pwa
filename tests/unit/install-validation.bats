@@ -92,7 +92,7 @@ teardown() {
   [ "$bad" -eq 0 ]
 }
 
-@test "every curl in CI-executed shell scripts carries a timeout" {
+@test "every curl in CI-executed scripts and workflows carries a timeout" {
   # 无超时的 curl 是一颗定时炸弹:服务「已 bind 未 listen」时 macOS 直接丢弃 SYN(不回 RST),
   # curl 会一直挂到作业级 timeout-minutes(30min),把真实缺陷掩盖成「卡住」——本次 CI 排查
   # 正是被这种「只看到卡住、看不到原因」拖慢的。
@@ -100,10 +100,15 @@ teardown() {
   #   - awk 先合并反斜杠续行,否则「curl 在一行、URL 在下一行」会漏检(第一版就漏了)。
   #   - 不按 127.0.0.1 过滤:URL 常写成变量(如 $ENDPOINT),按主机过滤同样会漏检(也踩过)。
   #   - 只认「像调用」的 curl(curl 后紧跟非字母数字字符,或裸 http URL),散文里提到 curl 不误报。
-  # 范围仅 shell 脚本;bats 用例不纳入:其 curl 都在 daemon_wait_health(自带 --max-time 2)
-  # 确认守护已监听之后,且守护已死时是连接拒绝(快速失败)而非挂起。
+  # 范围:CI 执行的 shell 脚本 + workflow 的 run: 块。
+  #   - workflow 按纯文本扫即可:注释行以 # 开头会被跳过,反斜杠续行也会被合并。
+  #     run: 块同样是 CI 执行的 shell,漏掉它就会出现「手工改过的那处门禁覆盖不到」的缺口
+  #     (实测:ci-enhanced.yml 里那处就确实没被旧版门禁覆盖)。
+  #   - bats 用例不纳入:其 curl 都在 daemon_wait_health(自带 --max-time 2)确认守护已监听之后,
+  #     且守护已死时是连接拒绝(快速失败)而非挂起。
   offenders="$(
-    for f in "$ROOT"/scripts/*.sh "$ROOT"/tests/*.sh "$ROOT"/tests/lib/*.sh; do
+    for f in "$ROOT"/scripts/*.sh "$ROOT"/tests/*.sh "$ROOT"/tests/lib/*.sh \
+             "$ROOT"/.github/workflows/*.yml; do
       awk -v F="$f" '
         function bad(l,   t, c) {
           t = l; sub(/^[ \t]+/, "", t)
