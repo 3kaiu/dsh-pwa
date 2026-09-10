@@ -92,22 +92,27 @@ teardown() {
   [ "$bad" -eq 0 ]
 }
 
-@test "every loopback curl in CI-executed shell scripts carries a timeout" {
-  # 回环 curl 必须带 --max-time / -m:守护「已 bind 未 listen」时 macOS 直接丢弃 SYN(不回 RST),
-  # 无超时的 curl 会一直挂到作业级 timeout-minutes(30min),把真实缺陷掩盖成「卡住」——
-  # 本次 CI 排查正是被这种「只看到卡住、看不到原因」拖慢的。
-  # awk 先合并反斜杠续行,避免「curl 在一行、URL 在下一行」时漏检。
-  # 命中 127.0.0.1 与 localhost(daemon 的 host_ok/origin_ok 两者都放行,将来可能有人写 localhost)。
+@test "every curl in CI-executed shell scripts carries a timeout" {
+  # 无超时的 curl 是一颗定时炸弹:服务「已 bind 未 listen」时 macOS 直接丢弃 SYN(不回 RST),
+  # curl 会一直挂到作业级 timeout-minutes(30min),把真实缺陷掩盖成「卡住」——本次 CI 排查
+  # 正是被这种「只看到卡住、看不到原因」拖慢的。
+  # 规则:CI 执行的 shell 脚本里每一处 curl 调用都必须带 --max-time / -m。
+  #   - awk 先合并反斜杠续行,否则「curl 在一行、URL 在下一行」会漏检(第一版就漏了)。
+  #   - 不按 127.0.0.1 过滤:URL 常写成变量(如 $ENDPOINT),按主机过滤同样会漏检(也踩过)。
+  #   - 只认「像调用」的 curl(curl 后紧跟非字母数字字符,或裸 http URL),散文里提到 curl 不误报。
   # 范围仅 shell 脚本;bats 用例不纳入:其 curl 都在 daemon_wait_health(自带 --max-time 2)
   # 确认守护已监听之后,且守护已死时是连接拒绝(快速失败)而非挂起。
   offenders="$(
     for f in "$ROOT"/scripts/*.sh "$ROOT"/tests/*.sh "$ROOT"/tests/lib/*.sh; do
       awk -v F="$f" '
-        function bad(l,   t) {
+        function bad(l,   t, c) {
           t = l; sub(/^[ \t]+/, "", t)
           if (substr(t, 1, 1) == "#") return 0
-          if (t !~ /curl/) return 0
-          if (t !~ /127\.0\.0\.1/ && t !~ /localhost/) return 0
+          if (!match(t, /curl[ \t]+/)) return 0
+          # 刻意不用字符类 [^-A-Za-z0-9_]:BWK awk 会把 -A 解析成范围,使 "-" 落进否定类,
+          # 于是所有 `curl -flag` 全被漏检(实测踩过)。改为取首字符逐个判断。
+          c = substr(t, RSTART + RLENGTH, 1)
+          if (c ~ /[A-Za-z0-9_]/ && c != "h") return 0
           if (t ~ /--max-time[= ][0-9]/ || t ~ /-m [0-9]/) return 0
           return 1
         }
@@ -119,7 +124,7 @@ teardown() {
     done
   )"
   if [ -n "$offenders" ]; then
-    printf '  无超时的回环 curl(请补 --max-time):\n%s\n' "$offenders" >&2
+    printf '  无超时的 curl(请补 --max-time):\n%s\n' "$offenders" >&2
   fi
   [ -z "$offenders" ]
 }

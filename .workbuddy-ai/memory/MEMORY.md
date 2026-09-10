@@ -45,6 +45,11 @@ bats tests/unit/                                                   # 当前 42 �
    必须写 `X=$(curl … || true)`，`|| true` 放在 `$( )` **内部**，再由断言报错。
 8. **`BATS_TEST_TIMEOUT` 不可依赖**：bats 的超时逻辑要调 `/bin/ps`，该 helper 不可用
    （沙箱/受限环境）时**静默空转**，测试照样跑满。凡是委托外部 helper 的门禁，都要验证它真的生效。
+9. **BWK(macOS) awk 的 `[^-A-Za-z0-9_]` 会漏掉 `-`**：`-A` 被解析成范围，`-` 落进否定类。
+   曾让 `install-validation.bats` 的 curl 门禁对**所有 `curl -flag` 行静默失明**，却仍报 0 违规。
+   改为 `substr` 取首字符逐个判断。教训：**门禁要对它声称覆盖的每种写法都植入违规验证**，
+   只测一两种形状会得到「通过」的假结论（前两次探针恰好用了坏字符类能匹配的形状）。
+   同理，按主机名（`127.0.0.1`/`localhost`）过滤会漏掉写成变量的 URL（`curl -fsS "$ENDPOINT"`）。
 
 ## daemon 安全模型（勿回退）
 - CSRF：Origin / Host 头**精确匹配**，防跨站与 DNS rebinding。
