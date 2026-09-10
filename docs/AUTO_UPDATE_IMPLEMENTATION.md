@@ -10,7 +10,7 @@
 ### 1. 后台异步更新（阶段 1）
 
 **新增文件:**
-- `scripts/update-dsh.sh` - 自动更新脚本，带文件锁防并发
+- `scripts/update-dsh.sh` - 自动更新脚本(install.sh 部署到 `$RT_HOME/scripts/`,与 install.sh 共用 `.install.lock` 防并发)
 
 **修改文件:**
 - `src/daemon.c` - 新增 `trigger_background_update()` 函数
@@ -18,21 +18,20 @@
 
 **工作流程:**
 ```
-用户登录 → daemon 启动 → 预热 dsh
+PWA 连接触发 → launchd 激活 daemon → 预热 dsh → 激活时触发 $RT_HOME/scripts/update-dsh.sh(12h 节流)
                            ↓
-                    延迟 10 秒后台触发 update-dsh.sh
-                           ↓
-                    检查 npm registry @latest
-                           ↓
-                    版本不同 → npm update（增量）
-                           ↓
-                    下次启动使用新版本
+        npm view 解析 @latest dist-tag 的真实版本号
+                    ↓
+                    与本地实际版本比较 → 版本不同 → pnpm update(增量,与 install.sh 同一引导方式)
+                    ↓
+                    下次启动使用新版本(刷新 run.json)
 ```
 
 **特点:**
 - ✅ 用户无感知延迟（首次启动 0 等待）
 - ✅ 网络失败自动降级（使用现有版本）
-- ✅ 文件锁机制防止并发更新
+- ✅ 与 install.sh 共用 `$RT_HOME/.install.lock`(mkdir 原子锁 + pid 存活检测),防止更新与安装并发
+- ✅ pnpm 不可用时失败记日志,绝不回退 npm(避免损坏 pnpm 依赖树)
 
 ---
 
@@ -48,11 +47,13 @@
 ```
 LaunchAgent 每天凌晨 2:30 触发
             ↓
-    运行 scripts/update-dsh.sh
+    运行 $RT_HOME/scripts/update-dsh.sh
             ↓
-    检查并更新到 @latest
+    解析 @latest 真实版本并比较(与本地实际版本号比较,非 dist-tag 字符串)
             ↓
-    日志写入 ~/.local/state/dsh-runtime/logs/updater.log
+    版本不同 → pnpm 增量更新 + cleanup-deps.sh 清理
+            ↓
+    日志写入 ~/.local/state/dsh-runtime/logs/update.log(updater.log 为 launchd 的 stdout/stderr)
 ```
 
 **特点:**
@@ -75,7 +76,7 @@ bash scripts/install.sh
 禁用预热功能（也会跳过后台更新触发）：
 ```bash
 export DSH_RT_NO_PREWARM=1
-launchctl kickstart -k gui/$(id -u)/com.dshpwa.daemon
+curl -fsS http://127.0.0.1:3080/health   # 触发 socket activation 激活 daemon
 ```
 
 ---
@@ -110,14 +111,15 @@ rm -rf ~/.local/share/dsh-runtime ~/.local/state/dsh-runtime
 
 ### 1. 验证后台更新
 ```bash
-# 安装旧版本 dsh（模拟）
+# 安装旧版本 dsh(模拟):改 package.json 后用 pnpm(与 install.sh 同一方式)
 cd ~/.local/share/dsh-runtime/app
-npm install @deepseek-ai/dsh@1.0.0
+sed -i '' 's/"@deepseek-ai\/dsh": "[^"]*"/"@deepseek-ai\/dsh": "0.1.4"/' package.json
+npm exec --yes --package=pnpm@10 -- pnpm --dir . install
 
-# 重启守护进程
-launchctl kickstart -k gui/$(id -u)/com.dshpwa.daemon
+# 重启守护进程(触发 socket activation)
+curl -fsS http://127.0.0.1:3080/health
 
-# 等待 10 秒后检查日志
+# 等待后台更新完成后检查日志
 sleep 15
 tail -20 ~/.local/state/dsh-runtime/logs/update.log
 ```
@@ -127,8 +129,8 @@ tail -20 ~/.local/state/dsh-runtime/logs/update.log
 # 手动触发定时任务
 launchctl start com.dshpwa.updater
 
-# 检查日志
-tail -20 ~/.local/state/dsh-runtime/logs/updater.log
+# 检查日志(update.log 为脚本自身日志;updater.log 为 launchd 捕获的 stdout/stderr)
+tail -20 ~/.local/state/dsh-runtime/logs/update.log
 
 # 验证版本
 node -e 'console.log(require(process.argv[1]).version)' \
@@ -167,7 +169,7 @@ ps aux | grep update-dsh.sh
 ### 方法 1：临时禁用
 ```bash
 export DSH_RT_NO_AUTO_UPDATE=1
-launchctl kickstart -k gui/$(id -u)/com.dshpwa.daemon
+curl -fsS http://127.0.0.1:3080/health   # 触发 socket activation 激活 daemon
 ```
 
 ### 方法 2：卸载 updater
@@ -178,9 +180,8 @@ rm -f ~/Library/LaunchAgents/com.dshpwa.updater.plist
 
 ### 方法 3：固定版本
 ```bash
-cd ~/.local/share/dsh-runtime/app
-npm install @deepseek-ai/dsh@1.2.3
-# 然后禁用自动更新
+# 固定到指定版本并禁用自动更新
+DSH_VERSION=1.2.3 bash scripts/update-dsh.sh   # 或重跑 install.sh 时设 DSH_VERSION=1.2.3
 export DSH_RT_NO_AUTO_UPDATE=1
 ```
 
@@ -209,20 +210,20 @@ export DSH_RT_NO_AUTO_UPDATE=1
                │ http://127.0.0.1:3080
                ▼
 ┌─────────────────────────────────────────────┐
-│  daemon (常驻, ~1.3MB)                       │
+│  daemon (按需激活, ~1.3MB)                   │
 │  ├─ 引导页伺服                               │
 │  ├─ 按需启动 dsh                             │
 │  ├─ 透传请求                                 │
 │  └─ 空闲自动停止                             │
 └──────┬───────────────────┬──────────────────┘
        │                   │
-       │ execl()           │ fork() + sleep(10)
+       │ execl()           │ fork()(激活时, 12h 节流)
        ▼                   ▼
 ┌─────────────────┐  ┌──────────────────────┐
 │  dsh (~178MB)   │  │ update-dsh.sh (后台) │
-│  官方 npm 包    │  │  ├─ curl npm registry│
-│  动态端口启动   │  │  ├─ 版本检查          │
-└─────────────────┘  │  └─ npm update       │
+│  官方 npm 包    │  │  ├─ npm view 解析版本│
+│  动态端口启动   │  │  ├─ 版本比较          │
+└─────────────────┘  │  └─ pnpm update       │
                      └──────────────────────┘
                               ▲
                               │ 每天凌晨 2:30

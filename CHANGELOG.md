@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **零常驻:launchd socket activation 改造** — daemon 不再 RunAtLoad/KeepAlive 常驻;launchd 持有监听 socket,首个 TCP 连接自动拉起 daemon(launch_activate_socket),空闲停止 dsh 后 daemon `exit(0)` 自退;后台更新检查改为 daemon 激活时触发并按 `RT_STATE/last_update_check` 时间戳 12h 节流;install.sh 改为 bootout + bootstrap(不再 kickstart);smoke-test 新增 socket-activation 端到端段(激活→自退→再激活)
+
 ### Security
 
 #### 🔴 High-Risk Fixes
@@ -105,5 +109,3 @@ All notable changes to this project will be documented in this file.
 **Residual Risk:**
 - Install script fetched from `main` branch (recommend branch protection + signed commits)
 - Daemon uses ad-hoc signature (recommend Developer ID + notarization for production)
-
-See [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md) for complete technical analysis.

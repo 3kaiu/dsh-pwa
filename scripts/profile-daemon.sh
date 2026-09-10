@@ -6,7 +6,7 @@ set -euo pipefail
 DAEMON_PID=$(pgrep -f "daemon" | head -1 || echo "")
 if [ -z "$DAEMON_PID" ]; then
   echo "❌ 守护进程未运行" >&2
-  echo "提示: 运行 'launchctl kickstart -k gui/$(id -u)/com.dshpwa.daemon' 启动守护进程" >&2
+  echo "提示: 运行 'curl -fsS http://127.0.0.1:3080/health' 触发 launchd socket activation 拉起守护进程" >&2
   exit 1
 fi
 

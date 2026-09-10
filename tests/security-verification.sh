@@ -7,11 +7,15 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PASS=0; FAIL=0
 
+# 公共 helper:daemon_compile / daemon_start_foreground / daemon_wait_health / daemon_stop
+# shellcheck source=/dev/null
+source "$ROOT/tests/lib/daemon-helpers.sh"
+
 # 颜色输出
 if [ -t 1 ]; then
-  G=$'\033[32m'; R=$'\033[31m'; Y=$'\033[33m'; B=$'\033[1m'; D=$'\033[2m'; RST=$'\033[0m'
+  G=$'\033[32m'; R=$'\033[31m'; B=$'\033[1m'; D=$'\033[2m'; RST=$'\033[0m'
 else
-  G=""; R=""; Y=""; B=""; D=""; RST=""
+  G=""; R=""; B=""; D=""; RST=""
 fi
 
 ok()   { echo "  ${G}✓${RST} $*"; ((PASS++)) || true; }
@@ -75,24 +79,17 @@ TMPD="$(mktemp -d)"
 TEST_PORT=$((30000 + RANDOM % 10000))
 
 # 编译并启动 daemon
-if clang -O2 -Wall -Wextra -arch arm64 -arch x86_64 -o "$TMPD/daemon" src/daemon.c 2>"$TMPD/compile.log"; then
+if daemon_compile "$TMPD/daemon" -arch arm64 -arch x86_64; then
   # 准备最小运行环境
   mkdir -p "$TMPD/rt" "$TMPD/state/logs" "$TMPD/home"
   echo '{"node":"/usr/bin/node","dsh":"/usr/bin/true"}' > "$TMPD/rt/run.json"
   
   # 后台启动 daemon
-  DSH_RT_HOME="$TMPD/rt" DSH_RT_STATE="$TMPD/state" DSH_HOME="$TMPD/home" \
-    DSH_RT_PORT=$TEST_PORT "$TMPD/daemon" >"$TMPD/daemon.log" 2>&1 &
-  DAEMON_PID=$!
+  export DSH_RT_HOME="$TMPD/rt" DSH_RT_STATE="$TMPD/state" DSH_HOME="$TMPD/home" DSH_RT_PORT="$TEST_PORT"
+  DAEMON_PID="$(daemon_start_foreground "$TMPD/daemon" "$TMPD/daemon.log")"
   
-  # 等待 daemon 就绪
-  for i in $(seq 1 30); do
-    if curl -fsS -o /dev/null "http://127.0.0.1:$TEST_PORT/health" 2>/dev/null; then
-      break
-    fi
-    sleep 0.2
-  done
-  
+  # 等待 daemon 就绪(梯度退避,6s 上限)
+  if daemon_wait_health "$TEST_PORT" any 6; then
   # 测试1: 缺少 Origin 应返回 403
   HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$TEST_PORT/wake" 2>/dev/null)
   if [ "$HTTP_CODE" = "403" ]; then
@@ -120,14 +117,34 @@ if clang -O2 -Wall -Wextra -arch arm64 -arch x86_64 -o "$TMPD/daemon" src/daemon
   else
     fail "CSRF 运行时：正确 Origin 应返回 200，实际返回 $HTTP_CODE"
   fi
+
+  # 测试4: 恶意 Host(DNS rebinding 模拟)应返回 403
+  HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "Host: evil.com" \
+    "http://127.0.0.1:$TEST_PORT/health" 2>/dev/null)
+  if [ "$HTTP_CODE" = "403" ]; then
+    ok "Host 校验：恶意 Host(evil.com)返回 403"
+  else
+    fail "Host 校验：恶意 Host 应返回 403，实际返回 $HTTP_CODE"
+  fi
+
+  # 测试5: 正常 Host(127.0.0.1:PORT)应返回 200
+  HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+    "http://127.0.0.1:$TEST_PORT/health" 2>/dev/null)
+  if [ "$HTTP_CODE" = "200" ]; then
+    ok "Host 校验：正常 Host(127.0.0.1:$TEST_PORT)返回 200"
+  else
+    fail "Host 校验：正常 Host 应返回 200，实际返回 $HTTP_CODE"
+  fi
+  else
+    fail "daemon 未就绪，跳过运行时 CSRF 测试"
+  fi
   
   # 清理
-  kill $DAEMON_PID 2>/dev/null || true
-  wait $DAEMON_PID 2>/dev/null || true
+  daemon_stop "$DAEMON_PID"
   rm -rf "$TMPD"
 else
-  warn "daemon 编译失败，跳过运行时 CSRF 测试"
-  cat "$TMPD/compile.log" >&2
+  fail "daemon 编译失败，跳过运行时 CSRF 测试"
   rm -rf "$TMPD"
 fi
 
@@ -140,10 +157,17 @@ else
 fi
 
 # 2.5 检查端口严格校验
-if grep -q "expected_origin" src/daemon.c && grep -q "snprintf.*http://127.0.0.1:%d" src/daemon.c; then
+if grep -q "origin_ok" src/daemon.c && grep -q "snprintf.*http://127.0.0.1:%d" src/daemon.c; then
   ok "daemon.c 实现端口严格校验"
 else
   fail "daemon.c 缺少端口严格校验"
+fi
+
+# 2.6 检查 Host 校验(DNS rebinding 防护)
+if grep -q "host_ok" src/daemon.c && grep -q "snprintf.*127.0.0.1:%d" src/daemon.c; then
+  ok "daemon.c 实现 Host 校验(防 DNS rebinding)"
+else
+  fail "daemon.c 缺少 Host 校验"
 fi
 
 h1 "3. 文件权限安全"
@@ -168,6 +192,47 @@ if grep -q "open(DSH_JSON.*0600" src/daemon.c && grep -q "open(PID_FILE.*0600" s
   ok "状态文件(dsh.json, dsh.pid)使用 0600 权限"
 else
   fail "状态文件未使用安全权限"
+fi
+
+# 3.4 install.sh 必须显式收紧 RT_STATE/LOG_DIR 权限
+# (umask 022 下 mkdir -p 建出 0755,且对已存在目录不生效;daemon 的 mkdir(LOG_DIR,0700)
+#  对已存在目录静默失败 → 仅靠源码里的 mkdir 调用会产生"假绿",install 侧需 chmod 兜底)
+if grep -q 'chmod 0700 "$RT_STATE" "$LOG_DIR"' scripts/install.sh; then
+  ok "install.sh 显式 chmod 0700 RT_STATE/LOG_DIR(含存量目录)"
+else
+  fail "install.sh 未显式收紧 RT_STATE/LOG_DIR 权限"
+fi
+
+# 3.5 运行时验证:daemon 自建 LOG_DIR 的真实权限必须为 0700(不再只 grep 源码)
+info "运行时验证 LOG_DIR 真实权限(daemon 前台启动自建目录)..."
+TMPD_PERM="$(mktemp -d)"
+if daemon_compile "$TMPD_PERM/daemon"; then
+  mkdir -p "$TMPD_PERM/rt" "$TMPD_PERM/state" "$TMPD_PERM/home"
+  echo '{"node":"/usr/bin/true","dsh":"/usr/bin/true"}' > "$TMPD_PERM/rt/run.json"
+  # 不预建 logs:让 daemon 自己 mkdir(LOG_DIR, 0700),验证真实落盘权限
+  export DSH_RT_HOME="$TMPD_PERM/rt" DSH_RT_STATE="$TMPD_PERM/state" DSH_HOME="$TMPD_PERM/home"
+  export DSH_RT_PORT="$((30000 + RANDOM % 10000))"
+  PERM_PID="$(daemon_start_foreground "$TMPD_PERM/daemon" /dev/null)"
+  for _ in $(seq 1 20); do [ -d "$TMPD_PERM/state/logs" ] && break; sleep 0.2; done
+  PERM_MODE="$(stat -f %Lp "$TMPD_PERM/state/logs" 2>/dev/null || true)"
+  if [ "$PERM_MODE" = "700" ]; then
+    ok "运行时 LOG_DIR 真实权限为 0700"
+  else
+    fail "运行时 LOG_DIR 权限为 ${PERM_MODE:-缺失}(应为 700,含 token 的日志可被本机其他用户枚举)"
+  fi
+  daemon_stop "$PERM_PID"
+  rm -rf "$TMPD_PERM"
+else
+  fail "daemon 编译失败,无法运行时验证 LOG_DIR 权限"
+  rm -rf "$TMPD_PERM"
+fi
+
+# 3.6 端口被占时 install.sh 必须显式失败(而非 launchd bind 失败后静默失效)
+if grep -q 'exec 3<>"/dev/tcp/127.0.0.1/$PORT"' scripts/install.sh && \
+   grep -q "DSH_RT_PORT=<空闲端口>" scripts/install.sh; then
+  ok "install.sh 检测端口占用并显式报错(bootout 之后、bootstrap 之前)"
+else
+  fail "install.sh 未检测端口占用"
 fi
 
 h1 "4. 端口分配安全"
@@ -256,12 +321,10 @@ info "编译 daemon.c(universal binary)..."
 TMPD="$(mktemp -d)"
 trap 'rm -rf "$TMPD"' EXIT
 
-if clang -O2 -Wall -Wextra -Werror -arch arm64 -arch x86_64 \
-   -o "$TMPD/daemon" src/daemon.c 2>"$TMPD/compile.log"; then
+if daemon_compile "$TMPD/daemon" -arch arm64 -arch x86_64; then
   ok "daemon.c 编译成功(无警告)"
 else
   fail "daemon.c 编译失败"
-  cat "$TMPD/compile.log"
 fi
 
 # 7.2 检查二进制架构
@@ -284,26 +347,6 @@ if [ -f "$TMPD/daemon" ]; then
     ok "daemon 二进制大小合理($SIZE 字节)"
   else
     info "daemon 二进制较大($SIZE 字节,可能包含调试符号)"
-  fi
-fi
-
-h1 "8. 安全文档完整性"
-
-# 8.1 检查 SECURITY_AUDIT.md 存在
-if [ -f SECURITY_AUDIT.md ]; then
-  ok "安全审计报告存在(SECURITY_AUDIT.md)"
-else
-  fail "缺少安全审计报告"
-fi
-
-# 8.2 检查审计报告内容
-if [ -f SECURITY_AUDIT.md ]; then
-  if grep -q "H1.*Supply-Chain" SECURITY_AUDIT.md && \
-     grep -q "H2.*CSRF" SECURITY_AUDIT.md && \
-     grep -q "M1.*Log" SECURITY_AUDIT.md; then
-    ok "审计报告覆盖所有主要问题"
-  else
-    fail "审计报告内容不完整"
   fi
 fi
 

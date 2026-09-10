@@ -247,7 +247,7 @@ bats tests/unit/install-validation.bats
 | **编译警告** | 0 |
 | **Shellcheck 问题** | 0 (critical) |
 | **单元测试通过率** | 100% |
-| **安全测试通过率** | 100% (26/26) |
+| **安全测试通过率** | 100% (33/33) |
 
 ---
 
@@ -257,10 +257,10 @@ bats tests/unit/install-validation.bats
 
 #### 1. profile-daemon.sh 提示 "守护进程未运行"
 ```bash
-# 启动守护进程
-launchctl kickstart -k gui/$(id -u)/com.dshpwa.daemon
+# 触发 launchd socket activation 拉起守护进程
+curl -fsS http://127.0.0.1:3080/health
 
-# 验证启动
+# 验证启动(零常驻:仅在活跃会话期间可见)
 ps aux | grep daemon
 ```
 

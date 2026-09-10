@@ -54,11 +54,9 @@ echo "7. 体积基准对比:"
 SIZE_BYTES=$(stat -f%z "$DAEMON" 2>/dev/null || stat -c%s "$DAEMON" 2>/dev/null)
 SIZE_KB=$((SIZE_BYTES / 1024))
 echo "  当前: ${SIZE_KB} KB"
-echo "  预期: 73-85 KB (优化后)"
-if [ "$SIZE_KB" -gt 90 ]; then
-  echo "  ⚠️  警告: 二进制膨胀 (>90KB)，检查是否引入了新依赖"
-elif [ "$SIZE_KB" -lt 70 ]; then
-  echo "  ✓ 优秀: 体积小于预期"
+echo "  预期: 100-150 KB (universal 双架构,含内嵌引导页)"
+if [ "$SIZE_KB" -gt 150 ]; then
+  echo "  ⚠️  警告: 二进制膨胀 (>150KB)，检查是否引入了新依赖"
 else
   echo "  ✓ 正常范围"
 fi

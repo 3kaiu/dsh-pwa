@@ -1,6 +1,6 @@
 # dsh-pwa
 
-macOS 上一键安装 [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh)(官方 npm 包 `@deepseek-ai/dsh`)并把它变成常驻的桌面 PWA:登录即启动一个 ~1.3MB 守护进程(LaunchAgent),Safari「添加到程序坞」即得全屏 Web App;dsh 空闲自动停止,不占资源。
+macOS 上一键安装 [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh)(官方 npm 包 `@deepseek-ai/dsh`)并把它变成桌面 PWA:零常驻架构(launchd socket activation)——登录后没有任何用户态进程,点 PWA 图标时 launchd 自动拉起守护进程与 dsh,关闭页面后 dsh 与守护进程全部退出;Safari「添加到程序坞」即得全屏 Web App。
 
 ## 安装
 
@@ -38,11 +38,9 @@ DSH_RT_RELEASE_TAG=v1.0.0 bash install.sh
 - ✅ Universal binary(arm64 + x86_64,免本地编译)
 
 **版本策略:**
-- 默认自动跟随 `@deepseek-ai/dsh@next`(dsh 官方开发分支)
+- 默认自动跟随 `@deepseek-ai/dsh@latest`(dsh 官方稳定标签)
 - 出现问题时可回退到已知版本: `DSH_VERSION=0.1.1-rc.2 bash install.sh`
 - 冒烟测试作为安全网,breaking change 会在安装后立即发现
-
-完整的安全审计报告见 [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md)。
 
 ## 性能优化
 
@@ -51,7 +49,7 @@ DSH_RT_RELEASE_TAG=v1.0.0 bash install.sh
   - node-pty Win32/Linux 预编译二进制 (~23MB)
   - @img/sharp WASM 备用方案 (~9MB)
   - sourcemap/文档/测试文件 (~2MB)
-- **daemon 极简:** 85KB universal binary (arm64 + x86_64)，运行时仅占 ~672KB 内存
+- **daemon 极简:** 85KB universal binary (arm64 + x86_64)，运行时仅占 ~1.3MB RSS,且仅在活跃会话期间存在(零常驻,空闲即退出)
 
 ## 卸载
 
@@ -66,26 +64,18 @@ rm -rf ~/.local/share/dsh-runtime ~/.local/state/dsh-runtime
 pnpm store prune
 ```
 
-## 性能优化
-
-- **体积优化:** 自动清理跨平台冗余文件，安装后体积 ~178MB (相比原始 212MB 减少 16%)
-- **清理内容:**
-  - node-pty Win32/Linux 预编译二进制 (~23MB)
-  - @img/sharp WASM 备用方案 (~9MB)
-  - sourcemap/文档/测试文件 (~2MB)
-- **daemon 极简:** 85KB universal binary (arm64 + x86_64)，运行时仅占 ~672KB 内存
-
 ## 安全特性
 
-- **CSRF 防护:** 控制端点(`/wake`, `/stop`)验证 Origin/Referer 头，拒绝跨域请求
-- **安全文件权限:** 日志和状态文件使用 0600 权限(用户私有)
+- **CSRF 防护:** 控制端点(`/wake`/`/stop` 等)与透传的状态变更请求(POST/PUT/DELETE/PATCH)必须携带精确匹配本守护端口的 Origin 头,拒绝跨域请求
+- **安全文件权限:** 日志与状态目录 0700、文件 0600(用户私有,install.sh 安装时显式收紧)
 - **端口验证:** 仅接受 1024-65535 范围的端口配置
 - **Localhost 绑定:** 守护进程仅监听 127.0.0.1，不暴露到网络
+- **Host 头校验:** 所有请求 Host 必须精确等于 `127.0.0.1:PORT`/`localhost:PORT`,防 DNS rebinding 窃取 dsh token
 - **进程隔离:** dsh 运行在独立进程，崩溃不影响守护进程
 
 ## 自动更新
 
-- **后台异步更新:** 守护进程启动后延迟 10 秒触发后台版本检查，不阻塞启动
+- **后台异步更新:** daemon 激活时触发后台版本检查(12h 节流,不阻塞启动)
 - **定时自动更新:** LaunchAgent 每天凌晨 2:30 自动检查并更新到 `@deepseek-ai/dsh@latest`
 - **增量更新优化:** 仅下载变化的包，节省 70-85% 流量和时间
 - **故障降级:** 网络失败或更新失败时静默跳过，使用现有版本
@@ -94,6 +84,15 @@ pnpm store prune
 ## 开发
 
 ```bash
-bash scripts/smoke-test.sh              # 隔离目录真实安装 → 幂等重跑 → 自动唤醒/就绪门控/透传 → 空闲自停
-bash tests/security-verification.sh     # 验证所有安全控制是否按预期工作
+bash scripts/smoke-test.sh              # 隔离目录真实安装 → 幂等重跑 → 端口占用检测 → 守护(引导页/自动唤醒/就绪门控/token 握手/透传) → 并发双唤醒幂等 → 空闲自停 → socket activation 端到端(激活→自退→再激活)
+bash tests/security-verification.sh     # 验证所有安全控制是否按预期工作(33 项断言)
+bats tests/unit/                        # 单元测试:安装校验 + 守护黑盒用例(18 项,不依赖真实 dsh)
 ```
+
+## 参考文档
+
+- [docs/TOOLS_INTEGRATION.md](docs/TOOLS_INTEGRATION.md) — 开发工具链(shellcheck/hyperfine/bats)、性能剖析、故障排查
+- [docs/AUTO_UPDATE_IMPLEMENTATION.md](docs/AUTO_UPDATE_IMPLEMENTATION.md) — 自动更新机制设计(pnpm 增量、12h 节流、安装锁互斥)
+- [docs/P0_P3_FIXES_IMPLEMENTATION.md](docs/P0_P3_FIXES_IMPLEMENTATION.md) — P0-P3 修复实施记录
+- [docs/ADVERSARIAL_AUDIT_FIX.md](docs/ADVERSARIAL_AUDIT_FIX.md) / [docs/ADVERSARIAL_AUDIT_ROUND2.md](docs/ADVERSARIAL_AUDIT_ROUND2.md) / [docs/ADVERSARIAL_AUDIT_ROUND3_FIX.md](docs/ADVERSARIAL_AUDIT_ROUND3_FIX.md) — 三轮安全审计与修复记录
+- [tests/auto-update-checklist.md](tests/auto-update-checklist.md) — 自动更新人工验收清单

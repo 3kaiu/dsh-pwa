@@ -16,7 +16,7 @@ fi
 # 检查守护进程是否运行
 if ! curl -fsS "$ENDPOINT" >/dev/null 2>&1; then
   echo "❌ 守护进程未响应 ($ENDPOINT)" >&2
-  echo "提示: 运行 'launchctl kickstart -k gui/$(id -u)/com.dshpwa.daemon'" >&2
+  echo "提示: 运行 'curl -fsS http://127.0.0.1:$PORT/health' 触发 launchd socket activation" >&2
   exit 1
 fi
 

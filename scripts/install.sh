@@ -58,6 +58,8 @@ if ! [[ "$PORT_RAW" =~ ^[0-9]+$ ]] || [ "$PORT_RAW" -lt 1024 ] || [ "$PORT_RAW" 
 fi
 PORT="$PORT_RAW"
 LOG_DIR="$RT_STATE/logs"
+# daemon 编译统一参数(两处编译路径共用;universal binary 双架构,Intel Mac 也产出 arm64+x86_64)
+DAEMON_CFLAGS="-O2 -Wall -Wextra -arch arm64 -arch x86_64"
 NODE_DIR="$RT_HOME/node"
 APP_DIR="$RT_HOME/app"
 NODE_BIN="$NODE_DIR/bin/node"
@@ -65,12 +67,16 @@ NPM_BIN="$NODE_DIR/bin/npm"
 DSH_PKG="$APP_DIR/node_modules/@deepseek-ai/dsh/package.json"
 ARCH="$(uname -m | sed 's/x86_64/x64/')"
 mkdir -p "$RT_HOME" "$RT_STATE" "$LOG_DIR" "$NODE_DIR" "$APP_DIR" "$DSH_HOME"
+# 含 token 的状态/日志目录必须 0700:umask 022 下 mkdir -p 建出 0755,且对已存在目录
+# 不会收紧权限(daemon 的 mkdir(LOG_DIR,0700) 对已存在目录静默失败)→ 显式 chmod 兜底,
+# 同时修复存量目录
+chmod 0700 "$RT_STATE" "$LOG_DIR"
 
 # 安装锁(并发互斥:双击连点/重复安装时后到者等待;仅属主进程已死才可抢占——
 # 旧逻辑按 10 分钟锁龄抢占活锁,慢网首装实测 >12 分钟,会导致两个安装互相破坏)
 LOCK="$RT_HOME/.install.lock"
 LOCKED=0
-for i in $(seq 1 300); do
+for _ in $(seq 1 300); do
   if mkdir "$LOCK" 2>/dev/null; then
     echo "$$" > "$LOCK/pid"; LOCKED=1; break
   fi
@@ -189,7 +195,7 @@ if [ -n "$LATEST" ] && [ "$CUR_DSH" != "$LATEST" ] || [ -z "$CUR_DSH" ]; then
   if [ "$NEED_COMPILE_DAEMON" = "1" ]; then
     echo "  ${D}同时编译 daemon (并行优化)...${R}"
     (
-      clang -O2 -Wall -Wextra -arch arm64 -arch x86_64 -o "$RT_HOME/daemon.tmp" "$ROOT/src/daemon.c" 2>"$RT_HOME/.daemon.build.log" \
+      clang $DAEMON_CFLAGS -o "$RT_HOME/daemon.tmp" "$ROOT/src/daemon.c" 2>"$RT_HOME/.daemon.build.log" \
         && mv "$RT_HOME/daemon.tmp" "$RT_HOME/daemon" \
         && echo "$SRC_MD5" > "$RT_HOME/.daemon.md5"
     ) &
@@ -272,7 +278,7 @@ ok "node=$NODE_BIN"
 ok "dsh=$DSH_BIN"
 
 # ---------- 4) 守护二进制(发行包预编译优先;否则本地 clang 编译;均 ad-hoc 签名) ----------
-h1 "4) 守护(常驻唤醒,~1.3MB RSS)"
+h1 "4) 守护(按需唤醒,~1.3MB RSS)"
 install_daemon() { chmod +x "$RT_HOME/daemon"; codesign --force -s - "$RT_HOME/daemon" 2>/dev/null || true; }
 if [ -x "$ROOT/daemon" ] && [ "$(file -b "$ROOT/daemon" | grep -c "$(uname -m)")" = "1" ]; then
   cp "$ROOT/daemon" "$RT_HOME/daemon"; install_daemon
@@ -284,7 +290,7 @@ elif [ -f "$ROOT/src/daemon.c" ] && command -v clang >/dev/null; then
     ok "守护已是最新(daemon.c 未变,免编译)"
   else
     echo "  ${D}clang 编译中 ...${R}"
-    clang -O2 -Wall -Wextra -o "$RT_HOME/daemon" "$ROOT/src/daemon.c" || { warn "守护编译失败"; exit 1; }
+    clang $DAEMON_CFLAGS -o "$RT_HOME/daemon" "$ROOT/src/daemon.c" || { warn "守护编译失败"; exit 1; }
     [ -n "$SRC_MD5" ] && printf '%s\n' "$SRC_MD5" > "$RT_HOME/.daemon.md5"
     install_daemon
     ok "本地 clang 编译完成"
@@ -295,8 +301,19 @@ else
   warn "未找到可用守护(需预编译 daemon 或 clang),PWA 自动拉起不可用"
 fi
 
-# ---------- 5) LaunchAgent 注册(登录即常驻,1.3MB) ----------
-h1 "5) LaunchAgent(登录即常驻)"
+# ---------- 4b) 更新脚本部署(daemon/updater 通过 $RT_HOME/scripts/ 调用;发行包临时目录装完即删,不可回溯) ----------
+if [ -d "$ROOT/scripts" ]; then
+  mkdir -p "$RT_HOME/scripts"
+  for s in update-dsh.sh cleanup-deps.sh; do
+    if [ -f "$ROOT/scripts/$s" ]; then
+      cp "$ROOT/scripts/$s" "$RT_HOME/scripts/$s"
+      chmod 700 "$RT_HOME/scripts/$s"
+    fi
+  done
+fi
+
+# ---------- 5) LaunchAgent 注册(零常驻 socket activation:launchd 持有 socket,连接到达才拉起守护) ----------
+h1 "5) LaunchAgent(零常驻,首次访问自动唤醒)"
 AGENT_OK=0
 if [ -z "${DSH_INSTALL_NO_AGENT:-}" ]; then
   TPL="$ROOT/launchd/com.dshpwa.daemon.plist"
@@ -311,14 +328,30 @@ if [ -z "${DSH_INSTALL_NO_AGENT:-}" ]; then
         -e "s|__RT_STATE__|$RT_STATE|g" \
         -e "s|__LOG_DIR__|$LOG_DIR|g" \
         -e "s|__DSH_RT_PORT__|$PORT|g" "$TPL" > "$AGENT"
+    # plist 含路径拓扑(非密钥),但仍收 0600 最小暴露(默认 umask 022 会生成 0644)
+    chmod 600 "$AGENT"
     # 清理旧名残留(改名前的 com.dshlauncher.daemon),避免旧守护占住端口
     launchctl bootout "gui/$(id -u)/com.dshlauncher.daemon" 2>/dev/null || true
     rm -f "$AGENT_DIR/com.dshlauncher.daemon.plist"
+    # 升级重载:先 bootout 旧 job(终止在跑守护并释放其 socket)再 bootstrap 新 plist,
+    # 确保重载后由新 job 的 launchd 持有监听 socket。
+    # 零常驻:无 RunAtLoad/KeepAlive,绝不 kickstart——kick 会立即拉起守护,违背零常驻设计;
+    # 登录后首个 TCP 连接(PWA 点图标)才触发激活。
+    launchctl bootout "gui/$(id -u)/com.dshpwa.daemon" 2>/dev/null || true
+    # 端口占用检测:bootout 已释放旧 job 的 socket,此刻仍被占 → 是其他进程占着端口。
+    # 若不拦截,launchd bind 失败会导致守护永不激活(静默失效),install 还会 open 占用者的页面。
+    if (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then
+      sleep 1  # bootout 后 socket 释放可能有短暂延迟,复查一次
+      if (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then
+        echo "端口 $PORT 已被其他进程占用,LaunchAgent 无法监听,守护将无法激活。" >&2
+        echo "请释放占用进程(查看:lsof -iTCP:$PORT -sTCP:LISTEN),或用 DSH_RT_PORT=<空闲端口> 重新安装。" >&2
+        exit 1
+      fi
+    fi
     launchctl bootstrap "gui/$(id -u)" "$AGENT" 2>/dev/null \
       || launchctl enable "gui/$(id -u)/com.dshpwa.daemon" 2>/dev/null || true
-    launchctl kickstart -k "gui/$(id -u)/com.dshpwa.daemon" 2>/dev/null || true
     AGENT_OK=1
-    ok "com.dshpwa.daemon 已注册并启动"
+    ok "com.dshpwa.daemon 已注册(launchd 持有 socket,零常驻;首次访问 http://127.0.0.1:$PORT/ 自动唤醒)"
   else
     warn "缺少 plist 模板,未注册守护"
   fi
@@ -330,12 +363,19 @@ if [ -z "${DSH_INSTALL_NO_AGENT:-}" ]; then
     sed -e "s|__HOME__|$HOME|g" \
         -e "s|__RT_HOME__|$RT_HOME|g" \
         -e "s|__RT_STATE__|$RT_STATE|g" \
-        -e "s|__LOG_DIR__|$LOG_DIR|g" "$UPDATER_TPL" > "$UPDATER"
+        -e "s|__LOG_DIR__|$LOG_DIR|g" \
+        -e "s|__DSH_RT_PORT__|$PORT|g" "$UPDATER_TPL" > "$UPDATER"
+    chmod 600 "$UPDATER"
     launchctl bootstrap "gui/$(id -u)" "$UPDATER" 2>/dev/null \
       || launchctl enable "gui/$(id -u)/com.dshpwa.updater" 2>/dev/null || true
     ok "com.dshpwa.updater 已注册(每天凌晨 2:30 自动检查更新)"
   fi
 else
+  # 测试模式(不注册 agent)同样校验端口,让占用端口配置尽早暴露而非静默通过
+  if (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then
+    echo "端口 $PORT 已被占用,请用 DSH_RT_PORT=<空闲端口> 重新安装。" >&2
+    exit 1
+  fi
   ok "跳过(DSH_INSTALL_NO_AGENT)"
 fi
 

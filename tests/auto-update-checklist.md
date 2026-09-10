@@ -40,13 +40,13 @@ rm -rf ~/.local/share/dsh-runtime ~/.local/state/dsh-runtime
 
 **步骤:**
 1. 运行 `bash scripts/install.sh`
-2. 等待 15 秒（守护进程启动 + 后台更新延迟 10 秒）
+2. 触发激活并等待后台更新完成（curl 激活 daemon + 激活时节流触发更新检查）
 3. 检查日志：`tail -20 ~/.local/state/dsh-runtime/logs/update.log`
 
 **预期结果:**
 - [ ] 日志文件存在
-- [ ] 日志包含 "开始更新 dsh" 或 "已是最新版本" 字样
-- [ ] 守护进程启动正常（`ps aux | grep daemon`）
+- [ ] 日志包含 "开始更新 dsh" 字样(已是最新时脚本静默退出,无日志)
+- [ ] 守护进程激活正常（`curl -fsS http://127.0.0.1:3080/health` 后 `ps aux | grep daemon` 可见）
 - [ ] PWA 可正常打开（http://127.0.0.1:3080）
 
 ---
@@ -56,7 +56,7 @@ rm -rf ~/.local/share/dsh-runtime ~/.local/state/dsh-runtime
 **步骤:**
 1. 验证 updater 已注册：`launchctl list | grep dshpwa`
 2. 手动触发：`launchctl start com.dshpwa.updater`
-3. 检查日志：`tail -20 ~/.local/state/dsh-runtime/logs/updater.log`
+3. 检查日志：`tail -20 ~/.local/state/dsh-runtime/logs/update.log`(脚本自身日志;updater.log 为 launchd 捕获的 stdout/stderr)
 
 **预期结果:**
 - [ ] `launchctl list` 显示两个服务（daemon + updater）
@@ -77,8 +77,8 @@ launchctl start com.dshpwa.updater &
 # 立即检查进程
 ps aux | grep update-dsh.sh
 
-# 检查锁目录
-ls -ld ~/.local/state/dsh-runtime/update.lock.d
+# 检查锁目录(与 install.sh 共用 $RT_HOME/.install.lock)
+ls -ld ~/.local/share/dsh-runtime/.install.lock
 ```
 
 **预期结果:**
@@ -107,7 +107,7 @@ launchctl list | grep dshpwa
 **预期结果:**
 - [ ] `launchctl list` 只显示 com.dshpwa.daemon
 - [ ] 没有 com.dshpwa.updater
-- [ ] 守护进程启动正常
+- [ ] socket activation 正常（`curl -fsS http://127.0.0.1:3080/health` 可拉起守护）
 
 ---
 
@@ -122,7 +122,7 @@ for i in {1..10}; do
 done
 
 # 检查日志大小
-wc -l ~/.local/state/dsh-runtime/logs/updater.log
+wc -l ~/.local/state/dsh-runtime/logs/update.log
 ```
 
 **预期结果:**
@@ -142,7 +142,7 @@ wc -l ~/.local/state/dsh-runtime/logs/updater.log
 launchctl start com.dshpwa.updater
 
 # 检查日志
-tail -10 ~/.local/state/dsh-runtime/logs/updater.log
+tail -10 ~/.local/state/dsh-runtime/logs/update.log
 
 # 检查 dsh 是否仍可启动
 open http://127.0.0.1:3080
@@ -161,10 +161,11 @@ open http://127.0.0.1:3080
 ```bash
 # 强制降级到旧版本（模拟）
 cd ~/.local/share/dsh-runtime/app
-npm install @deepseek-ai/dsh@1.0.0 --force
+sed -i '' 's/"@deepseek-ai\/dsh": "[^"]*"/"@deepseek-ai\/dsh": "1.0.0"/' package.json
+npm exec --yes --package=pnpm@10 -- pnpm --dir . install
 
-# 重启守护进程
-launchctl kickstart -k gui/$(id -u)/com.dshpwa.daemon
+# 重启守护进程(触发 socket activation)
+curl -fsS http://127.0.0.1:3080/health
 
 # 等待后台更新
 sleep 15
@@ -188,20 +189,20 @@ tail -20 ~/.local/state/dsh-runtime/logs/update.log
 
 **步骤:**
 ```bash
-# 手动创建一个过期锁（模拟更新进程被 kill -9）
-mkdir ~/.local/state/dsh-runtime/update.lock.d
-touch -t 202609080000 ~/.local/state/dsh-runtime/update.lock.d
+# 手动创建一个僵尸锁（模拟更新进程被 kill -9:持锁 pid 已死,pid 存活检测判定可抢占）
+mkdir ~/.local/share/dsh-runtime/.install.lock
+echo "99999" > ~/.local/share/dsh-runtime/.install.lock/pid
 
 # 触发更新
 launchctl start com.dshpwa.updater
 
 # 检查锁是否被清理
 sleep 5
-ls -ld ~/.local/state/dsh-runtime/update.lock.d 2>/dev/null || echo "锁已清理 ✓"
+ls -ld ~/.local/share/dsh-runtime/.install.lock 2>/dev/null || echo "锁已清理 ✓"
 ```
 
 **预期结果:**
-- [ ] 旧锁被自动清理（超过 1 小时）
+- [ ] 僵尸锁被自动抢占清理（持锁进程已死）
 - [ ] 更新正常执行
 - [ ] 日志显示版本检查逻辑
 
@@ -239,7 +240,7 @@ ls ~/Library/LaunchAgents/com.dshpwa*.plist
 time curl -I http://127.0.0.1:3080/
 
 # 测试带自动更新的启动延迟
-# （应该相同，因为更新在后台延迟 10 秒）
+# （应该相同，因为更新在激活时后台触发，12h 节流）
 ```
 
 **预期结果:**
@@ -262,7 +263,7 @@ ps aux | grep update-dsh.sh
 **预期结果:**
 - [ ] daemon 内存 ~1.3MB（不变）
 - [ ] update-dsh.sh 内存 < 50MB
-- [ ] npm update 内存 < 500MB
+- [ ] pnpm update 内存 < 500MB
 
 ---
 

@@ -2,11 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <!--
-  常驻唤醒守护(隐形基础设施,~1.3MB RSS):登录即加载,只应答引导页 + /health + /wake + /stop,不跑 dsh。
-  唯一端口 DSH_RT_PORT(默认 3080):dsh 未运行 → 任意路径返回引导页;dsh 运行中 → 双向透传。
-  dsh 内部端口启动时自动分配并写入 RT_STATE/dsh.json;运行时位置读 RT_HOME/run.json。
-  PWA(程序坞 Web App,start_url 指向本端口)检测到 dsh 未运行 → POST /wake → 守护直启 dsh。
-  PWA 关闭 → 连接归零 DSH_RT_IDLE_STOP_SECS(默认 60)秒 → 守护自动停止 dsh。
+  零常驻唤醒守护(launchd socket activation):登录时不启动任何进程(零 RSS)。
+  launchd 持有唯一监听 socket(DSH_RT_PORT,默认 3080);PWA 点图标 → 首个 TCP 连接
+  → launchd 按需拉起守护(launch_activate_socket 接管 fd)→ 守护拉起 dsh。
+  PWA 关闭 → 连接归零 DSH_RT_IDLE_STOP_SECS(代码默认 30)秒 → 守护停止 dsh 并 exit(0) 自退,
+  launchd 重新接管 socket 等待下次连接(ThrottleInterval=1 保证再次点击 1s 内拉起)。
+  dsh 未运行时任意路径返回引导页;dsh 运行中双向透传;dsh 内部端口启动时自动分配写入 RT_STATE/dsh.json。
    由 scripts/install.sh 自动生成到 ~/Library/LaunchAgents/。
    占位符:__DAEMON_BIN__/__RT_HOME__/__RT_STATE__/__LOG_DIR__/__DSH_RT_PORT__
 -->
@@ -16,8 +17,18 @@
   <array>
     <string>__DAEMON_BIN__</string>
   </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <key>Sockets</key>
+  <dict>
+    <key>Listeners</key>
+    <dict>
+      <key>SockNodeName</key><string>127.0.0.1</string>
+      <key>SockServiceName</key><string>__DSH_RT_PORT__</string>
+      <key>SockFamily</key><string>IPv4</string>
+      <key>SockType</key><string>stream</string>
+    </dict>
+  </dict>
+  <key>ThrottleInterval</key><integer>1</integer>
+  <key>AbandonProcessGroup</key><true/>
   <key>EnvironmentVariables</key>
   <dict>
     <key>HOME</key><string>__HOME__</string>

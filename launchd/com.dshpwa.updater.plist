@@ -13,7 +13,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>__RT_HOME__/../scripts/update-dsh.sh</string>
+    <string>__RT_HOME__/scripts/update-dsh.sh</string>
   </array>
   <key>StartCalendarInterval</key>
   <dict>
@@ -25,6 +25,7 @@
     <key>HOME</key><string>__HOME__</string>
     <key>DSH_RT_HOME</key><string>__RT_HOME__</string>
     <key>DSH_RT_STATE</key><string>__RT_STATE__</string>
+    <key>DSH_RT_PORT</key><string>__DSH_RT_PORT__</string>
   </dict>
   <key>StandardOutPath</key><string>__LOG_DIR__/updater.log</string>
   <key>StandardErrorPath</key><string>__LOG_DIR__/updater.log</string>

@@ -206,7 +206,7 @@ done
 
 **方案A: 简单截断（install.sh 启动前）**
 ```bash
-# scripts/install.sh:298 (launchctl kickstart 前)
+# scripts/install.sh:298 (launchctl bootstrap 前)
 if [ -f "$LOG_DIR/dsh.log" ]; then
   LOG_SIZE=$(stat -f%z "$LOG_DIR/dsh.log" 2>/dev/null || echo 0)
   if [ "$LOG_SIZE" -gt 10485760 ]; then  # 10MB

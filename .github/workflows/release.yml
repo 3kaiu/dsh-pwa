@@ -41,6 +41,10 @@ jobs:
           else
             echo "✓ pnpm-lock.yaml 无变化"
           fi
+      - name: 冒烟测试(打包前置:install → 守护 → 唤醒 → 透传 → 空闲自停)
+        # release 也可能在无 GUI 会话的 runner 上跑:smoke-test.sh 对 socket activation 段
+        # 做条件跳过并显式输出 [SKIP](不静默),其余冒烟项必须真实通过
+        run: bash scripts/smoke-test.sh
       - name: 打包(install.sh + daemon + daemon.c + plist + lock + cleanup)
         run: |
           mkdir -p /tmp/pkg/launchd /tmp/pkg/scripts

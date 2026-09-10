@@ -1,5 +1,7 @@
 # P0-P3 修复实施报告
 
+> ⚠️ **更新说明:** 本文 P0-1 描述的 dsh 版本固定(固定到 `0.1.1-rc.2`)已由 commit `47f9ae3` 回退,当前版本策略为跟随 `@deepseek-ai/dsh@latest`(install.sh 与 update-dsh.sh 默认 latest,`DSH_VERSION` 仍可覆盖为指定版本)。其余 P1-P3 修复不受影响。
+
 ## 修复概览
 
 本次修复针对 dsh 上游 RC 版本不稳定性和系统可靠性问题,按优先级 P0→P3 系统性实施了 9 项改进。
