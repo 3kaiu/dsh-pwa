@@ -59,7 +59,7 @@ fi
 PORT="$PORT_RAW"
 LOG_DIR="$RT_STATE/logs"
 # daemon 编译统一参数(两处编译路径共用;universal binary 双架构,Intel Mac 也产出 arm64+x86_64)
-DAEMON_CFLAGS="-O2 -Wall -Wextra -arch arm64 -arch x86_64"
+DAEMON_CFLAGS=(-O2 -Wall -Wextra -arch arm64 -arch x86_64)
 NODE_DIR="$RT_HOME/node"
 APP_DIR="$RT_HOME/app"
 NODE_BIN="$NODE_DIR/bin/node"
@@ -93,7 +93,7 @@ trap 'rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null || true; [ -n "${PKG_TMP:-}" 
 #                否则安装 nodejs.org 最新 LTS(DSH_RT_NO_SYSTEM_NODE=1 强制走此路径) ----------
 MIN_NODE=22
 SYS_NODE=""; SYS_NPM=""
-if [ -z "${DSH_RT_NO_SYSTEM_NODE:-}" ]; then
+if [ "${DSH_RT_NO_SYSTEM_NODE:-}" != "1" ]; then
   CAND="$(command -v node 2>/dev/null || true)"
   if [ -n "$CAND" ]; then
     # 解析 fnm/volta 等 shim 符号链接到真实二进制(fnm 的 multishell 临时目录会随 shell 退出失效)
@@ -189,13 +189,12 @@ if [ -n "$LATEST" ] && [ "$CUR_DSH" != "$LATEST" ] || [ -z "$CUR_DSH" ]; then
     echo "  ${D}增量升级 dsh: $CUR_DSH → ${LATEST} (pnpm 仅拉差异包)${R}"
     NPM_CMD="update"; NPM_TARGET="@deepseek-ai/dsh"
   fi
-  NPM_START="$SECONDS"
   
   # 并行启动 npm 操作和 daemon 编译
   if [ "$NEED_COMPILE_DAEMON" = "1" ]; then
     echo "  ${D}同时编译 daemon (并行优化)...${R}"
     (
-      clang $DAEMON_CFLAGS -o "$RT_HOME/daemon.tmp" "$ROOT/src/daemon.c" 2>"$RT_HOME/.daemon.build.log" \
+      clang "${DAEMON_CFLAGS[@]}" -o "$RT_HOME/daemon.tmp" "$ROOT/src/daemon.c" 2>"$RT_HOME/.daemon.build.log" \
         && mv "$RT_HOME/daemon.tmp" "$RT_HOME/daemon" \
         && echo "$SRC_MD5" > "$RT_HOME/.daemon.md5"
     ) &
@@ -211,12 +210,12 @@ if [ -n "$LATEST" ] && [ "$CUR_DSH" != "$LATEST" ] || [ -z "$CUR_DSH" ]; then
       rm -rf "$APP_DIR/node_modules" "$APP_DIR/pnpm-lock.yaml"
       if ! PATH="$NODE_DIR/bin:$PATH" NODE_OPTIONS="--max-old-space-size=4096" npx_pnpm \
            --dir "$APP_DIR" --store-dir "$PNPM_STORE" install --prefer-offline; then
-        [ -n "${DAEMON_PID:-}" ] && kill $DAEMON_PID 2>/dev/null || true
+        [ -n "${DAEMON_PID:-}" ] && kill "$DAEMON_PID" 2>/dev/null || true
         warn "dsh 安装失败"
         exit 1
       fi
     else
-      [ -n "${DAEMON_PID:-}" ] && kill $DAEMON_PID 2>/dev/null || true
+      [ -n "${DAEMON_PID:-}" ] && kill "$DAEMON_PID" 2>/dev/null || true
       warn "dsh 安装失败"
       exit 1
     fi
@@ -225,7 +224,7 @@ if [ -n "$LATEST" ] && [ "$CUR_DSH" != "$LATEST" ] || [ -z "$CUR_DSH" ]; then
   
   # 等待 daemon 编译完成
   if [ -n "${DAEMON_PID:-}" ]; then
-    if wait $DAEMON_PID 2>/dev/null; then
+    if wait "$DAEMON_PID" 2>/dev/null; then
       ok "daemon 编译完成(并行)"
     else
       warn "daemon 并行编译失败,稍后将重试"
@@ -238,9 +237,10 @@ if [ -n "$LATEST" ] && [ "$CUR_DSH" != "$LATEST" ] || [ -z "$CUR_DSH" ]; then
     echo "  ${D}清理跨平台冗余文件...${R}"
     bash "$ROOT/scripts/cleanup-deps.sh" "$APP_DIR" 2>/dev/null || true
     
-    # 验证探针：确保清理未破坏运行时原生依赖(在 APP_DIR 内解析,sharp 为主包)
+    # 验证探针：确保清理未破坏运行时原生依赖(从 dsh 包目录解析——pnpm 隔离布局下
+    # sharp/node-pty 是传递依赖,顶层 node_modules/ 只有 @deepseek-ai,从 APP_DIR 解析必失败)
     echo "  ${D}验证关键依赖完整性...${R}"
-    if ! ( cd "$APP_DIR" && "$NODE_BIN" -e "require('sharp'); require('node-pty')" >/dev/null 2>&1 ); then
+    if ! ( cd "$APP_DIR/node_modules/@deepseek-ai/dsh" && "$NODE_BIN" -e "require('sharp'); require('node-pty')" >/dev/null 2>&1 ); then
       warn "依赖验证失败（sharp/node-pty），回退重装"
       rm -rf "$APP_DIR/node_modules"
       if ! PATH="$NODE_DIR/bin:$PATH" NODE_OPTIONS="--max-old-space-size=4096" npx_pnpm \
@@ -290,7 +290,7 @@ elif [ -f "$ROOT/src/daemon.c" ] && command -v clang >/dev/null; then
     ok "守护已是最新(daemon.c 未变,免编译)"
   else
     echo "  ${D}clang 编译中 ...${R}"
-    clang $DAEMON_CFLAGS -o "$RT_HOME/daemon" "$ROOT/src/daemon.c" || { warn "守护编译失败"; exit 1; }
+    clang "${DAEMON_CFLAGS[@]}" -o "$RT_HOME/daemon" "$ROOT/src/daemon.c" || { warn "守护编译失败"; exit 1; }
     [ -n "$SRC_MD5" ] && printf '%s\n' "$SRC_MD5" > "$RT_HOME/.daemon.md5"
     install_daemon
     ok "本地 clang 编译完成"
@@ -315,7 +315,7 @@ fi
 # ---------- 5) LaunchAgent 注册(零常驻 socket activation:launchd 持有 socket,连接到达才拉起守护) ----------
 h1 "5) LaunchAgent(零常驻,首次访问自动唤醒)"
 AGENT_OK=0
-if [ -z "${DSH_INSTALL_NO_AGENT:-}" ]; then
+if [ "${DSH_INSTALL_NO_AGENT:-}" != "1" ]; then
   TPL="$ROOT/launchd/com.dshpwa.daemon.plist"
   [ -f "$TPL" ] || TPL="$ROOT/com.dshpwa.daemon.plist"
   if [ -f "$TPL" ]; then
@@ -358,7 +358,7 @@ if [ -z "${DSH_INSTALL_NO_AGENT:-}" ]; then
   
   # 注册自动更新器(定时任务,每天凌晨 2:30)
   UPDATER_TPL="$ROOT/launchd/com.dshpwa.updater.plist"
-  if [ -f "$UPDATER_TPL" ] && [ ! "${DSH_RT_NO_AUTO_UPDATE:-}" ]; then
+  if [ -f "$UPDATER_TPL" ] && [ "${DSH_RT_NO_AUTO_UPDATE:-}" != "1" ]; then
     UPDATER="$AGENT_DIR/com.dshpwa.updater.plist"
     sed -e "s|__HOME__|$HOME|g" \
         -e "s|__RT_HOME__|$RT_HOME|g" \

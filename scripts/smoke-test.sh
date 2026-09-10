@@ -94,8 +94,13 @@ if [ -n "$TOKEN" ]; then
   # 就绪后 manifest 也必须是守护自己的(PWA 安装身份不得绑定 dsh 内部端口)
   curl -fsS "http://127.0.0.1:$SMOKE_PORT/manifest.webmanifest" | grep -q '"start_url":"/"' \
     || fail "就绪后 manifest 未由守护应答(PWA 会绑到 dsh 行为)"
-  curl -fsS -o /dev/null -c "$SMOKE_ROOT/cookies.txt" "http://127.0.0.1:$SMOKE_PORT/?token=$TOKEN" \
+  # 握手必须真的透传到 dsh 换取会话:只断言 200 测不出 F1 类死循环 bug(引导页也是 200),
+  # 必须断言响应携带 Set-Cookie: dsh-auth(dsh 0.1.5+ 的持久会话 cookie)
+  curl -fsS -o /dev/null -D "$SMOKE_ROOT/handshake.headers" -c "$SMOKE_ROOT/cookies.txt" \
+    "http://127.0.0.1:$SMOKE_PORT/?token=$TOKEN" \
     || fail "token 握手失败(dsh 0.1.5+ 鉴权)"
+  grep -qi '^set-cookie:.*dsh-auth' "$SMOKE_ROOT/handshake.headers" \
+    || fail "token 握手响应未携带 Set-Cookie: dsh-auth(握手疑似被引导页拦截,引导页会无限 reload): $(tr -d '\r' < "$SMOKE_ROOT/handshake.headers" | head -5 | tr '\n' ' ')"
   code="$(curl -s -o /dev/null -w '%{http_code}' -b "$SMOKE_ROOT/cookies.txt" "http://127.0.0.1:$SMOKE_PORT/")"
 else
   code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$SMOKE_PORT/")"

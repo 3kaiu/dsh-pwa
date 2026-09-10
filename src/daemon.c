@@ -222,10 +222,34 @@ static time_t last_spawn_time = 0;
 static int spawn_failure_count = 0;
 static time_t cooldown_until = 0; // 崩溃冷却截止(非阻塞:到期前拒绝拉起,主循环照常服务引导页)
 
+// 更新进行中判定:update-dsh.sh 更新期间持 $RT_HOME/.install.lock(内含存活 pid)。
+// 此刻 node_modules 处于半更新状态,拉起 dsh 会崩溃或行为异常——放弃本次 spawn,等下次唤醒重试。
+// fail-open:锁不可读/不存在/pid 已死(陈旧锁)一律视为无锁,绝不因锁机制问题阻断正常启动。
+static int update_locked(void) {
+  char p[1100];
+  snprintf(p, sizeof p, "%s/.install.lock/pid", RT_HOME);
+  int fd = open(p, O_RDONLY);
+  if (fd < 0) return 0;
+  char b[32];
+  ssize_t n = read(fd, b, sizeof b - 1);
+  close(fd);
+  if (n <= 0) return 0;
+  b[n] = 0;
+  int pid = atoi(b);
+  return pid > 0 && kill(pid, 0) == 0;
+}
+
 static void spawn_dsh(void) {
   // 崩溃自愈:连续快速崩溃则进入 60s 冷却(非阻塞——旧 sleep(60) 会卡住主循环 60s,期间所有请求 hanging)
   time_t now = time(NULL);
   if (now < cooldown_until) return;
+  if (update_locked()) {
+    // 更新持有 install.lock:本轮放弃 spawn(spawn_pid 保持 0,下次 /wake/页面请求自然重试);
+    // /health 继续如实报 dsh:false,引导页 tick 持续轮询,更新完成后任一新请求即可拉起。
+    // 只做一次非阻塞检查,绝不等待锁释放。
+    fprintf(stderr, "daemon: 更新进行中(install.lock 持有存活 pid),本轮不拉起 dsh\n");
+    return;
+  }
   if (now - last_spawn_time < 5) {
     spawn_failure_count++;
     if (spawn_failure_count >= 3) {
@@ -555,8 +579,7 @@ static void relay(int c, int u) {
       else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR)) { u_eof = 1; shutdown(c, SHUT_WR); }
     }
   }
-  close(c);
-  close(u);
+  close(u); // c 的所有权在调用方(handle_conn 返回后统一收尾),u 是 relay 私有
 }
 
 static int connect_upstream(void) {
@@ -669,7 +692,7 @@ static void handle_conn(int c) {
     return;
   }
 
-  char method[8] = "", path[1024] = "";
+  char method[8] = "", path[1024] = "", query[1024] = "";
   char *sp1 = strchr(buf, ' ');
   char *sp2 = sp1 ? strchr(sp1 + 1, ' ') : NULL;
   if (sp1 && sp2) {
@@ -677,7 +700,8 @@ static void handle_conn(int c) {
     memcpy(method, buf, ml); method[ml] = 0;
     size_t pl = (size_t)(sp2 - (sp1 + 1)); if (pl >= sizeof path) pl = sizeof path - 1;
     memcpy(path, sp1 + 1, pl); path[pl] = 0;
-    char *q = strchr(path, '?'); if (q) *q = 0;
+    // query 单独留存('?/' 后至 path 截断前):token 握手放行判断需要它,见下方无 cookie 拦截
+    char *q = strchr(path, '?'); if (q) { snprintf(query, sizeof query, "%s", q + 1); *q = 0; }
   }
 
   // 每次请求都重读 dsh.json:/wake 拉起 dsh 后端口是守护挑的,停止后文件被删,自动跟随
@@ -736,7 +760,11 @@ static void handle_conn(int c) {
   // Safari Web App 有独立 cookie 存储:Safari 里种下的 dsh-auth cookie 在 PWA 进程里不存在,
   // 冷启动直接透传会得到 dsh 的 401。引导页会经 /health 拿 token 完成握手(种 PWA 自己的
   // cookie)再 reload 进入 dsh。带 cookie 的正常会话不受影响,直接透传。
-  if (strcmp(method, "GET") == 0 && strcmp(path, "/") == 0 && !strstr(buf, "\nCookie: dsh-auth")) {
+  // 例外:引导页自己的握手 fetch('/?token=…') 同样是无 cookie 的 GET /,若不豁免会被本拦截
+  // 挡回引导页 → Set-Cookie 永远拿不到 → 引导页无限 reload。query 以 token= 开头(引导页与
+  // dsh 官方 URL 均如此)才放行透传;?other=… 之类无 token 的仍回引导页。
+  if (strcmp(method, "GET") == 0 && strcmp(path, "/") == 0 && strncmp(query, "token=", 6) != 0 &&
+      !strstr(buf, "\nCookie: dsh-auth")) {
     respond(c, 200, "text/html; charset=utf-8", BOOT_PAGE);
     return;
   }
@@ -771,6 +799,13 @@ int main(void) {
   read_run();
   dsh_port = read_state_port();
   if (dsh_port > 0 && !dsh_up()) dsh_port = 0;
+  else if (dsh_port > 0) {
+    // 守护重启收养运行中的 dsh(spawn_pid=0):日志里的 token 行仍在(O_TRUNC 只发生在下次
+    // spawn),开启扫描窗口并立即扫一次;否则 token 永不捕获 → /health 无 token → 引导页
+    // 等 token 失败后裸 reload 吃 401,同样进不去
+    last_spawn_time = time(NULL);
+    scan_token();
+  }
 
   // 唤醒请求管道(连接子进程写 → 主进程读)。两端均 CLOEXEC:exec 出的 dsh 不继承
   if (pipe(wake_pipe) == 0) {
@@ -892,9 +927,9 @@ int main(void) {
         }
       }
     }
-    // dsh 0.1.5+ 启动 token 扫描:dsh 本体在跑且未捕获时增量扫日志
-    // (最多追 120s:再晚说明是旧版无 token 机制,放弃以免整场空扫)
-    if (!dsh_token[0] && spawn_pid > 0 && time(NULL) - last_spawn_time < 120) scan_token();
+    // dsh 0.1.5+ 启动 token 扫描:dsh 在跑(本进程 spawn 或重启收养)且未捕获时增量扫日志
+    // (最多追 120s:再晚说明是旧版无 token 机制,放弃以免整场空扫;收养场景窗口从守护启动算起)
+    if (!dsh_token[0] && dsh_port > 0 && time(NULL) - last_spawn_time < 120) scan_token();
     // 就绪推进放主进程:dsh 每次启动只在这里探测成功一次,ready_port 经 fork 传给所有连接子进程
     // (否则每个连接子进程都会各自探一次,透传期每个请求白白多一次完整 GET /)
     if (dsh_port > 0 && ready_port != dsh_port && dsh_up() && http_probe(dsh_port)) {
@@ -934,11 +969,11 @@ int main(void) {
             _exit(0);
           }
           close(c);
-          active++;
+          if (pid > 0) active++; // fork 失败(pid<0):连接已关、无子进程,不得计入——
+          // 否则 active 永不归零,空闲停机判定失效,dsh 永不自动停、守护永不自退(零常驻被破坏)
         }
       }
     }
   }
-  close(ls);
   return 0;
 }

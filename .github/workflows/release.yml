@@ -20,8 +20,8 @@ jobs:
         run: clang -O2 -Wall -Wextra -arch arm64 -arch x86_64 -o /tmp/daemon src/daemon.c && codesign --force -s - /tmp/daemon
       - name: 生成 pnpm-lock.yaml(预解析依赖树,用户安装跳解析省时;与 install.sh 同配置)
         run: |
-          # 自动跟随上游 next 标签(dsh 官方开发分支)
-          DSH_VERSION="${DSH_VERSION:-next}"
+          # 自动跟随上游 latest 标签(dsh 稳定版本;与 install.sh 的 DSH_VERSION 默认一致)
+          DSH_VERSION="${DSH_VERSION:-latest}"
           npm i -g pnpm@10 >/dev/null 2>&1
           mkdir -p /tmp/dsh-lock
           printf '{"name":"dsh-lock","private":true,"dependencies":{"@deepseek-ai/dsh":"%s"},"pnpm":{"onlyBuiltDependencies":["node-pty","koffi","@deepseek-ai/dsh-subprocess-local"]}}\n' "$DSH_VERSION" > /tmp/dsh-lock/package.json
@@ -45,22 +45,25 @@ jobs:
         # release 也可能在无 GUI 会话的 runner 上跑:smoke-test.sh 对 socket activation 段
         # 做条件跳过并显式输出 [SKIP](不静默),其余冒烟项必须真实通过
         run: bash scripts/smoke-test.sh
-      - name: 打包(install.sh + daemon + daemon.c + plist + lock + cleanup)
+      - name: 打包(install.sh + daemon + daemon.c + plist + lock + cleanup + update-dsh)
         run: |
           mkdir -p /tmp/pkg/launchd /tmp/pkg/scripts
           cp /tmp/daemon /tmp/pkg/daemon
           cp scripts/install.sh /tmp/pkg/install.sh
           cp scripts/cleanup-deps.sh /tmp/pkg/scripts/cleanup-deps.sh
+          cp scripts/update-dsh.sh /tmp/pkg/scripts/update-dsh.sh
           cp src/daemon.c /tmp/pkg/daemon.c
           cp launchd/com.dshpwa.daemon.plist /tmp/pkg/launchd/
+          cp launchd/com.dshpwa.updater.plist /tmp/pkg/launchd/
           cd /tmp/pkg && zip -qr dsh-pwa.zip .
           shasum -a 256 dsh-pwa.zip > dsh-pwa.zip.sha256
       - name: 发布到 GitHub Releases(下载链接)
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
         run: |
-          gh release create "${{ github.ref_name }}" /tmp/pkg/dsh-pwa.zip /tmp/pkg/dsh-pwa.zip.sha256 \
+          gh release create "$TAG" /tmp/pkg/dsh-pwa.zip /tmp/pkg/dsh-pwa.zip.sha256 \
             --repo "$GITHUB_REPOSITORY" \
-            --title "dsh-pwa ${{ github.ref_name }}" \
+            --title "dsh-pwa $TAG" \
             --notes-file "$GITHUB_WORKSPACE/.github/RELEASE_NOTES.md" \
-            || gh release upload "${{ github.ref_name }}" /tmp/pkg/dsh-pwa.zip /tmp/pkg/dsh-pwa.zip.sha256 --repo "$GITHUB_REPOSITORY" --clobber
+            || gh release upload "$TAG" /tmp/pkg/dsh-pwa.zip /tmp/pkg/dsh-pwa.zip.sha256 --repo "$GITHUB_REPOSITORY" --clobber

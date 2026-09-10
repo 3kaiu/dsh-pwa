@@ -20,9 +20,12 @@
     <key>Hour</key><integer>2</integer>
     <key>Minute</key><integer>30</integer>
   </dict>
+  <!-- PATH 兜底:launchd 不继承用户 shell 的 PATH,显式注入系统工具路径确保
+       curl/stat/sed 等可用;node 不在此列,由 update-dsh.sh 从 run.json 自行解析 -->
   <key>EnvironmentVariables</key>
   <dict>
     <key>HOME</key><string>__HOME__</string>
+    <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>DSH_RT_HOME</key><string>__RT_HOME__</string>
     <key>DSH_RT_STATE</key><string>__RT_STATE__</string>
     <key>DSH_RT_PORT</key><string>__DSH_RT_PORT__</string>

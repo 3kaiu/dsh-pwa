@@ -10,6 +10,9 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   build-and-test:
     name: 编译 + bats 单测 + 冒烟 + 安全套件
@@ -20,6 +23,7 @@ jobs:
 
       - name: 编译守护进程 (universal binary)
         run: |
+          set -euo pipefail
           clang -O2 -Wall -Wextra -Werror \
             -arch arm64 -arch x86_64 \
             -o /tmp/daemon src/daemon.c
@@ -29,12 +33,14 @@ jobs:
 
       - name: 验证二进制架构
         run: |
+          set -euo pipefail
           file /tmp/daemon
           lipo -info /tmp/daemon
           stat -f%z /tmp/daemon
 
       - name: Bats 单元测试 (install 端口校验 / daemon 编译 / 脚本语法)
         run: |
+          set -euo pipefail
           brew install bats-core
           # 必须经 bats 运行器执行(bats 文件是 DSL,bash file.bats 无法运行)
           bats tests/unit/*.bats
@@ -53,12 +59,14 @@ jobs:
 
       - name: Shellcheck (Bash 脚本检查,门禁)
         run: |
+          set -euo pipefail
           brew install shellcheck
           # -S warning:错误/警告级为门禁;info 级风格提示不阻断(现有脚本均为有意的写法)
           shellcheck -S warning scripts/*.sh tests/*.sh tests/lib/*.sh
 
       - name: Clang Static Analyzer (门禁)
         run: |
+          set -euo pipefail
           clang --analyze \
             -Xanalyzer -analyzer-output=text \
             -Wall -Wextra \
@@ -82,6 +90,7 @@ jobs:
 
       - name: 编译并安装守护进程
         run: |
+          set -euo pipefail
           clang -O2 -Wall -Wextra -Werror \
             -arch arm64 -arch x86_64 \
             -o /tmp/daemon src/daemon.c
@@ -91,6 +100,7 @@ jobs:
 
       - name: 性能基准测试 (非门禁)
         run: |
+          set -euo pipefail
           # 基准需要守护在线:smoke-test 在 build-and-test 已跑完(其守护退出即自停),
           # 这里单独拉起基准实例(缺 run.json 时守护仅应答 /health,足够基准测量)
           DSH_RT_HOME="$HOME/.local/share/dsh-runtime" \
@@ -125,6 +135,7 @@ jobs:
 
       - name: 编译守护进程
         run: |
+          set -euo pipefail
           clang -O2 -Wall -Wextra -Werror \
             -arch arm64 -arch x86_64 \
             -o /tmp/daemon src/daemon.c
@@ -134,6 +145,7 @@ jobs:
 
       - name: 检查体积回归
         run: |
+          set -euo pipefail
           SIZE=$(stat -f%z /tmp/daemon)
           SIZE_KB=$((SIZE / 1024))
           echo "Binary size: ${SIZE_KB} KB"
