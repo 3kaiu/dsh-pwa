@@ -352,25 +352,47 @@ if make_env t08 1.0.0; then
   PORT=""
   for _ in 1 2 3; do
     CAND="$(pick_free_port)"
+    # 裸 socket 假服务:bind 与 listen 之间不夹任何解析动作。
+    # 不要换回 http.server.HTTPServer —— 它在 server_bind() 里调用 socket.getfqdn(host)
+    # 做反向解析,而该调用恰好夹在 bind() 与 listen() 之间:解析慢时 socket 会长时间停在
+    # 「已绑定、未监听」状态,而 macOS 对此时到达的 SYN 是直接丢弃(实测 curl 挂满超时,
+    # 不返回 ECONNREFUSED)。CI(GitHub macOS runner)上反向解析可达数秒 → update-dsh.sh 的
+    # /health 探测(-m 2)与 /stop 探测(--max-time 5)双双超时 → 健康检查读不到 dsh:true →
+    # 误判「dsh 未运行」→ 照常更新,本用例假失败(实测 CI 用例耗时 ~7.9s ≈ 2s+5s 双超时)。
+    # 同 job 内 smoke-test.sh 的占位监听器同样是裸 socket,在 CI 稳定通过,可反证网络无碍。
     python3 -c '
-import sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
-class H(BaseHTTPRequestHandler):
-    def do_GET(self):
-        b = b"{\"dsh\":true}"
-        self.send_response(200)
-        self.send_header("Content-Length", str(len(b)))
-        self.end_headers()
-        self.wfile.write(b)
-    def do_POST(self):
-        self.do_GET()
-    def log_message(self, *a):
+import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+s.listen(16)
+body = b"{\"dsh\":true,\"port\":0,\"pid\":0}"
+while True:
+    try:
+        c, _ = s.accept()
+    except OSError:
+        break
+    try:
+        c.recv(4096)
+        c.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+                  + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
+    except OSError:
         pass
-HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+    finally:
+        c.close()
 ' "$CAND" >/dev/null 2>&1 &
     CAND_PID=$!
-    sleep 0.3
-    if kill -0 "$CAND_PID" 2>/dev/null; then
+    # 就绪判定必须真连一次:kill -0 只证明进程活着,不证明端口已在 listen(见上方注释)。
+    # 保留 curl 退出码:失败时据此区分「连不上(7)」与「挂到超时(28)」,否则 2>/dev/null
+    # 会把失败原因一并吞掉,让下一次同类故障无从定位。
+    PROBE=""; PROBE_RC=0
+    for _ in $(seq 1 50); do
+      PROBE_RC=0
+      PROBE="$(curl -s -m 1 --noproxy '*' "http://127.0.0.1:$CAND/health" 2>/dev/null)" || PROBE_RC=$?
+      if printf '%s' "$PROBE" | grep -q '"dsh":true'; then break; fi
+      sleep 0.1
+    done
+    if printf '%s' "$PROBE" | grep -q '"dsh":true'; then
       PORT="$CAND"
       SERVER_PID="$CAND_PID"
       break
@@ -380,12 +402,15 @@ HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
   done
   if [ -z "$PORT" ]; then
     fail "无法启动假 HTTP 服务(健康探测需要)"
+    info "最后一次探测: curl rc=$PROBE_RC 响应=${PROBE:-<空>}(rc=7 连不上 / rc=28 挂到超时)"
   else
     run_update "$TEST_DIR/run.out" "$PORT"
     if [ "$RUN_RC" = 0 ] && grep -q "dsh 运行中" "$TEST_STATE/logs/update.log" && grep -q "跳过本次更新" "$TEST_STATE/logs/update.log"; then
       ok "日志记录「dsh 运行中…跳过本次更新」并 exit 0"
     else
       fail "dsh 运行中未跳过(rc=$RUN_RC)"
+      info "假服务在 127.0.0.1:$PORT 已就绪(探测响应 $PROBE),但 updater 未识别;update.log 尾部:"
+      tail -3 "$TEST_STATE/logs/update.log" 2>/dev/null | while IFS= read -r l; do info "    $l"; done
     fi
     if grep -q '"version": *"1.0.0"' "$TEST_RT/app/node_modules/@deepseek-ai/dsh/package.json" && [ ! -f "$TEST_PNPM_LOG" ]; then
       ok "node_modules 未动且未调用 pnpm"

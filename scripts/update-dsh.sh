@@ -156,8 +156,10 @@ log "==> $(date '+%Y-%m-%d %H:%M:%S') 开始更新 dsh: $CUR -> $REMOTE($DSH_VER
 # /wake 拉起半更新的 node_modules"。规则:dsh 在跑(守护 /health 报 dsh:true,大概率有
 # 活跃会话)→ 推迟本次更新,等下一轮(每天 2:30 / 守护激活 12h 节流)用户不在场时再做;
 # /health 不可达(守护未激活,典型凌晨场景)→ dsh 必然没在跑,照常更新。
+# --noproxy '*':守护恒在回环地址,而用户环境可能设了 http_proxy(代理不可达/不转发回环时
+# curl 会一直挂到超时)→ 会误判「dsh 未运行」而在用户活跃时替换依赖树,故显式绕过代理。
 RT_PORT="${DSH_RT_PORT:-3080}"
-HEALTH="$(curl -s -m 2 "http://127.0.0.1:$RT_PORT/health" 2>/dev/null || true)"
+HEALTH="$(curl -s -m 2 --noproxy '*' "http://127.0.0.1:$RT_PORT/health" 2>/dev/null || true)"
 if printf '%s' "$HEALTH" | grep -q '"dsh"[[:space:]]*:[[:space:]]*true'; then
   log "! $(date '+%Y-%m-%d %H:%M:%S') dsh 运行中(用户可能活跃),跳过本次更新(当前 $CUR)"
   exit 0
@@ -167,7 +169,7 @@ fi
 # 用户恰好 /wake 会把 dsh 从即将半更新的 node_modules 拉起。经守护 /stop 优雅停掉
 # 刚拉起的 dsh 兜住该窗口(守护自身继续服务引导页);连不上守护照常更新——curl 失败
 # 绝不中止更新。更新完成后不主动重启:零常驻模式下下次 PWA 访问天然自动拉起新版。
-if curl -fsS --max-time 5 -X POST -H "Origin: http://127.0.0.1:$RT_PORT" \
+if curl -fsS --max-time 5 --noproxy '*' -X POST -H "Origin: http://127.0.0.1:$RT_PORT" \
      "http://127.0.0.1:$RT_PORT/stop" >/dev/null 2>&1; then
   log "  更新前已停止运行中的 dsh(经守护 /stop),避免从半更新树启动"
 fi

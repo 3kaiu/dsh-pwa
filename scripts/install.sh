@@ -142,16 +142,18 @@ trap 'rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null || true; [ -n "${PKG_TMP:-}" 
 # 并等它真正退出后再动依赖树。本脚本此刻已持有 .install.lock,守护 update_locked() 会拒绝
 # 重新拉起 dsh,因此停下后不会被引导页立刻唤醒(等本次装完自然恢复)。
 # /health 不可达(未安装/守护未激活)→ dsh 必然没在跑,直接返回。
+# --noproxy '*':守护恒在回环地址,而用户环境可能设了 http_proxy(代理不可达/不转发回环时
+# curl 会一直挂到超时)→ 会误判「dsh 未运行」而在用户活跃时替换依赖树,故显式绕过代理。
 stop_active_dsh() {
   local port="${1:-3080}" health=""
-  health="$(curl -s -m 2 "http://127.0.0.1:$port/health" 2>/dev/null || true)"
+  health="$(curl -s -m 2 --noproxy '*' "http://127.0.0.1:$port/health" 2>/dev/null || true)"
   printf '%s' "$health" | grep -q '"dsh"[[:space:]]*:[[:space:]]*true' || return 0
   echo "  ${D}检测到 dsh 正在运行,先优雅停止(避免从半更新的依赖树启动)...${R}"
-  curl -fsS --max-time 5 -X POST -H "Origin: http://127.0.0.1:$port" \
+  curl -fsS --max-time 5 --noproxy '*' -X POST -H "Origin: http://127.0.0.1:$port" \
     "http://127.0.0.1:$port/stop" >/dev/null 2>&1 || true
   # 等待停止完成(daemon 侧 stop_dsh 最长 6s;给 7s 余量后不再阻塞)
   for _ in $(seq 1 14); do
-    health="$(curl -s -m 2 "http://127.0.0.1:$port/health" 2>/dev/null || true)"
+    health="$(curl -s -m 2 --noproxy '*' "http://127.0.0.1:$port/health" 2>/dev/null || true)"
     printf '%s' "$health" | grep -q '"dsh"[[:space:]]*:[[:space:]]*true' || return 0
     sleep 0.5
   done
