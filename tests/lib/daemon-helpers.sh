@@ -13,6 +13,22 @@
 DSH_TEST_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DSH_DAEMON_SRC="${DSH_DAEMON_SRC:-$DSH_TEST_ROOT/src/daemon.c}"
 
+# pick_free_port
+# 挑一个当前空闲的回环端口(bind port 0 由内核分配,随即释放):降低与残留监听进程冲突的概率。
+# 窗口期内仍可能被抢占(探测与使用之间非原子),但显著优于纯随机;python3 不可用时回退随机。
+pick_free_port() {
+  local py=""
+  py="$(command -v python3 || true)"
+  if [ -n "$py" ]; then
+    "$py" -c 'import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()' && return 0
+  fi
+  echo $(( (RANDOM % 20000) + 20000 ))
+}
+
 # daemon_compile <输出路径> [clang 额外参数...]
 # 编译 src/daemon.c(-O2 -Wall -Wextra -Werror);成功静默,失败打印编译日志并返回非零。
 daemon_compile() {

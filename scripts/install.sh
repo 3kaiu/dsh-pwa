@@ -28,6 +28,9 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 if [ ! -f "$ROOT/src/daemon.c" ] && [ ! -f "$ROOT/daemon" ]; then
   h1 "自动下载发行包(releases/${RELEASE_TAG})"
   PKG_TMP="$(mktemp -d /tmp/dsh-pwa.XXXXXX)"
+  # 立即注册清理:下载/解压/校验任一步失败都不泄漏临时目录
+  # (拿到安装锁后会被下方含锁清理的完整 trap 覆盖,其已含 PKG_TMP 清理)
+  trap '[ -n "${PKG_TMP:-}" ] && rm -rf "$PKG_TMP" 2>/dev/null || true' EXIT
   DL_URL="https://github.com/3kaiu/dsh-pwa/releases/${RELEASE_TAG}/download/dsh-pwa.zip"
   SHA_URL="https://github.com/3kaiu/dsh-pwa/releases/${RELEASE_TAG}/download/dsh-pwa.zip.sha256"
   
@@ -58,6 +61,16 @@ if ! [[ "$PORT_RAW" =~ ^[0-9]+$ ]] || [ "$PORT_RAW" -lt 1024 ] || [ "$PORT_RAW" 
 fi
 PORT="$PORT_RAW"
 LOG_DIR="$RT_STATE/logs"
+# plist 模板经 sed(分隔符 |、替换串中 & 有特殊含义)注入路径:路径含这两个字符
+# 会产出损坏的 plist,替换前校验、fail-closed 拒绝(LOG_DIR 由 RT_STATE 派生,已覆盖)
+for _P in "$HOME" "$RT_HOME" "$RT_STATE"; do
+  case "$_P" in
+    *'|'*|*'&'*)
+      echo "路径含 | 或 &,无法生成 LaunchAgent 配置:$_P" >&2
+      exit 1
+      ;;
+  esac
+done
 # daemon 编译统一参数(两处编译路径共用;universal binary 双架构,Intel Mac 也产出 arm64+x86_64)
 DAEMON_CFLAGS=(-O2 -Wall -Wextra -arch arm64 -arch x86_64)
 NODE_DIR="$RT_HOME/node"
@@ -78,11 +91,39 @@ LOCK="$RT_HOME/.install.lock"
 LOCKED=0
 for _ in $(seq 1 300); do
   if mkdir "$LOCK" 2>/dev/null; then
-    echo "$$" > "$LOCK/pid"; LOCKED=1; break
+    echo "$$" > "$LOCK/pid" 2>/dev/null || true
+    # 写后复核:mkdir→写 pid 的微窗口内锁可能被抢占者删掉重建(空 pid 会被误判陈旧)。
+    # pid 仍是自己才真正持锁——活 pid 的锁绝不会被抢占,复核通过即安全;
+    # 不一致说明实际未拿到,继续循环重试
+    if [ "$(cat "$LOCK/pid" 2>/dev/null || true)" = "$$" ]; then
+      LOCKED=1; break
+    fi
+    continue
   fi
   LPID="$(cat "$LOCK/pid" 2>/dev/null || true)"
   if [ -z "$LPID" ] || ! kill -0 "$LPID" 2>/dev/null; then
-    rm -rf "$LOCK"; continue
+    # TOCTOU 防护:读到死 pid 到执行删除之间,锁可能被其他等待进程抢占重建(活锁)。
+    # 1) O_EXCL 原子创建 claim 文件独占抢占权:claim 存在期间锁目录无法被 mkdir,
+    #    多个等待者只有一个能走到删除,新持有者也不可能中途出现
+    if ( set -C; echo "$$" > "$LOCK/claim" ) 2>/dev/null; then
+      sleep 0.2  # 等待可能正处于 mkdir→写 pid 微窗口的新持有者完成落笔
+      # 2) 复读 pid 仍是最初判死的值才删(陈旧锁连同 claim 一并删除);不一致说明
+      #    锁刚易主(活锁),只归还 claim,不动锁
+      if [ "$(cat "$LOCK/pid" 2>/dev/null || true)" = "$LPID" ]; then
+        rm -rf "$LOCK"
+      else
+        rm -f "$LOCK/claim" 2>/dev/null || true
+      fi
+    else
+      # 已有等待者在抢占:活着的等它完成;死了的清残留 claim(否则会永远挡住后来者)
+      CPID="$(cat "$LOCK/claim" 2>/dev/null || true)"
+      if [ -n "$CPID" ] && kill -0 "$CPID" 2>/dev/null; then
+        sleep 0.2
+      else
+        rm -f "$LOCK/claim" 2>/dev/null || true
+      fi
+    fi
+    continue
   fi
   sleep 1
 done
@@ -348,10 +389,20 @@ if [ "${DSH_INSTALL_NO_AGENT:-}" != "1" ]; then
         exit 1
       fi
     fi
-    launchctl bootstrap "gui/$(id -u)" "$AGENT" 2>/dev/null \
-      || launchctl enable "gui/$(id -u)/com.dshpwa.daemon" 2>/dev/null || true
-    AGENT_OK=1
-    ok "com.dshpwa.daemon 已注册(launchd 持有 socket,零常驻;首次访问 http://127.0.0.1:$PORT/ 自动唤醒)"
+    # bootstrap 失败不能被 || true 静默吞掉:enable 兜底后必须用 launchctl print
+    # 确认真实注册状态,否则用户看到"已注册"+自动打开浏览器,守护却从未注册(静默失效)
+    if ! launchctl bootstrap "gui/$(id -u)" "$AGENT" 2>/dev/null; then
+      warn "launchctl bootstrap 失败,尝试 enable 兜底(常见原因:job 已注册或被禁用)"
+      launchctl enable "gui/$(id -u)/com.dshpwa.daemon" 2>/dev/null || true
+    fi
+    if launchctl print "gui/$(id -u)/com.dshpwa.daemon" >/dev/null 2>&1; then
+      AGENT_OK=1
+      ok "com.dshpwa.daemon 已注册(launchd 持有 socket,零常驻;首次访问 http://127.0.0.1:$PORT/ 自动唤醒)"
+    else
+      warn "LaunchAgent 注册失败(launchctl print 确认 com.dshpwa.daemon 未注册),守护不会自动拉起"
+      echo "  手动恢复:launchctl bootstrap gui/$(id -u) '$AGENT'" >&2
+      echo "  排查错误:launchctl print gui/$(id -u)/com.dshpwa.daemon" >&2
+    fi
   else
     warn "缺少 plist 模板,未注册守护"
   fi
@@ -366,9 +417,16 @@ if [ "${DSH_INSTALL_NO_AGENT:-}" != "1" ]; then
         -e "s|__LOG_DIR__|$LOG_DIR|g" \
         -e "s|__DSH_RT_PORT__|$PORT|g" "$UPDATER_TPL" > "$UPDATER"
     chmod 600 "$UPDATER"
-    launchctl bootstrap "gui/$(id -u)" "$UPDATER" 2>/dev/null \
-      || launchctl enable "gui/$(id -u)/com.dshpwa.updater" 2>/dev/null || true
-    ok "com.dshpwa.updater 已注册(每天凌晨 2:30 自动检查更新)"
+    if ! launchctl bootstrap "gui/$(id -u)" "$UPDATER" 2>/dev/null; then
+      warn "updater launchctl bootstrap 失败,尝试 enable 兜底"
+      launchctl enable "gui/$(id -u)/com.dshpwa.updater" 2>/dev/null || true
+    fi
+    if launchctl print "gui/$(id -u)/com.dshpwa.updater" >/dev/null 2>&1; then
+      ok "com.dshpwa.updater 已注册(每天凌晨 2:30 自动检查更新)"
+    else
+      warn "自动更新器注册失败(launchctl print 确认未注册),自动更新不可用"
+      echo "  手动恢复:launchctl bootstrap gui/$(id -u) '$UPDATER'" >&2
+    fi
   fi
 else
   # 测试模式(不注册 agent)同样校验端口,让占用端口配置尽早暴露而非静默通过

@@ -123,6 +123,8 @@ if (strcmp(method, "POST") == 0 || strcmp(method, "PUT") == 0 ||
 **实施位置**  
 - `scripts/install.sh:222-233`
 
+> 📝 **勘误(2026-09-11):** 探针此后已演进——不再是顶层 `require('@img/sharp')`(pnpm 隔离布局下 sharp/node-pty 是传递依赖,从 `APP_DIR` 顶层解析必失败),改为 `cd "$APP_DIR/node_modules/@deepseek-ai/dsh"` 后同时探测 `sharp` 与 `node-pty`,失败仍回退重装。下文代码块按当时实现记录。
+
 **修复代码**
 ```bash
 # 深度清理 node_modules
@@ -157,6 +159,8 @@ fi
 ---
 
 ### 问题 4: CI 不跑安全套件（中危）
+
+> 📝 **勘误(2026-09-11):** 工作流文件此后已由 `ci.yml` 更名/整合为 `.github/workflows/ci-enhanced.yml`,安全套件步骤在 ci-enhanced.yml 中;下文 `.github/workflows/ci.yml:22-24` 按当时文件名记录。安全测试数量也从 29 项增至 **33 项**(`tests/security-verification.sh`)。
 
 **问题描述**  
 `.github/workflows/ci.yml` 只运行 `smoke-test.sh`，不运行 `tests/security-verification.sh`，导致 CSRF/Origin 校验的运行时测试没有进入 CI 门禁。R2 类回归无法被自动拦截。
@@ -281,7 +285,7 @@ $ bash scripts/smoke-test.sh
    - 图像功能正常（验证 `@img/sharp` 探针有效）
 
 3. **文档更新**  
-   更新 `SECURITY_AUDIT.md`，记录本轮修复内容
+   更新 CHANGELOG.md(原计划的 `SECURITY_AUDIT.md` 未入库),记录本轮修复内容
 
 4. **长期监控**  
    关注 CI 中 security-verification 的运行结果，确保新代码不引入回归

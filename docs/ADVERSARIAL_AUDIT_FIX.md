@@ -202,16 +202,13 @@ if (pid == 0) {  // 子进程
 +   - Narrow window remains (5 lines) between child's close() and dsh's bind()
 +   - Much safer than original implementation but not completely eliminated
 
-# SECURITY_AUDIT.md:220-224
-- Port released only when dsh successfully starts
-+ Child closes fd before `execl()` (line 186), releasing reservation ~5 lines before dsh binds
-+ **Residual window:** Brief gap between child's `close(reserve_fd)` and dsh's `bind()` 
-+ Much narrower than original implementation, but not completely eliminated
+# (勘误:本报告初稿还引用了 SECURITY_AUDIT.md:220-224,该审计报告从未提交入库;
+#  TOCTOU 的如实表述见 CHANGELOG.md 的 M3 条目与 Security Audit Details 一节)
 ```
 
 **变更文件:**
 - `CHANGELOG.md:37-40`
-- `SECURITY_AUDIT.md:220-224`
+- (勘误:`SECURITY_AUDIT.md` 未入库,相应修正并入 `CHANGELOG.md`)
 
 ---
 
@@ -238,7 +235,7 @@ if (pid == 0) {  // 子进程
    - dsh 自身 API 无额外鉴权（依赖 localhost 隔离）
    - 风险：恶意站可能触发 dsh API 副作用（需 dsh 自身修复）
 
-**处理:** 已在 `SECURITY_AUDIT.md` "Residual Risks" 章节记录，不视为本项目可修复问题。
+**处理:** 残留风险已记录在 `CHANGELOG.md` 的 "Residual Risk" 一节(原文计划的 `SECURITY_AUDIT.md` 未入库),不视为本项目可修复问题。
 
 ---
 
@@ -291,7 +288,7 @@ SMOKE OK
 | `src/daemon.c` | 🔒 安全 | CSRF 端口严格校验（R2） |
 | `tests/security-verification.sh` | ✅ 测试 | 新增运行时 CSRF 测试（R3） |
 | `CHANGELOG.md` | 📝 文档 | 修正 TOCTOU 表述（R4） |
-| `SECURITY_AUDIT.md` | 📝 文档 | 修正 TOCTOU 表述（R4） |
+| `CHANGELOG.md` | 📝 文档 | 修正 TOCTOU 表述（R4;原计划的 `SECURITY_AUDIT.md` 未入库,修正并入本文件） |
 | `docs/ADVERSARIAL_AUDIT_FIX.md` | 📝 文档 | 本报告（新增） |
 
 ---
@@ -313,7 +310,7 @@ SMOKE OK
 
 ### 短期（1-2 周）
 1. **CI 强化:** 在 GitHub Actions 中运行 `security-verification.sh`
-2. **文档补充:** 在 README.md 添加 "Security" 章节，链接 SECURITY_AUDIT.md
+2. **文档补充:** 在 README.md 添加 "Security" 章节（✅ 已完成,即现有「安全特性」一节;原计划链接的 `SECURITY_AUDIT.md` 未入库,审计结论散见于 CHANGELOG.md 与 docs/ 三轮审计报告）
 
 ### 长期（1-3 个月）
 1. **完全消除 TOCTOU:** 研究 socket fd 继承方案（需重构 spawn_dsh）

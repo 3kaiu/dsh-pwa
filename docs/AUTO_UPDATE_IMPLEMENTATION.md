@@ -14,23 +14,28 @@
 
 **修改文件:**
 - `src/daemon.c` - 新增 `trigger_background_update()` 函数
-- `src/daemon.c: main()` - 预热后触发后台更新
+- `src/daemon.c: main()` - 守护启动时触发后台更新(与预热解耦)
 
 **工作流程:**
 ```
-PWA 连接触发 → launchd 激活 daemon → 预热 dsh → 激活时触发 $RT_HOME/scripts/update-dsh.sh(12h 节流)
+PWA 连接触发 → launchd 激活 daemon → 激活时评估后台更新(按 RT_STATE/last_update_check 时间戳 12h 节流,>12h 才真正触发)
                            ↓
         npm view 解析 @latest dist-tag 的真实版本号
                     ↓
-                    与本地实际版本比较 → 版本不同 → pnpm update(增量,与 install.sh 同一引导方式)
+                    与本地实际版本比较 → 版本不同 → dsh 运行中则跳过本轮;否则 pnpm update(增量,与 install.sh 同一引导方式,失败回滚)
                     ↓
                     下次启动使用新版本(刷新 run.json)
 ```
 
+**触发时机说明(勘误,2026-09-11):** 预热已默认改为懒启动(登录不再预热,`DSH_RT_PREWARM=1` 才显式开启),后台更新检查与预热完全解耦——守护每次被 launchd 激活启动都会评估是否触发,由 12h 节流决定是否真正执行;`DSH_RT_NO_PREWARM` 只影响预热,不再影响后台更新。
+
 **特点:**
-- ✅ 用户无感知延迟（首次启动 0 等待）
-- ✅ 网络失败自动降级（使用现有版本）
-- ✅ 与 install.sh 共用 `$RT_HOME/.install.lock`(mkdir 原子锁 + pid 存活检测),防止更新与安装并发
+- ✅ 用户无感知延迟（首次启动 0 等待;更新子进程延迟 10s 启动,不干扰首次 dsh 启动）
+- ✅ 网络失败自动降级（使用现有版本,保持当前版本不变）
+- ✅ dsh 正在运行时跳过本轮更新（守护 `/health` 报 dsh:true 视为用户可能活跃,等下一轮用户不在场时再更新;探测后到更新开始之间若 dsh 被拉起,先经守护 `/stop` 优雅停掉兜底）
+- ✅ 更新彻底失败时回滚（增量与全量重装均失败则恢复更新前的依赖树,保证"保持当前版本"是真的保持）
+- ✅ node 路径从 `RT_HOME/run.json` 解析（launchd 环境无用户 PATH,`command -v node` 会失败;run.json 是 install.sh 写入的单一事实源,缺失时回落 command -v / 自带 node）
+- ✅ 与 install.sh 共用 `$RT_HOME/.install.lock`(mkdir 原子锁 + pid 存活检测 + claim 防抢占),防止更新与安装并发
 - ✅ pnpm 不可用时失败记日志,绝不回退 npm(避免损坏 pnpm 依赖树)
 
 ---
@@ -41,7 +46,7 @@ PWA 连接触发 → launchd 激活 daemon → 预热 dsh → 激活时触发 $R
 - `launchd/com.dshpwa.updater.plist` - LaunchAgent 定时任务
 
 **修改文件:**
-- `scripts/install.sh` - 自动注册 updater LaunchAgent
+- `scripts/install.sh` - 自动注册 updater LaunchAgent(打包组件由 release workflow 一并发布)
 
 **工作流程:**
 ```
@@ -51,32 +56,48 @@ LaunchAgent 每天凌晨 2:30 触发
             ↓
     解析 @latest 真实版本并比较(与本地实际版本号比较,非 dist-tag 字符串)
             ↓
-    版本不同 → pnpm 增量更新 + cleanup-deps.sh 清理
-            ↓
-    日志写入 ~/.local/state/dsh-runtime/logs/update.log(updater.log 为 launchd 的 stdout/stderr)
+    版本不同且 dsh 未在运行 → pnpm 增量更新(失败回滚)+ cleanup-deps.sh 清理
+    ↓
+    日志写入 ~/.local/state/dsh-runtime/logs/update.log(超 2MB 自动轮转为 update.log.1;updater.log 为 launchd 的 stdout/stderr)
 ```
 
 **特点:**
 - ✅ 零启动延迟（守护进程启动逻辑完全不变）
-- ✅ 永远保持最新（每天自动更新）
+- ✅ 永远保持最新（每天自动更新;dsh 运行中则推迟到下一轮）
 - ✅ 职责分离（更新逻辑与守护进程解耦）
+- ✅ node 从 run.json 解析 + PATH 前置(launchd 定时环境无用户 PATH,updater plist 仅注入系统工具 PATH,node 由脚本自解析)
 
 ---
 
 ## 环境变量控制
 
 ### `DSH_RT_NO_AUTO_UPDATE`
-禁用所有自动更新功能（后台更新 + 定时更新）：
-```bash
-export DSH_RT_NO_AUTO_UPDATE=1
-bash scripts/install.sh
-```
 
-### `DSH_RT_NO_PREWARM`
-禁用预热功能（也会跳过后台更新触发）：
+该变量的实际作用范围(如实描述,2026-09-11 勘误):
+
+- **安装期(完全生效):** `install.sh` 看到该变量会跳过 updater LaunchAgent 注册,定时更新不装;daemon 侧 `trigger_background_update()` 也用 `getenv` 检查它。
+  ```bash
+  export DSH_RT_NO_AUTO_UPDATE=1
+  bash scripts/install.sh
+  ```
+- **已装系统的坑:** launchd 拉起的 daemon 只继承 plist 的 `EnvironmentVariables`(见 `launchd/com.dshpwa.daemon.plist`,当前不含该变量),用户 shell 里的 `export` 传不进去——`export DSH_RT_NO_AUTO_UPDATE=1` 后 curl 触发激活并不会禁用后台更新。对已装系统要禁用后台更新,需任选其一:
+  ```bash
+  # 方法 A:编辑已安装的 plist 注入变量后重载(永久生效)
+  #   ~/Library/LaunchAgents/com.dshpwa.daemon.plist 的 EnvironmentVariables 字典里加:
+  #   <key>DSH_RT_NO_AUTO_UPDATE</key><string>1</string>
+  launchctl bootout "gui/$(id -u)/com.dshpwa.daemon"
+  launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.dshpwa.daemon.plist
+
+  # 方法 B:卸载 updater LaunchAgent(禁用定时更新;后台更新仍会在守护激活时按 12h 节流触发)
+  launchctl bootout "gui/$(id -u)/com.dshpwa.updater"
+  rm -f ~/Library/LaunchAgents/com.dshpwa.updater.plist
+  ```
+  手动前台运行 daemon(冒烟测试/dev)时 shell 环境直接继承,`export` 即生效。
+
+### `DSH_RT_PREWARM` / `DSH_RT_NO_PREWARM`
+预热已默认改为懒启动:登录只驻留 ~1MB 守护,首次点 PWA 图标才拉起 dsh。`DSH_RT_PREWARM=1` 显式开启登录预热;旧变量 `DSH_RT_NO_PREWARM=1` 继续有效(显式关闭预热)。**两者均不影响后台更新**——后台更新与预热已解耦,守护每次启动都评估(12h 节流):
 ```bash
-export DSH_RT_NO_PREWARM=1
-curl -fsS http://127.0.0.1:3080/health   # 触发 socket activation 激活 daemon
+curl -fsS http://127.0.0.1:3080/health   # 触发 socket activation 激活 daemon(独立评估后台更新)
 ```
 
 ---
@@ -85,6 +106,7 @@ curl -fsS http://127.0.0.1:3080/health   # 触发 socket activation 激活 daemo
 
 - **后台更新日志:** `~/.local/state/dsh-runtime/logs/update.log`
 - **定时更新日志:** `~/.local/state/dsh-runtime/logs/updater.log`
+- **日志轮转:** `update.log` 超 2MB 自动滚动为 `update.log.1`(仅保留最近一份)
 
 示例日志内容：
 ```
@@ -167,10 +189,7 @@ ps aux | grep update-dsh.sh
 如果自动更新导致问题：
 
 ### 方法 1：临时禁用
-```bash
-export DSH_RT_NO_AUTO_UPDATE=1
-curl -fsS http://127.0.0.1:3080/health   # 触发 socket activation 激活 daemon
-```
+安装期未设过该变量时,后台更新只受 plist 环境变量控制(见「环境变量控制」一节的说明)——对已装系统,改 plist 注入 `DSH_RT_NO_AUTO_UPDATE=1` 后重载,或直接用方法 2 卸载 updater;手动前台运行 daemon 时 `export DSH_RT_NO_AUTO_UPDATE=1` 即生效。
 
 ### 方法 2：卸载 updater
 ```bash
@@ -245,7 +264,7 @@ export DSH_RT_NO_AUTO_UPDATE=1
 ### 长期（生产级）
 1. 增加版本校验（SHA-256）
 2. 增加灰度策略（10% 用户先更新）
-3. 增加回滚机制（保留上一版本）
+3. ~~增加回滚机制（保留上一版本）~~ 已部分实现:更新彻底失败自动回滚更新前依赖树;保留历史版本供主动降级仍未做
 4. 增加更新遥测（上报版本分布）
 
 ---

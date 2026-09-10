@@ -60,6 +60,9 @@ rm -f ~/Library/LaunchAgents/com.dshpwa.daemon.plist
 rm -f ~/Library/LaunchAgents/com.dshpwa.updater.plist
 rm -rf ~/.local/share/dsh-runtime ~/.local/state/dsh-runtime
 
+# 可选: 清理 dsh 用户数据(会话历史等,删除前请确认无需保留)
+rm -rf ~/.dsh
+
 # 可选: 清理 pnpm store(释放磁盘空间,累积历史版本可能占数GB)
 pnpm store prune
 ```
@@ -77,16 +80,32 @@ pnpm store prune
 
 - **后台异步更新:** daemon 激活时触发后台版本检查(12h 节流,不阻塞启动)
 - **定时自动更新:** LaunchAgent 每天凌晨 2:30 自动检查并更新到 `@deepseek-ai/dsh@latest`
+- **活跃会话保护:** dsh 正在运行(用户可能在使用)时跳过本轮更新,等下一轮用户不在场时再做
 - **增量更新优化:** 仅下载变化的包，节省 70-85% 流量和时间
-- **故障降级:** 网络失败或更新失败时静默跳过，使用现有版本
-- **禁用开关:** 设置 `DSH_RT_NO_AUTO_UPDATE=1` 可完全禁用自动更新
+- **失败回滚:** 网络失败时静默跳过、使用现有版本;更新失败时自动回滚到更新前的依赖树,保持当前版本可用
+- **禁用开关:** 安装时设 `DSH_RT_NO_AUTO_UPDATE=1` 跳过 updater 注册;已装系统需向 daemon plist 注入该环境变量或卸载 updater(详见 [docs/AUTO_UPDATE_IMPLEMENTATION.md](docs/AUTO_UPDATE_IMPLEMENTATION.md)「环境变量控制」)
+
+## 故障排查
+
+日志统一在 `~/.local/state/dsh-runtime/logs/`:
+
+- `daemon.log` — 守护进程日志(launchd 重定向,含 dsh 启动输出与 token)
+- `update.log` — 自动更新脚本日志(超 2MB 自动轮转为 `update.log.1`)
+- `updater.log` — updater LaunchAgent 的 stdout/stderr
+
+常见排查:
+```bash
+tail -50 ~/.local/state/dsh-runtime/logs/daemon.log    # 守护是否正常拉起/停止 dsh
+tail -50 ~/.local/state/dsh-runtime/logs/update.log   # 自动更新是否成功/失败/回滚
+launchctl print "gui/$(id -u)/com.dshpwa.daemon"      # launchd 注册状态
+```
 
 ## 开发
 
 ```bash
 bash scripts/smoke-test.sh              # 隔离目录真实安装 → 幂等重跑 → 端口占用检测 → 守护(引导页/自动唤醒/就绪门控/token 握手/透传) → 并发双唤醒幂等 → 空闲自停 → socket activation 端到端(激活→自退→再激活)
 bash tests/security-verification.sh     # 验证所有安全控制是否按预期工作(33 项断言)
-bats tests/unit/                        # 单元测试:安装校验 + 守护黑盒用例(18 项,不依赖真实 dsh)
+bats tests/unit/                        # 单元测试:安装校验 + 守护黑盒用例(24 项,不依赖真实 dsh)
 ```
 
 ## 参考文档

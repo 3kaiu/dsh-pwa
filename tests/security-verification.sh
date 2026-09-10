@@ -150,7 +150,7 @@ fi
 
 # 2.4 代码静态检查
 info "检查 daemon.c CSRF 防护代码..."
-if grep -q "CSRF 防护" src/daemon.c && grep -q "Origin:" src/daemon.c; then
+if grep -q "CSRF 防护" src/daemon.c && grep -q 'find_header(buf, "Origin")' src/daemon.c; then
   ok "daemon.c 包含 CSRF 防护逻辑"
 else
   fail "daemon.c 缺少 CSRF 防护"
@@ -188,7 +188,7 @@ else
 fi
 
 # 3.3 检查状态文件权限
-if grep -q "open(DSH_JSON.*0600" src/daemon.c && grep -q "open(PID_FILE.*0600" src/daemon.c; then
+if grep -q 'write_file_atomic(DSH_JSON' src/daemon.c && grep -q 'write_file_atomic(PID_FILE' src/daemon.c && grep -q "open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600)" src/daemon.c; then
   ok "状态文件(dsh.json, dsh.pid)使用 0600 权限"
 else
   fail "状态文件未使用安全权限"

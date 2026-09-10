@@ -1,6 +1,11 @@
 # P0-P3 修复实施报告
 
-> ⚠️ **更新说明:** 本文 P0-1 描述的 dsh 版本固定(固定到 `0.1.1-rc.2`)已由 commit `47f9ae3` 回退,当前版本策略为跟随 `@deepseek-ai/dsh@latest`(install.sh 与 update-dsh.sh 默认 latest,`DSH_VERSION` 仍可覆盖为指定版本)。其余 P1-P3 修复不受影响。
+> ⚠️ **更新说明(2026-09-11):** 本文为当时快照,以下各项情况已演进:
+> - **P0-1** 描述的 dsh 版本固定(固定到 `0.1.1-rc.2`)已由 commit `47f9ae3` 回退,当前版本策略为跟随 `@deepseek-ai/dsh@latest`(install.sh 与 update-dsh.sh 默认 latest,`DSH_VERSION` 仍可覆盖为指定版本)。其余 P1-P3 修复不受影响。
+> - **P0-2** 的情况已根本变化:dsh 0.1.5+ 引入 token 鉴权后,daemon 已**实际实现** token 解析(见 `src/daemon.c` 的 `scan_token()`:主进程增量扫描 dsh 日志捕获 launch token,经 `/health` 交给引导页完成 `/?token=` 握手;守护重启 adopt 运行中 dsh 时也会补扫)。本文"未实际添加 token 解析代码"的表述已过时。
+> - **P1-5** 的 `sleep(60)` 阻塞冷却已演进为非阻塞 `cooldown_until` 时间戳:冷却期内 `spawn_dsh()` 直接拒绝拉起并立即返回,主循环照常服务引导页,不再卡住全部请求 60s。
+> - **P1-4** 的梯度探测逻辑已从 smoke-test.sh 抽出,落在 `tests/lib/daemon-helpers.sh` 的 `daemon_wait_health()`(梯度:前 10 次 0.5s → 50 次 1s → 其余 2s),单测与冒烟共用。
+> - **P2-6** 的 pnpm store prune 提示已不在 update-dsh.sh 中(更新脚本不再打印该提示);README 卸载节仍保留可选的 `pnpm store prune` 清理步骤。
 
 ## 修复概览
 

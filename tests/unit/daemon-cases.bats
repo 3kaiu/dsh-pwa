@@ -29,7 +29,8 @@ start_daemon_env() {
   mkdir -p "$TMP_ENV/rt" "$TMP_ENV/state"
   export DSH_RT_HOME="$TMP_ENV/rt" DSH_RT_STATE="$TMP_ENV/state" DSH_HOME="$TMP_ENV/home"
   export DSH_RT_IDLE_STOP_SECS=2   # 兜底:即使忘杀,daemon 也会快速自停
-  PORT=$(( (RANDOM % 20000) + 20000 ))
+  export DSH_RT_NO_AUTO_UPDATE=1   # 测试环境绝不触发后台更新子进程
+  PORT="$(pick_free_port)"
   export DSH_RT_PORT="$PORT"
   [ -z "$runjson" ] || printf '%s\n' "$runjson" > "$TMP_ENV/rt/run.json"
   if ! daemon_compile "$TMP_ENV/daemon"; then
@@ -61,6 +62,10 @@ stop_daemon_env() {
 }
 
 teardown() {
+  if [ -n "${STOP_CURL_PID:-}" ]; then
+    kill "$STOP_CURL_PID" 2>/dev/null || true
+    STOP_CURL_PID=""
+  fi
   if [ -n "${LOCK_PID:-}" ]; then
     kill "$LOCK_PID" 2>/dev/null || true
     LOCK_PID=""
@@ -336,7 +341,8 @@ PY
   mkdir -p "$TMP_ENV/rt" "$TMP_ENV/state/logs"
   export DSH_RT_HOME="$TMP_ENV/rt" DSH_RT_STATE="$TMP_ENV/state" DSH_HOME="$TMP_ENV/home"
   export DSH_RT_IDLE_STOP_SECS=60  # 收养场景验证期不空闲停机
-  PORT=$(( (RANDOM % 20000) + 20000 ))
+  export DSH_RT_NO_AUTO_UPDATE=1
+  PORT="$(pick_free_port)"
   export DSH_RT_PORT="$PORT"
   FAKE_DSH_PID=""
   "$PY" "$BATS_TEST_TMPDIR/fake-dsh-adopt.py" >"$DSH_RT_STATE/logs/dsh.log" 2>&1 &
@@ -437,4 +443,473 @@ PY
   done
   [ "$ok" = "1" ] || { echo "  锁清除后 8s 内 dsh 未被拉起(日志见 $TMP_ENV/daemon.log)" >&2; return 1; }
   [ -f "$FAKE_DSH_MARKER" ] || { echo "  dsh 就绪但 marker 未出现(伪 dsh 未真正执行?)" >&2; return 1; }
+}
+
+@test "lowercase origin header with correct value is accepted" {
+  # 头字段名应大小写不敏感(RFC 7230):小写 origin: + 正确值不得被误拒为 CSRF(应 200 而非 403)
+  start_daemon_env '{"node":"/nonexistent/dsh-unit-node","dsh":"/nonexistent/dsh-unit-dsh"}'
+  run curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "origin: http://127.0.0.1:$PORT" \
+    "http://127.0.0.1:$PORT/wake"
+  assert_status "200"
+}
+
+@test "lowercase host header with valid value returns 200 on health" {
+  # curl -H 'host:' 会被规范化回 Host:,用原始 socket 发真正的小写 host: 头
+  start_daemon_env '{"node":"/nonexistent/dsh-unit-node","dsh":"/nonexistent/dsh-unit-dsh"}'
+  PY="$(command -v python3 || true)"
+  [ -n "$PY" ] || { echo "  python3 不可用" >&2; return 1; }
+  code="$("$PY" - "$PORT" <<'PY'
+import socket, sys
+port = int(sys.argv[1])
+s = socket.create_connection(("127.0.0.1", port), timeout=3)
+s.sendall(("GET /health HTTP/1.1\r\nhost: 127.0.0.1:%d\r\nConnection: close\r\n\r\n" % port).encode())
+data = b""
+while True:
+    try:
+        chunk = s.recv(4096)
+    except OSError:
+        break
+    if not chunk:
+        break
+    data += chunk
+s.close()
+print(data.split(b" ", 2)[1].decode() if b" " in data else "000")
+PY
+)"
+  [ "$code" = "200" ] || { echo "  小写 host: 头 /health 应 200,得到 [$code]" >&2; return 1; }
+}
+
+@test "stop then immediate wake keeps new dsh state files" {
+  # P2 竞态回归:伪 dsh 收 SIGTERM 后优雅退出耗时 1s(拉宽 stop 等待窗口)。
+  # 旧实现:/stop 在连接子进程直连执行,等待期间主进程因 /wake spawn 新 dsh 并写新
+  # dsh.json/dsh.pid;旧 stop 结束时无条件 unlink 两个文件,误删新实例状态。
+  # 新实现:/stop 只投递命令字节,主进程串行结算 stop→wake,新实例状态不被误删。
+  PY="$(command -v python3 || true)"
+  [ -n "$PY" ] || { echo "  python3 不可用" >&2; return 1; }
+  cat > "$BATS_TEST_TMPDIR/fake-dsh-slowstop.py" <<'PY'
+#!/usr/bin/env python3
+import os, signal, socket, sys, time
+args = sys.argv
+port = 0
+for i in range(len(args) - 1):
+    if args[i] == "--port":
+        port = int(args[i + 1])
+sys.stdout.write("dsh web: http://127.0.0.1:%d/?token=stopRaceTok\n" % port)
+sys.stdout.flush()
+ppid = os.getppid()
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port))
+s.listen(16)
+s.settimeout(1.0)
+def onterm(sig, frm):
+    # 立刻关监听 socket:dsh_up() 探测即刻变 false(新实例可被 /wake 拉起),
+    # 但进程本身再存活 1s——stop_dsh 的等待循环必须真等一轮,竞态窗口拉满全程
+    try:
+        s.close()
+    except OSError:
+        pass
+    time.sleep(1.0)
+    os._exit(0)
+signal.signal(signal.SIGTERM, onterm)
+while True:
+    if os.getppid() != ppid:
+        break
+    try:
+        c, _ = s.accept()
+    except socket.timeout:
+        continue
+    except OSError:
+        break
+    try:
+        c.recv(1024)
+        c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+    except OSError:
+        pass
+    c.close()
+PY
+  start_daemon_env "{\"node\":\"$PY\",\"dsh\":\"$BATS_TEST_TMPDIR/fake-dsh-slowstop.py\"}"
+  # 实例 1:拉起并等就绪
+  run curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "Origin: http://127.0.0.1:$PORT" \
+    "http://127.0.0.1:$PORT/wake"
+  assert_status "200"
+  daemon_wait_health "$PORT" true 5 || { echo "  实例 1 未就绪(日志见 $TMP_ENV/daemon.log)" >&2; return 1; }
+  old_pid="$(cat "$DSH_RT_STATE/dsh.pid" 2>/dev/null || true)"
+  # /stop 后台发出(旧实现会在连接子进程里同步阻塞最长 6s),同时立即反复 /wake
+  # 覆盖 stop 等待窗口,直到拉起新实例(started 响应)
+  curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "Origin: http://127.0.0.1:$PORT" \
+    "http://127.0.0.1:$PORT/stop" > "$BATS_TEST_TMPDIR/stop.code" &
+  STOP_CURL_PID=$!
+  started=""
+  for _ in $(seq 1 60); do
+    r="$(curl -s --max-time 2 -X POST -H "Origin: http://127.0.0.1:$PORT" \
+      "http://127.0.0.1:$PORT/wake" 2>/dev/null || true)"
+    if printf '%s' "$r" | grep -q 'started'; then started=1; break; fi
+    sleep 0.1
+  done
+  wait "$STOP_CURL_PID" 2>/dev/null || true
+  [ "$(cat "$BATS_TEST_TMPDIR/stop.code")" = "200" ] \
+    || { echo "  /stop 响应非 200: $(cat "$BATS_TEST_TMPDIR/stop.code")" >&2; return 1; }
+  [ "$started" = "1" ] || { echo "  6s 内 /wake 未拉起新实例(日志见 $TMP_ENV/daemon.log)" >&2; return 1; }
+  # 等新实例就绪:pid 必须与实例 1 不同(确认是重启而非旧实例存活)
+  new_ok=""
+  for _ in $(seq 1 60); do
+    h="$(curl -s --max-time 2 "http://127.0.0.1:$PORT/health" 2>/dev/null || true)"
+    if printf '%s' "$h" | grep -q '"dsh":true'; then
+      p="$(printf '%s' "$h" | sed -n 's/.*"pid":\([0-9]*\).*/\1/p')"
+      if [ -n "$p" ] && [ "$p" != "0" ] && [ "$p" != "$old_pid" ]; then new_ok=1; break; fi
+    fi
+    sleep 0.2
+  done
+  [ "$new_ok" = "1" ] || { echo "  12s 内新实例未就绪(日志见 $TMP_ENV/daemon.log)" >&2; return 1; }
+  # 核心断言:连续 ~5s(跨过旧实现 stop 子进程的误删时刻)新实例状态文件健在且一致。
+  # 轮询本身也是在场证据,避免 IDLE_STOP 误停。
+  for _ in $(seq 1 10); do
+    h="$(curl -s --max-time 2 "http://127.0.0.1:$PORT/health" 2>/dev/null || true)"
+    printf '%s' "$h" | grep -q '"dsh":true' || { echo "  新实例未持续就绪: $h" >&2; return 1; }
+    port="$(printf '%s' "$h" | sed -n 's/.*"port":\([0-9]*\).*/\1/p')"
+    [ -f "$DSH_RT_STATE/dsh.json" ] || { echo "  dsh.json 被误删(stop/wake 竞态)" >&2; return 1; }
+    grep -q "\"port\":$port" "$DSH_RT_STATE/dsh.json" \
+      || { echo "  dsh.json 端口与新实例不一致: $(cat "$DSH_RT_STATE/dsh.json")" >&2; return 1; }
+    [ -f "$DSH_RT_STATE/dsh.pid" ] || { echo "  dsh.pid 被误删(stop/wake 竞态)" >&2; return 1; }
+    fpid="$(cat "$DSH_RT_STATE/dsh.pid")"
+    kill -0 "$fpid" 2>/dev/null \
+      || { echo "  dsh.pid 指向已死进程($fpid)" >&2; return 1; }
+    sleep 0.5
+  done
+}
+
+# ---- CSRF 矩阵(origin_ok):四个状态变更端点全覆盖 + localhost 分支 + 前缀绕过 + 透传路径 ----
+
+@test "POST /stop without Origin returns 403" {
+  start_daemon_env '{"node":"/nonexistent/dsh-unit-node","dsh":"/nonexistent/dsh-unit-dsh"}'
+  run curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/stop"
+  assert_status "403"
+}
+
+@test "POST /ping without Origin returns 403" {
+  start_daemon_env '{"node":"/nonexistent/dsh-unit-node","dsh":"/nonexistent/dsh-unit-dsh"}'
+  run curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/ping"
+  assert_status "403"
+}
+
+@test "POST /goodbye without Origin returns 403" {
+  start_daemon_env '{"node":"/nonexistent/dsh-unit-node","dsh":"/nonexistent/dsh-unit-dsh"}'
+  run curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/goodbye"
+  assert_status "403"
+}
+
+@test "POST /stop with matching Origin returns 200 async" {
+  # /stop 语义是异步投递命令字节即回 200(不阻塞等待 dsh 死透),无 dsh 时同样 200
+  start_daemon_env '{"node":"/nonexistent/dsh-unit-node","dsh":"/nonexistent/dsh-unit-dsh"}'
+  run curl -s -w '\n%{http_code}' -X POST \
+    -H "Origin: http://127.0.0.1:$PORT" \
+    "http://127.0.0.1:$PORT/stop"
+  [ "${lines[1]}" = "200" ] || { echo "  expected 200, got ${lines[1]}" >&2; return 1; }
+  assert_body_match '"stopped":true'
+}
+
+@test "POST /stop with prefix-bypass Origin suffix returns 403" {
+  # http://127.0.0.1:PORT.evil.com 以期望值开头但整体是 evil 域名,必须 403
+  start_daemon_env '{"node":"/nonexistent/dsh-unit-node","dsh":"/nonexistent/dsh-unit-dsh"}'
+  run curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "Origin: http://127.0.0.1:$PORT.evil.com" \
+    "http://127.0.0.1:$PORT/stop"
+  assert_status "403"
+}
+
+@test "POST /wake with localhost Origin returns 200" {
+  # origin_ok 的 localhost 分支:http://localhost:PORT 同样放行
+  start_daemon_env '{"node":"/nonexistent/dsh-unit-node","dsh":"/nonexistent/dsh-unit-dsh"}'
+  run curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "Origin: http://localhost:$PORT" \
+    "http://127.0.0.1:$PORT/wake"
+  assert_status "200"
+}
+
+@test "relay POST /api/x without Origin returns 403, with Origin passes through" {
+  # 透传路径同样有 CSRF 防护:dsh 就绪后,POST 无 Origin → 403;正确 Origin → 透传拿到上游应答
+  PY="$(command -v python3 || true)"
+  [ -n "$PY" ] || { echo "  python3 不可用" >&2; return 1; }
+  cat > "$BATS_TEST_TMPDIR/fake-dsh-api.py" <<'PY'
+#!/usr/bin/env python3
+import os, socket, sys
+args = sys.argv
+port = 0
+for i in range(len(args) - 1):
+    if args[i] == "--port":
+        port = int(args[i + 1])
+sys.stdout.write("dsh web: http://127.0.0.1:%d/?token=apiT0ken\n" % port)
+sys.stdout.flush()
+ppid = os.getppid()
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port))
+s.listen(16)
+s.settimeout(1.0)
+while True:
+    if os.getppid() != ppid:
+        break
+    try:
+        c, _ = s.accept()
+    except socket.timeout:
+        continue
+    except OSError:
+        break
+    try:
+        c.recv(1024)
+        c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\napibod")
+    except OSError:
+        pass
+    c.close()
+PY
+  start_daemon_env "{\"node\":\"$PY\",\"dsh\":\"$BATS_TEST_TMPDIR/fake-dsh-api.py\"}"
+  run curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "Origin: http://127.0.0.1:$PORT" \
+    "http://127.0.0.1:$PORT/wake"
+  assert_status "200"
+  daemon_wait_health "$PORT" true 5 || { echo "  伪 dsh 未就绪(日志见 $TMP_ENV/daemon.log)" >&2; return 1; }
+  run curl -s -o /dev/null -w '%{http_code}' --max-time 3 -X POST \
+    "http://127.0.0.1:$PORT/api/x"
+  assert_status "403"
+  run curl -s -o /dev/null -w '%{http_code}' --max-time 3 -X POST \
+    -H "Origin: http://127.0.0.1:$PORT.evil.com" \
+    "http://127.0.0.1:$PORT/api/x"
+  assert_status "403"
+  run curl -s -w '\n%{http_code}' --max-time 3 -X POST \
+    -H "Origin: http://127.0.0.1:$PORT" \
+    "http://127.0.0.1:$PORT/api/x"
+  [ "${lines[1]}" = "200" ] || { echo "  正确 Origin 的透传应 200,得到 ${lines[1]}" >&2; return 1; }
+  assert_body_match '^apibod'
+}
+
+# ---- Host 矩阵(host_ok):localhost 放行 / 无 Host 拒绝 / 前缀绕过拒绝 ----
+
+@test "GET /health with Host localhost:PORT returns 200" {
+  # curl 默认发 Host: 127.0.0.1:PORT,显式 -H 覆盖为 localhost:PORT 应同样放行
+  start_daemon_env '{"node":"/nonexistent/dsh-unit-node","dsh":"/nonexistent/dsh-unit-dsh"}'
+  run curl -s -o /dev/null -w '%{http_code}' -H "Host: localhost:$PORT" \
+    "http://127.0.0.1:$PORT/health"
+  assert_status "200"
+}
+
+@test "GET /health without Host header (raw HTTP/1.0) returns 403" {
+  # HTTP/1.0 原始请求无 Host 头(host_ok 找不到 Host 即拒绝),防非浏览器客户端绕过
+  start_daemon_env '{"node":"/nonexistent/dsh-unit-node","dsh":"/nonexistent/dsh-unit-dsh"}'
+  PY="$(command -v python3 || true)"
+  [ -n "$PY" ] || { echo "  python3 不可用" >&2; return 1; }
+  code="$("$PY" - "$PORT" <<'PY'
+import socket, sys
+port = int(sys.argv[1])
+s = socket.create_connection(("127.0.0.1", port), timeout=3)
+s.sendall(b"GET /health HTTP/1.0\r\n\r\n")
+data = b""
+while True:
+    try:
+        chunk = s.recv(4096)
+    except OSError:
+        break
+    if not chunk:
+        break
+    data += chunk
+s.close()
+print(data.split(b" ", 2)[1].decode() if b" " in data else "000")
+PY
+)"
+  [ "$code" = "403" ] || { echo "  无 Host 头应 403,得到 [$code]" >&2; return 1; }
+}
+
+@test "GET /health with Host 127.0.0.1:PORT.evil.com returns 403" {
+  # Host 值以期望值开头但整体是 evil 域名,必须 403(前缀绕过变体)
+  start_daemon_env '{"node":"/nonexistent/dsh-unit-node","dsh":"/nonexistent/dsh-unit-dsh"}'
+  run curl -s -o /dev/null -w '%{http_code}' -H "Host: 127.0.0.1:$PORT.evil.com" \
+    "http://127.0.0.1:$PORT/health"
+  assert_status "403"
+}
+
+# ---- 故障注入组:崩溃风暴冷却 / SIGTERM 拒死走 SIGKILL 兜底 / 崩溃自愈 ----
+
+@test "crash storm enters cooldown and boot page stays responsive" {
+  # run.json 指向立即退出(exit 0)的假 dsh:连发 3 次 /wake 都被拉起;
+  # 第 4 次 /wake 触发 60s 冷却不再拉起;冷却期间 GET / 秒回引导页(非阻塞)。
+  PY="$(command -v python3 || true)"
+  [ -n "$PY" ] || { echo "  python3 不可用" >&2; return 1; }
+  export FAKE_DSH_CRASH_LOG="$BATS_TEST_TMPDIR/crash-spawns.log"
+  cat > "$BATS_TEST_TMPDIR/fake-dsh-crash.py" <<'PY'
+#!/usr/bin/env python3
+import os, sys
+log = os.environ.get("FAKE_DSH_CRASH_LOG", "")
+if log:
+    with open(log, "a") as f:
+        f.write("%d\n" % os.getpid())
+sys.exit(0)
+PY
+  start_daemon_env "{\"node\":\"$PY\",\"dsh\":\"$BATS_TEST_TMPDIR/fake-dsh-crash.py\"}"
+  nspawn() { [ -f "$FAKE_DSH_CRASH_LOG" ] && wc -l < "$FAKE_DSH_CRASH_LOG" | tr -d ' ' || echo 0; }
+  for i in 1 2 3; do
+    run curl -s -o /dev/null -w '%{http_code}' -X POST \
+      -H "Origin: http://127.0.0.1:$PORT" \
+      "http://127.0.0.1:$PORT/wake"
+    assert_status "200"
+    ok=""
+    for _ in $(seq 1 30); do
+      [ "$(nspawn)" -ge "$i" ] && { ok=1; break; }
+      sleep 0.1
+    done
+    [ "$ok" = "1" ] || { echo "  第 $i 次 /wake 后假 dsh 未被拉起(日志见 $TMP_ENV/daemon.log)" >&2; return 1; }
+  done
+  # 第 4 次 /wake:进入冷却,不再拉起(等待一个足够窗口确认无第 4 个 spawn)
+  run curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "Origin: http://127.0.0.1:$PORT" \
+    "http://127.0.0.1:$PORT/wake"
+  assert_status "200"
+  sleep 1
+  [ "$(nspawn)" = "3" ] \
+    || { echo "  第 4 次 /wake 后仍拉起了 dsh(冷却未生效,spawn 数 $(nspawn))" >&2; return 1; }
+  # 冷却期间主循环不被阻塞:GET / 秒回引导页
+  t0=$(python3 -c 'import time; print(time.time())')
+  run curl -s -w '\n%{http_code}' --max-time 2 "http://127.0.0.1:$PORT/"
+  t1=$(python3 -c 'import time; print(time.time())')
+  [ "${lines[1]}" = "200" ] || { echo "  冷却期间 GET / 应 200,得到 ${lines[1]}" >&2; return 1; }
+  assert_body_match "DeepSeek Harness"
+  el="$(python3 -c "print(round($t1 - $t0, 1))")"
+  [ "$(python3 -c "print(1 if $el < 2.0 else 0)")" = "1" ] \
+    || { echo "  冷却期间 GET / 耗时 ${el}s(疑似阻塞主循环)" >&2; return 1; }
+}
+
+@test "stop escalates to SIGKILL when dsh ignores SIGTERM" {
+  # 伪 dsh trap SIGTERM 后拒死:POST /stop(异步 200)后,SIGTERM 宽限(~6s)耗尽
+  # 必须升级 SIGKILL 把进程组打死的兜底路径。
+  PY="$(command -v python3 || true)"
+  [ -n "$PY" ] || { echo "  python3 不可用" >&2; return 1; }
+  cat > "$BATS_TEST_TMPDIR/fake-dsh-stubborn.py" <<'PY'
+#!/usr/bin/env python3
+import os, signal, socket, sys
+args = sys.argv
+port = 0
+for i in range(len(args) - 1):
+    if args[i] == "--port":
+        port = int(args[i + 1])
+sys.stdout.write("dsh web: http://127.0.0.1:%d/?token=stubbornTok\n" % port)
+sys.stdout.flush()
+signal.signal(signal.SIGTERM, signal.SIG_IGN)  # 拒绝优雅退出,逼出 SIGKILL 兜底
+ppid = os.getppid()
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port))
+s.listen(16)
+s.settimeout(1.0)
+while True:
+    if os.getppid() != ppid:
+        break
+    try:
+        c, _ = s.accept()
+    except socket.timeout:
+        continue
+    except OSError:
+        break
+    try:
+        c.recv(1024)
+        c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+    except OSError:
+        pass
+    c.close()
+PY
+  start_daemon_env "{\"node\":\"$PY\",\"dsh\":\"$BATS_TEST_TMPDIR/fake-dsh-stubborn.py\"}"
+  run curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "Origin: http://127.0.0.1:$PORT" \
+    "http://127.0.0.1:$PORT/wake"
+  assert_status "200"
+  daemon_wait_health "$PORT" true 5 || { echo "  伪 dsh 未就绪(日志见 $TMP_ENV/daemon.log)" >&2; return 1; }
+  dsh_pid="$(cat "$DSH_RT_STATE/dsh.pid" 2>/dev/null || true)"
+  [ -n "$dsh_pid" ] || { echo "  dsh.pid 缺失" >&2; return 1; }
+  kill -0 "$dsh_pid" 2>/dev/null || { echo "  伪 dsh 未存活" >&2; return 1; }
+  run curl -s -o /dev/null -w '%{http_code}' --max-time 3 -X POST \
+    -H "Origin: http://127.0.0.1:$PORT" \
+    "http://127.0.0.1:$PORT/stop"
+  assert_status "200"  # 异步语义:立即 200,不等待 dsh 死透
+  dead=""
+  for _ in $(seq 1 90); do
+    kill -0 "$dsh_pid" 2>/dev/null || { dead=1; break; }
+    sleep 0.1
+  done
+  [ "$dead" = "1" ] \
+    || { kill -9 "$dsh_pid" 2>/dev/null || true; echo "  /stop 后 9s 内拒死 dsh 未被 SIGKILL(日志见 $TMP_ENV/daemon.log)" >&2; return 1; }
+}
+
+@test "dsh crash self-heals on next wake" {
+  # 伪 dsh 就绪后收到 GET /die 自杀(SIGKILL self):主循环 waitpid 收割(spawn_pid 清零
+  # → 状态清理 → /health 翻 dsh:false),随后 /wake 必须能重新拉起新实例。
+  PY="$(command -v python3 || true)"
+  [ -n "$PY" ] || { echo "  python3 不可用" >&2; return 1; }
+  cat > "$BATS_TEST_TMPDIR/fake-dsh-suicidal.py" <<'PY'
+#!/usr/bin/env python3
+import os, signal, socket, sys
+args = sys.argv
+port = 0
+for i in range(len(args) - 1):
+    if args[i] == "--port":
+        port = int(args[i + 1])
+sys.stdout.write("dsh web: http://127.0.0.1:%d/?token=suicideTok\n" % port)
+sys.stdout.flush()
+ppid = os.getppid()
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port))
+s.listen(16)
+s.settimeout(1.0)
+while True:
+    if os.getppid() != ppid:
+        break
+    try:
+        c, _ = s.accept()
+    except socket.timeout:
+        continue
+    except OSError:
+        break
+    try:
+        req = c.recv(1024).decode("latin-1")
+        if req.startswith("GET /die"):
+            c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndied")
+            c.close()
+            os.kill(os.getpid(), signal.SIGKILL)  # 模拟 dsh 崩溃
+        c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+    except OSError:
+        pass
+    c.close()
+PY
+  start_daemon_env "{\"node\":\"$PY\",\"dsh\":\"$BATS_TEST_TMPDIR/fake-dsh-suicidal.py\"}"
+  run curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "Origin: http://127.0.0.1:$PORT" \
+    "http://127.0.0.1:$PORT/wake"
+  assert_status "200"
+  daemon_wait_health "$PORT" true 5 || { echo "  伪 dsh 未就绪(日志见 $TMP_ENV/daemon.log)" >&2; return 1; }
+  old_pid="$(cat "$DSH_RT_STATE/dsh.pid" 2>/dev/null || true)"
+  # 触发自杀(curl 可能收到连接重置,忽略)
+  curl -s --max-time 3 "http://127.0.0.1:$PORT/die" >/dev/null 2>&1 || true
+  fell=""
+  for _ in $(seq 1 30); do
+    h="$(curl -s --max-time 2 "http://127.0.0.1:$PORT/health" 2>/dev/null || true)"
+    printf '%s' "$h" | grep -q '"dsh":false' && { fell=1; break; }
+    sleep 0.2
+  done
+  [ "$fell" = "1" ] || { echo "  dsh 自杀后 6s 内 /health 未翻 dsh:false(日志见 $TMP_ENV/daemon.log)" >&2; return 1; }
+  # 再 /wake:必须能重新拉起(waitpid 清理链完整),且是新 pid
+  run curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "Origin: http://127.0.0.1:$PORT" \
+    "http://127.0.0.1:$PORT/wake"
+  assert_status "200"
+  revived=""
+  for _ in $(seq 1 40); do
+    h="$(curl -s --max-time 2 "http://127.0.0.1:$PORT/health" 2>/dev/null || true)"
+    if printf '%s' "$h" | grep -q '"dsh":true'; then
+      p="$(printf '%s' "$h" | sed -n 's/.*"pid":\([0-9]*\).*/\1/p')"
+      if [ -n "$p" ] && [ "$p" != "0" ] && [ "$p" != "$old_pid" ]; then revived=1; break; fi
+    fi
+    sleep 0.2
+  done
+  [ "$revived" = "1" ] || { echo "  /wake 未重新拉起 dsh(或 pid 未变化)(日志见 $TMP_ENV/daemon.log)" >&2; return 1; }
 }

@@ -1,7 +1,7 @@
 // daemon.c —— DeepSeek Harness 守护(macOS 专用,~1.3MB RSS)
 // 最简设计:单一端口(DSH_RT_PORT,默认 3080,全链路自动匹配,无硬编码双端口)。
 //   dsh 未运行 → 伺服引导页(任意路径);PWA 打开引导页 → 自动 /wake → dsh 在内部端口启动。
-//   dsh 运行中 → 双向透传;PWA 关闭 → 连接归零 N 秒(DSH_RT_IDLE_STOP_SECS,默认 60)→ 自动停止 dsh。
+//   dsh 运行中 → 双向透传;PWA 关闭 → 连接归零 N 秒(DSH_RT_IDLE_STOP_SECS,默认 30)→ 自动停止 dsh。
 //   dsh 内部端口:启动时自动挑选空闲端口,写入 RT_STATE/dsh.json。
 //   dsh 位置:install.sh 装好运行时后写 RT_HOME/run.json({"node":...,"dsh":...}),守护直接 exec。
 // 端点(守护自身处理,不透传):
@@ -37,6 +37,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -179,7 +180,7 @@ static int pick_port_fd(int *out_port) {
   a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   if (bind(s, (struct sockaddr *)&a, sizeof a) < 0) { close(s); return -1; }
   socklen_t al = sizeof a;
-  getsockname(s, (struct sockaddr *)&a, &al);
+  if (getsockname(s, (struct sockaddr *)&a, &al) < 0) { close(s); return -1; }
   *out_port = ntohs(a.sin_port);
   return s; // 返回 socket,调用者负责在 dsh 启动后 close
 }
@@ -193,8 +194,14 @@ static int is_spawn(pid_t p) { return p > 0 && p == spawn_pid; }
 // 剔除,否则更新子进程退出会误减 active——WS 长连接独占(active=1)时误归 0 → 30s 内误停
 // dsh 且守护自退,透传子进程被孤儿化。同一时刻至多一个(>12h 节流保证),退出即清零。
 static pid_t update_pid = 0;
-// 唤醒请求管道(连接子进程 → 主进程):dsh 统一由主进程 spawn,天然单飞,
-// 且 dsh 成为主进程的子进程可被 waitpid 收尸(连接子进程直接 spawn 会孤儿化)
+// 控制命令管道(连接子进程 → 主进程):dsh 的启/停统一由主进程单线程串行执行。
+// 唤醒:dsh 只由主进程 spawn,天然单飞,且 dsh 成为主进程的子进程可被 waitpid 收尸
+//   (连接子进程直接 spawn 会孤儿化)。
+// 停止:旧实现 /stop 在连接子进程里直连 stop_dsh,其最长 6s 的等待循环期间主进程可因
+//   另一连接 /wake spawn 新 dsh 并写新 dsh.json/PID_FILE,旧 stop 结束时无条件 unlink
+//   两个文件,把新实例状态误删。改为子进程只投递命令字节,由主进程串行启停,消除竞态。
+#define CMD_WAKE 1
+#define CMD_STOP 2
 static int wake_pipe[2] = { -1, -1 };
 // ---------- 在场租约(presence lease):"用户还在"的证据 ----------
 // tap_use: 父进程每次 accept 即调用——短轮询靠每次连接续租,心跳 /ping 同理。
@@ -239,6 +246,29 @@ static int update_locked(void) {
   return pid > 0 && kill(pid, 0) == 0;
 }
 
+// 原子写小状态文件:同目录临时文件写满后 rename() 替换。
+// O_TRUNC + write 存在半写窗口,读者(read_state_port/read_pid)可能读到截断内容;
+// rename() 在同目录内是原子替换,读者要么看到旧文件要么看到完整新文件。
+static int write_file_atomic(const char *path, const char *data, size_t len) {
+  char tmp[1200];
+  snprintf(tmp, sizeof tmp, "%s.tmp", path);
+  int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0) return -1;
+  size_t off = 0;
+  while (off < len) {
+    ssize_t w = write(fd, data + off, len - off);
+    if (w < 0) {
+      if (errno == EINTR) continue;
+      close(fd);
+      unlink(tmp);
+      return -1;
+    }
+    off += (size_t)w;
+  }
+  if (close(fd) < 0) { unlink(tmp); return -1; }
+  return rename(tmp, path);
+}
+
 static void spawn_dsh(void) {
   // 崩溃自愈:连续快速崩溃则进入 60s 冷却(非阻塞——旧 sleep(60) 会卡住主循环 60s,期间所有请求 hanging)
   time_t now = time(NULL);
@@ -277,11 +307,9 @@ static void spawn_dsh(void) {
     fprintf(stderr, "daemon: 唤醒 dsh(pid %d, 端口 %d)\n", pid, port);
     fast_hint_m = 0; // 新实例:旧关闭 hint 作废
     char j[64]; snprintf(j, sizeof j, "{\"port\":%d}\n", port);
-    int fd = open(DSH_JSON, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (fd >= 0) { write(fd, j, strlen(j)); close(fd); }
+    write_file_atomic(DSH_JSON, j, strlen(j));
     char ps[32]; snprintf(ps, sizeof ps, "%d\n", pid);
-    fd = open(PID_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (fd >= 0) { write(fd, ps, strlen(ps)); close(fd); }
+    write_file_atomic(PID_FILE, ps, strlen(ps));
     return;
   }
   close(reserve_fd); // 子进程关闭预留 fd,让 dsh 自己 bind
@@ -303,10 +331,10 @@ static void spawn_dsh(void) {
   _exit(127);
 }
 
-// 连接子进程里请求唤醒:只写管道,由主进程统一决定是否 spawn(幂等核心)
+// 连接子进程里请求唤醒:只写命令字节,由主进程统一决定是否 spawn(幂等核心)
 static void request_wake(void) {
   if (wake_pipe[1] < 0) { spawn_dsh(); return; } // 管道建立失败时退化为直启(旧行为)
-  char b = 1;
+  char b = CMD_WAKE;
   ssize_t w = write(wake_pipe[1], &b, 1);
   (void)w; // 管道满/关闭都无妨:主进程按自身状态决定
 }
@@ -368,8 +396,8 @@ static void stop_dsh(void) {
     if (kill(-pid, SIGTERM) == 0 || kill(pid, SIGTERM) == 0) {
       // 等待最多 6 秒(30 × 200ms)让进程优雅退出。
       // 必须先 waitpid 收割:dsh 死后若未收割会呈僵尸态,kill(pid,0) 对僵尸恒成功,
-      // 不收就会白等满 6s(且主循环被卡住,所有请求排队——旧代码每次停机都如此)。
-      // 注:/stop 路径跑在连接子进程里,waitpid 返回 ECHILD 无害,父主循环 1s 内会收走僵尸。
+      // 不收就会白等满 6s。/stop 经命令管道也跑在主进程里,waitpid 直接有效;
+      // idle 停机路径同样在主进程调用本函数。
       for (int i = 0; i < 30; i++) {
         if (waitpid(pid, NULL, WNOHANG) == pid) break; // 已退出并收割
         if (kill(pid, 0) != 0) break;                  // 已彻底消失
@@ -381,6 +409,16 @@ static void stop_dsh(void) {
   }
   unlink(DSH_JSON);
   unlink(PID_FILE);
+}
+
+// 连接子进程里请求停止:与 /wake 同法只写命令字节,由主进程串行执行 stop_dsh。
+// 若在子进程里直连 stop_dsh(旧实现),其最长 6s 等待循环期间主进程可 spawn 新 dsh,
+// 旧 stop 结束时无条件 unlink 状态文件,会误删新实例状态(见 wake_pipe 处注释)。
+static void request_stop(void) {
+  if (wake_pipe[1] < 0) { stop_dsh(); return; } // 管道建立失败时退化为直停(旧行为)
+  char b = CMD_STOP;
+  ssize_t w = write(wake_pipe[1], &b, 1);
+  (void)w; // 管道满/关闭都无妨:主循环的残留状态清理兜底
 }
 
 // ---------- 后台自动更新(预热后延迟触发,不阻塞启动) ----------
@@ -402,15 +440,15 @@ static void trigger_background_update(void) {
       if (last > 0 && now - last < 12 * 3600) return;
     }
   }
+  pid_t pid = fork();
+  if (pid < 0) return; // fork 失败不写时间戳,本次激活仍可重试(避免 12h 内被"假检查"节流)
+  // 先 fork 成功再写时间戳:若先写后 fork,fork 失败会导致 12h 内不再重试
   fd = open(stamp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
   if (fd >= 0) {
     char b[32]; int n = snprintf(b, sizeof b, "%lld\n", (long long)now);
     if (write(fd, b, (size_t)n) < 0) { /* 时间戳写失败不影响更新 */ }
     close(fd);
   }
-
-  pid_t pid = fork();
-  if (pid < 0) return;
   if (pid == 0) {
     // 子进程:独立会话,守护进程退出不影响更新
     setsid();
@@ -519,6 +557,8 @@ static void respond(int c, int code, const char *ct, const char *body) {
   int n = snprintf(hdr, sizeof hdr,
     "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
     code, code == 200 ? "OK" : (code == 403 ? "Forbidden" : (code == 502 ? "Bad Gateway" : "Internal Server Error")), ct, strlen(body));
+  // 截断防护:snprintf 截断时返回"本应写入长度",直接交给 write_all 会越界读
+  if (n < 0 || (size_t)n >= sizeof hdr) n = (int)sizeof hdr - 1;
   write_all(c, hdr, (size_t)n);
   write_all(c, body, strlen(body));
 }
@@ -530,13 +570,14 @@ static void respond_health(int c) {
   // 引导页 JS 负责在该窗口内等 token 出现再握手(见 TPL 内注释),冷启动不再多等 2s 宽限。
   int ready = dsh_ready();
   int pid = ready ? read_pid() : 0;
+  int n = -1;
   if (ready && dsh_token[0])
     // token 仅在本机回环端口经同源 fetch 可读(无 CORS 头,跨域页面读不到),
     // 信任级别与日志文件里的 token URL 相同;dsh 0.1.5+ 引导页用它完成 /?token= 握手
-    snprintf(body, sizeof body, "{\"dsh\":true,\"port\":%d,\"pid\":%d,\"token\":\"%s\"}", dsh_port, pid, dsh_token);
-  else
+    n = snprintf(body, sizeof body, "{\"dsh\":true,\"port\":%d,\"pid\":%d,\"token\":\"%s\"}", dsh_port, pid, dsh_token);
+  if (n < 0 || (size_t)n >= sizeof body)
     snprintf(body, sizeof body, "{\"dsh\":%s,\"port\":%d,\"pid\":%d}",
-      ready ? "true" : "false", ready ? dsh_port : 0, pid);
+             ready ? "true" : "false", ready ? dsh_port : 0, pid);
   respond(c, 200, "application/json", body);
 }
 
@@ -563,19 +604,26 @@ static void write_all(int fd, const char *b, size_t n) {
 static void relay(int c, int u) {
   char cb[65536], ub[65536];
   int c_eof = 0, u_eof = 0;
+  // 无数据总时限:双向静默的僵尸连接(如异常客户端/上游挂死)会让本循环永不退出,
+  // 子进程永生、active 永不归零。任一方向有数据即续期,连续无数据超 1800s 则断开。
+  const double IDLE_LIMIT = 1800.0;
+  double last_data = mono_now();
   while (!(c_eof && u_eof)) {
     struct pollfd pf[2];
     pf[0].fd = c; pf[0].events = POLLIN; pf[0].revents = 0;
     pf[1].fd = u; pf[1].events = POLLIN; pf[1].revents = 0;
-    if (poll(pf, 2, 300000) <= 0) continue;
+    if (poll(pf, 2, 300000) <= 0) {
+      if (mono_now() - last_data > IDLE_LIMIT) break;
+      continue;
+    }
     if (!c_eof && (pf[0].revents & (POLLIN | POLLHUP | POLLERR))) {
       ssize_t n = read(c, cb, sizeof cb);
-      if (n > 0) write_all(u, cb, (size_t)n);
+      if (n > 0) { last_data = mono_now(); write_all(u, cb, (size_t)n); }
       else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR)) { c_eof = 1; shutdown(u, SHUT_WR); }
     }
     if (!u_eof && (pf[1].revents & (POLLIN | POLLHUP | POLLERR))) {
       ssize_t n = read(u, ub, sizeof ub);
-      if (n > 0) write_all(c, ub, (size_t)n);
+      if (n > 0) { last_data = mono_now(); write_all(c, ub, (size_t)n); }
       else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR)) { u_eof = 1; shutdown(c, SHUT_WR); }
     }
   }
@@ -596,7 +644,7 @@ static int connect_upstream(void) {
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (connect(s, (struct sockaddr *)&a, sizeof a) == 0) return s;
     close(s);
-    if (i < 10) usleep(delays_us[i]);
+    if (i < 9) usleep(delays_us[i]);
   }
   return -1;
 }
@@ -631,17 +679,31 @@ static int http_probe(int port) {
 // 连接子进程经 fork 只读继承 —— 避免每个请求各自探测(每次探测 = 一次完整 GET /)。
 static int dsh_ready(void) { return dsh_port > 0 && ready_port == dsh_port; }
 
+// HTTP 头字段名查找(大小写不敏感,RFC 7230):返回值起始指针,未找到返回 NULL。
+// 只读 buf:buf 稍后要原样透传给 upstream,不得原地改写(包括 tolower);
+// 逐行 strncasecmp 而非复制整个 buf,天然不碰原始字节。字段名后必须紧跟 ':'。
+static const char *find_header(const char *buf, const char *name) {
+  size_t nl = strlen(name);
+  for (const char *p = buf; (p = strchr(p, '\n')) != NULL; p++) {
+    const char *h = p + 1;
+    if (strncasecmp(h, name, nl) == 0 && h[nl] == ':') {
+      h += nl + 1;
+      while (*h == ' ' || *h == '\t') h++;
+      return h;
+    }
+  }
+  return NULL;
+}
+
 // Origin 精确匹配本守护端口:防异端口绕过(如 127.0.0.1:31399 冒充 3080);
 // 后缀仅允许结束 / ? #,防 http://127.0.0.1:3080.evil.com 前缀绕过。
-// 只读 buf:buf 稍后要原样透传给 upstream,旧代码 *eol=0 原地截断会污染转发字节。
+// 值部分大小写敏感原样比较(与旧实现一致);字段名大小写不敏感。
 static int origin_ok(const char *buf) {
   char exp_ip[64], exp_local[64];
   snprintf(exp_ip, sizeof exp_ip, "http://127.0.0.1:%d", PORT);
   snprintf(exp_local, sizeof exp_local, "http://localhost:%d", PORT);
-  const char *o = strstr(buf, "\nOrigin:");
+  const char *o = find_header(buf, "Origin");
   if (!o) return 0;
-  o += 8;
-  while (*o == ' ') o++;
   const char *eol = strchr(o, '\r');
   if (!eol || eol == o) return 0;
   size_t vlen = (size_t)(eol - o);
@@ -657,16 +719,14 @@ static int origin_ok(const char *buf) {
 // Host 精确匹配本守护端口(127.0.0.1:PORT 或 localhost:PORT):防 DNS rebinding——
 // evil.com 解析到 127.0.0.1 后与守护"同源",无 Origin/CORS 拦得住,可直接读 /health 拿
 // dsh token 接管会话;严格匹配 Host 即可挡住(浏览器 URL 带端口,Host 必然带端口)。
-// 与 origin_ok 同法只读 buf:透传字节流稍后原样转发,不得原地改写。
+// 字段名大小写不敏感(find_header);值部分原样精确比较。
 // 守护自身的 http_probe 直连 dsh 内部端口(Host 无端口),不经 handle_conn,不受影响。
 static int host_ok(const char *buf) {
   char exp_ip[64], exp_local[64];
   snprintf(exp_ip, sizeof exp_ip, "127.0.0.1:%d", PORT);
   snprintf(exp_local, sizeof exp_local, "localhost:%d", PORT);
-  const char *h = strstr(buf, "\nHost:");
+  const char *h = find_header(buf, "Host");
   if (!h) return 0;
-  h += 6;
-  while (*h == ' ' || *h == '\t') h++;
   const char *eol = strchr(h, '\r');
   if (!eol) eol = strchr(h, '\n');
   if (!eol || eol == h) return 0;
@@ -727,7 +787,9 @@ static void handle_conn(int c) {
     return;
   }
   if (strcmp(method, "POST") == 0 && strcmp(path, "/stop") == 0) {
-    if (up) stop_dsh();
+    // 只投递命令字节,由主进程串行执行 stop_dsh(消除与 /wake spawn 的竞态,见 request_stop);
+    // 响应立即返回,停止异步完成——旧实现会在本连接子进程里阻塞最长 6s。
+    if (up) request_stop();
     respond(c, 200, "application/json", "{\"stopped\":true}");
     return;
   }
@@ -763,10 +825,13 @@ static void handle_conn(int c) {
   // 例外:引导页自己的握手 fetch('/?token=…') 同样是无 cookie 的 GET /,若不豁免会被本拦截
   // 挡回引导页 → Set-Cookie 永远拿不到 → 引导页无限 reload。query 以 token= 开头(引导页与
   // dsh 官方 URL 均如此)才放行透传;?other=… 之类无 token 的仍回引导页。
-  if (strcmp(method, "GET") == 0 && strcmp(path, "/") == 0 && strncmp(query, "token=", 6) != 0 &&
-      !strstr(buf, "\nCookie: dsh-auth")) {
-    respond(c, 200, "text/html; charset=utf-8", BOOT_PAGE);
-    return;
+  // Cookie 头字段名大小写不敏感(find_header);cookie 名 dsh-auth 本身大小写敏感,原样比较。
+  if (strcmp(method, "GET") == 0 && strcmp(path, "/") == 0 && strncmp(query, "token=", 6) != 0) {
+    const char *ck = find_header(buf, "Cookie");
+    if (!ck || strncmp(ck, "dsh-auth", 8) != 0) {
+      respond(c, 200, "text/html; charset=utf-8", BOOT_PAGE);
+      return;
+    }
   }
 
   // ---- 就绪:双向透传 ----
@@ -832,6 +897,9 @@ int main(void) {
   if (launch_activate_socket("Listeners", &lfd, &lcnt) == 0 && lcnt > 0 && lfd != NULL) {
     ls = lfd[0];
     fcntl(ls, F_SETFD, FD_CLOEXEC); // 主进程 spawn dsh 时不泄漏监听 fd
+    // 多余的监听 fd(配置了多个 Listeners 时):不留泄漏,全部关闭
+    for (size_t i = 1; i < lcnt; i++) close(lfd[i]);
+    free(lfd);
     activated = 1;
     fprintf(stderr, "dsh-daemon socket-activated: launchd 接管 http://127.0.0.1:%d/ 的监听(空闲停机后本守护 exit(0),launchd 重新接管)\n", PORT);
   }
@@ -949,8 +1017,19 @@ int main(void) {
     if (poll(pf, 3, poll_ms) > 0) {
       if (wake_pipe[0] >= 0 && (pf[1].revents & POLLIN)) {
         char wb;
-        while (read(wake_pipe[0], &wb, 1) > 0) {} // 吸干所有唤醒请求,至多 spawn 一次
-        if (spawn_pid == 0 && !dsh_up() && NODE_BIN[0] && DSH_BIN[0]) spawn_dsh();
+        int want_wake = 0;
+        while (read(wake_pipe[0], &wb, 1) > 0) {
+          if (wb == CMD_WAKE) want_wake = 1; // 多个唤醒请求至多 spawn 一次
+          else if (wb == CMD_STOP) {
+            // 停止也由主进程串行执行:与同批的 CMD_WAKE 按 FIFO 顺序结算,
+            // 停止期间不会有并发 spawn 写入新状态文件再被误删(竞态根源)。
+            stop_dsh();
+            dsh_port = 0;
+            ready_port = 0;
+            fast_hint_m = 0;
+          }
+        }
+        if (want_wake && spawn_pid == 0 && !dsh_up() && NODE_BIN[0] && DSH_BIN[0]) spawn_dsh();
       }
       if (hint_pipe[0] >= 0 && (pf[2].revents & POLLIN)) {
         char hb;
@@ -959,6 +1038,11 @@ int main(void) {
       }
       if (pf[0].revents & POLLIN) {
         int c = accept(ls, NULL, NULL);
+        if (c < 0 && (errno == EMFILE || errno == ENFILE)) {
+          // fd 耗尽:poll 对监听 socket 仍恒就绪(listen 队列非空),不歇一会会
+          // accept→EMFILE 空转烧 CPU。100ms 让上层连接子进程退出释放 fd。
+          usleep(100000);
+        }
         if (c >= 0) {
           tap_use(); // 父进程 accept 即在场证据(含 /health 轮询、/ping 心跳、透传请求)
           pid_t pid = fork();

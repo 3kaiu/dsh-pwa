@@ -90,13 +90,40 @@ if ! mkdir "$LOCK" 2>/dev/null; then
     log "! $(date '+%Y-%m-%d %H:%M:%S') 安装锁被占用(pid $LPID),跳过本次更新(当前 $CUR)"
     exit 0
   fi
-  rm -rf "$LOCK"
+  # TOCTOU 防护(与 install.sh 同款):读到死 pid 到执行删除之间,锁可能被其他等待进程
+  # 抢占重建(活锁)。O_EXCL 原子创建 claim 文件独占抢占权(claim 存在期间锁目录无法被
+  # mkdir),claim 后复读 pid 仍是最初判死的值才清理;锁刚易主/他人正在抢占则本轮让位
+  if ( set -C; echo "$$" > "$LOCK/claim" ) 2>/dev/null; then
+    sleep 0.2
+    if [ "$(cat "$LOCK/pid" 2>/dev/null || true)" = "$LPID" ]; then
+      rm -rf "$LOCK"
+    else
+      rm -f "$LOCK/claim" 2>/dev/null || true
+      log "! $(date '+%Y-%m-%d %H:%M:%S') 安装锁刚被其他进程抢占,跳过本次更新(当前 $CUR)"
+      exit 0
+    fi
+  else
+    CPID="$(cat "$LOCK/claim" 2>/dev/null || true)"
+    if [ -n "$CPID" ] && kill -0 "$CPID" 2>/dev/null; then
+      log "! $(date '+%Y-%m-%d %H:%M:%S') 其他进程正在抢占安装锁,跳过本次更新(当前 $CUR)"
+    else
+      rm -f "$LOCK/claim" 2>/dev/null || true
+      log "! $(date '+%Y-%m-%d %H:%M:%S') 清理残留 claim(抢占者已死),跳过本次更新(下轮再试)"
+    fi
+    exit 0
+  fi
   if ! mkdir "$LOCK" 2>/dev/null; then
     log "! $(date '+%Y-%m-%d %H:%M:%S') 安装锁创建失败($LOCK),跳过本次更新"
     exit 0
   fi
 fi
-echo "$$" > "$LOCK/pid"
+echo "$$" > "$LOCK/pid" 2>/dev/null || true
+# 写后复核(与 install.sh 同款):mkdir→写 pid 微窗口内锁可能被并发抢占者删掉重建,
+# pid 仍是自己才算真正持锁;否则本轮让位(下一轮定时任务再试)
+if [ "$(cat "$LOCK/pid" 2>/dev/null || true)" != "$$" ]; then
+  log "! $(date '+%Y-%m-%d %H:%M:%S') 安装锁竞争失败(被并发进程抢占),跳过本次更新"
+  exit 0
+fi
 trap 'rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null || true' EXIT
 
 # 清理陈旧备份:全量重装前会把依赖树 mv 成 .bak.$$;若更新中途被 kill(断电/重启),

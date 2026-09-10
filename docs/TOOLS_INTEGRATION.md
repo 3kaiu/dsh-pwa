@@ -77,7 +77,7 @@ shellcheck scripts/*.sh tests/*.sh
 
 **集成点:**
 - ✅ `.github/workflows/ci-enhanced.yml` (CI 自动检查)
-- ✅ `.git/hooks/pre-commit` (提交前检查)
+- ⚠️ 本仓库未配置 pre-commit hook(如需提交前本地检查,可自建 `.git/hooks/pre-commit`,参见下文「Pre-commit Hook(可选,自建)」)
 
 ---
 
@@ -114,21 +114,19 @@ bash scripts/benchmark.sh
 brew install bats-core
 ```
 
-**测试文件:** `tests/unit/install-validation.bats`
+**测试文件:** `tests/unit/install-validation.bats` + `tests/unit/daemon-cases.bats`
 
 ```bash
-bats tests/unit/install-validation.bats
+bats tests/unit/
 ```
 
 **功能:**
-- 端口验证测试
-- 编译成功性测试
-- 二进制体积测试
-- 脚本语法测试
+- install-validation.bats: 端口验证、编译成功性、二进制体积、脚本语法等安装侧用例
+- daemon-cases.bats: 守护进程黑盒用例(就绪门控/透传/启停等),不依赖真实 dsh,复用 `tests/lib/daemon-helpers.sh` 探测助手
 
-**当前覆盖:**
-- 8 个测试用例
-- 覆盖边界情况 (端口范围, 二进制大小)
+**当前覆盖(截至 2026-09-11):**
+- 2 个测试文件,共 24 个测试用例(install-validation 8 + daemon-cases 16)
+- 覆盖边界情况 (端口范围, 二进制大小, 守护运行时行为)
 
 ---
 
@@ -164,16 +162,23 @@ bats tests/unit/install-validation.bats
 
 ---
 
-## Pre-commit Hook
+## Pre-commit Hook（可选，自建）
 
-**文件:** `.git/hooks/pre-commit`
+本仓库**没有**内置 `.git/hooks/pre-commit`（`.git/hooks` 不入库,CI 已覆盖同等检查）。如需提交前本地把关,可自行创建:
 
-**自动检查:**
-1. Shellcheck (如果已安装)
-2. C 编译检查 (零警告)
-3. 二进制体积检查 (>90KB 警告)
-
-**触发时机:** `git commit` 之前
+```bash
+cat > .git/hooks/pre-commit <<'EOF'
+#!/bin/bash
+# 1. Shellcheck (如果已安装)
+command -v shellcheck >/dev/null && shellcheck scripts/*.sh tests/*.sh || true
+# 2. C 编译检查 (零警告)
+clang -O2 -Wall -Wextra -Werror -arch arm64 -arch x86_64 -o /tmp/daemon-precommit src/daemon.c || exit 1
+# 3. 二进制体积检查 (>90KB 警告)
+SIZE=$(stat -f%z /tmp/daemon-precommit)
+[ "$SIZE" -gt 92160 ] && echo "⚠️ 二进制超过 90KB: ${SIZE}B"
+EOF
+chmod +x .git/hooks/pre-commit
+```
 
 **跳过方式:** `git commit --no-verify`
 
@@ -209,7 +214,7 @@ bash scripts/benchmark.sh
 #### 3. 单元测试
 ```bash
 # 运行 Bash 单元测试 (需要先安装 bats-core)
-bats tests/unit/install-validation.bats
+bats tests/unit/
 ```
 
 ---
@@ -275,16 +280,7 @@ brew install hyperfine
 brew install bats-core
 
 # 单独运行失败的测试
-bats tests/unit/install-validation.bats -f "test_name"
-```
-
-#### 4. pre-commit hook 被跳过
-```bash
-# 检查 hook 是否可执行
-chmod +x .git/hooks/pre-commit
-
-# 手动运行
-bash .git/hooks/pre-commit
+bats tests/unit/ -f "test_name"
 ```
 
 ---
@@ -306,7 +302,7 @@ rm -f scripts/benchmark.sh
 # 删除 CI 配置
 rm -f .github/workflows/ci-enhanced.yml
 
-# 删除 pre-commit hook
+# 删除 pre-commit hook(若曾按上文自建)
 rm -f .git/hooks/pre-commit
 
 # 删除单元测试
