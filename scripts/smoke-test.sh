@@ -39,7 +39,11 @@ s.bind(("127.0.0.1", 0))
 s.listen(1)
 with open(sys.argv[1], "w") as f:
     f.write(str(s.getsockname()[1]))
-s.accept()
+# 持续监听:install.sh 的 stop_active_dsh() 会先 curl /health 探测,
+# 若只 accept 一次就退出,端口会被提前释放,导致后续端口检测失效
+while True:
+    c, _ = s.accept()
+    c.close()
 PY
 OCC_PID=$!
 for _ in $(seq 1 20); do [ -s "$OCC_DIR/port" ] && break; sleep 0.1; done
