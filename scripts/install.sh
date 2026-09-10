@@ -149,14 +149,14 @@ else
 fi
 
 # ---------- 2) dsh + daemon 并行安装(节省 3-5 秒) ----------
-h1 "2) dsh(@deepseek-ai/dsh@next)"
+h1 "2) dsh(@deepseek-ai/dsh@latest)"
 # pnpm:内容寻址存储 + 硬链接 → 升级只拉差异、node_modules 体积小、安装快。
 # 用 npm exec 按需引导(复用上文确定的 NPM_BIN,不污染系统;pnpm@10 大版本固定)。
 npx_pnpm() { "$NPM_BIN" exec --yes --package=pnpm@10 -- pnpm "$@"; }
 PNPM_STORE="$RT_HOME/.pnpm-store"
-# 自动跟随上游 next 标签(dsh 官方开发分支,比 latest 稳定)
-# 可通过 DSH_VERSION 环境变量覆盖回退到已知版本(如 DSH_VERSION=0.1.1-rc.2 bash install.sh)
-DSH_VERSION="${DSH_VERSION:-next}"
+# 自动跟随上游 latest 标签(稳定版本)
+# 可通过 DSH_VERSION 环境变量覆盖到指定版本(如 DSH_VERSION=0.1.1-rc.2 bash install.sh)
+DSH_VERSION="${DSH_VERSION:-latest}"
 LATEST="$DSH_VERSION"
 CUR_DSH="$("$NODE_BIN" -e 'console.log(require(process.argv[1]).version)' "$DSH_PKG" 2>/dev/null || true)"
 
