@@ -231,6 +231,16 @@ static time_t last_spawn_time = 0;
 static int spawn_failure_count = 0;
 static time_t cooldown_until = 0; // 崩溃冷却截止(非阻塞:到期前拒绝拉起,主循环照常服务引导页)
 
+// 更新期被丢弃的唤醒:update_locked() 拒绝 spawn 时置位,主循环在锁释放后自行重试。
+// 必要性:引导页 JS 只在首次进入时 POST 一次 /wake(BOOT_PAGE 的 fired 守卫),之后仅轮询
+// /health,而 /health 不触发 spawn(只有 /wake 与页面请求会)。若那唯一一次唤醒恰好撞上
+// update-dsh.sh 持 .install.lock(守护启动后 10s 触发,持锁直到 npm view 返回),唤醒就被
+// 丢弃且无人重试 → 页面永久停在「正在唤醒…」。
+// 实测:CI 冒烟 3b(并发双 /wake)在被拒后仅轮询 /health,卡满 300s 超时;同一提交重跑即绿,
+// 说明是依赖 npm view 时长的时序型缺陷,不是稳定失败。
+static int wake_pending = 0;
+static double wake_retry_m = 0;
+
 // 更新进行中判定:update-dsh.sh 更新期间持 $RT_HOME/.install.lock(内含存活 pid)。
 // 此刻 node_modules 处于半更新状态,拉起 dsh 会崩溃或行为异常——放弃本次 spawn,等下次唤醒重试。
 // fail-open:锁不可读/不存在/pid 已死(陈旧锁)一律视为无锁,绝不因锁机制问题阻断正常启动。
@@ -279,7 +289,9 @@ static void spawn_dsh(void) {
     // 更新持有 install.lock:本轮放弃 spawn(spawn_pid 保持 0,下次 /wake/页面请求自然重试);
     // /health 继续如实报 dsh:false,引导页 tick 持续轮询,更新完成后任一新请求即可拉起。
     // 只做一次非阻塞检查,绝不等待锁释放。
+    // 同时记 pending:客户端未必再发 /wake(引导页只发一次),锁释放后由主循环自愈重试。
     fprintf(stderr, "daemon: 更新进行中(install.lock 持有存活 pid),本轮不拉起 dsh\n");
+    wake_pending = 1;
     return;
   }
   if (now - last_spawn_time < 5) {
@@ -1109,6 +1121,17 @@ int main(void) {
       // token 字段,由引导页 JS 负责等 token 出来再握手(连续 ~3s 仍无 token 才按旧版直接 reload)。
       ready_port = dsh_port;
     }
+    // 更新期被丢弃的唤醒自愈:锁释放后由主循环自行重试,不依赖客户端再发请求(1s 节流)。
+    // 这里位于 poll() 之前,故即使完全无连接也会按 poll_ms(空闲 1s)推进,不会永久卡住。
+    // spawn_dsh() 在锁仍被持有时只读一次 pid 文件即返回,且不计入崩溃失败计数,故反复调用安全。
+    if (wake_pending && mono_now() - wake_retry_m >= 1.0) {
+      wake_retry_m = mono_now();
+      if (!NODE_BIN[0] || !DSH_BIN[0] || dsh_up() || spawn_pid != 0) {
+        wake_pending = 0; // runtime 不可用 / 已拉起 / 正在启动:唤醒无从兑现或已兑现,作废
+      } else {
+        spawn_dsh();
+      }
+    }
     struct pollfd pf[3];
     pf[0].fd = ls; pf[0].events = POLLIN; pf[0].revents = 0;
     pf[1].fd = wake_pipe[0]; pf[1].events = POLLIN; pf[1].revents = 0;
@@ -1130,6 +1153,7 @@ int main(void) {
             dsh_port = 0;
             ready_port = 0;
             fast_hint_m = 0;
+            wake_pending = 0; // 显式停止:作废待重试的唤醒,避免 stop 之后又被自行拉起
           }
         }
         if (want_wake && spawn_pid == 0 && !dsh_up() && NODE_BIN[0] && DSH_BIN[0]) spawn_dsh();

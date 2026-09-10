@@ -450,6 +450,80 @@ PY
   [ -f "$FAKE_DSH_MARKER" ] || { echo "  dsh 就绪但 marker 未出现(伪 dsh 未真正执行?)" >&2; return 1; }
 }
 
+@test "wake refused by install lock is retried after lock clears without a new wake" {
+  # 回归:引导页只在首次进入时 POST 一次 /wake(BOOT_PAGE 的 fired 守卫),之后仅轮询 /health,
+  # 而 /health 不触发 spawn(只有 /wake 与页面请求会)。若那唯一一次唤醒撞上 update-dsh.sh 持
+  # .install.lock,旧实现直接丢弃且无人重试 → 页面永久停在「正在唤醒…」。
+  # 来源:CI 冒烟 3b(并发双 /wake)被拒后仅轮询 /health,卡满 300s 超时;同一提交重跑即绿,
+  # 说明是依赖 npm view 时长的时序型缺陷。故本用例刻意不再发第二次 /wake,只轮询 /health。
+  PY="$(command -v python3 || true)"
+  [ -n "$PY" ] || { echo "  python3 不可用" >&2; return 1; }
+  export FAKE_DSH_MARKER="$BATS_TEST_TMPDIR/dsh-started.marker"
+  cat > "$BATS_TEST_TMPDIR/fake-dsh-pending.py" <<'PY'
+#!/usr/bin/env python3
+import os, socket, sys
+args = sys.argv
+port = 0
+for i in range(len(args) - 1):
+    if args[i] == "--port":
+        port = int(args[i + 1])
+sys.stdout.write("dsh web: http://127.0.0.1:%d/?token=pendingTok\n" % port)
+sys.stdout.flush()
+marker = os.environ.get("FAKE_DSH_MARKER", "")
+if marker:
+    open(marker, "w").close()
+ppid = os.getppid()  # 守护杀了我父进程 → PPID 变化 → 自行退出,不留孤儿
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port))
+s.listen(16)
+s.settimeout(1.0)
+while True:
+    if os.getppid() != ppid:
+        break
+    try:
+        c, _ = s.accept()
+    except socket.timeout:
+        continue
+    except OSError:
+        break
+    try:
+        c.recv(1024)
+        c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+    except OSError:
+        pass
+    c.close()
+PY
+  start_daemon_env "{\"node\":\"$PY\",\"dsh\":\"$BATS_TEST_TMPDIR/fake-dsh-pending.py\"}"
+  # 伪锁:活进程 pid 写入 $RT_HOME/.install.lock/pid
+  sleep 60 &
+  LOCK_PID=$!
+  mkdir -p "$DSH_RT_HOME/.install.lock"
+  printf '%s\n' "$LOCK_PID" > "$DSH_RT_HOME/.install.lock/pid"
+  # 唯一一次 /wake:被锁拒绝(200 但不拉起)
+  run curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "Origin: http://127.0.0.1:$PORT" \
+    "http://127.0.0.1:$PORT/wake"
+  assert_status "200"
+  sleep 0.5
+  [ ! -f "$FAKE_DSH_MARKER" ] || { echo "  持锁期间 dsh 被拉起(marker 已出现)" >&2; return 1; }
+  grep -q "更新进行中" "$TMP_ENV/daemon.log" \
+    || { echo "  守护未走 install.lock 拒绝路径(日志见 $TMP_ENV/daemon.log)" >&2; return 1; }
+  # 释放锁:此后不再发任何 /wake,只轮询 /health(与引导页 tick 行为一致)
+  kill "$LOCK_PID" 2>/dev/null || true
+  wait "$LOCK_PID" 2>/dev/null || true
+  rm -rf "$DSH_RT_HOME/.install.lock"
+  ok=""
+  for _ in $(seq 1 60); do
+    h="$(curl -s --max-time 2 "http://127.0.0.1:$PORT/health" 2>/dev/null || true)"
+    if printf '%s' "$h" | grep -q '"dsh":true'; then ok=1; break; fi
+    sleep 0.2
+  done
+  [ "$ok" = "1" ] \
+    || { echo "  锁释放后仅轮询 /health,12s 内被丢弃的唤醒未被自愈重试(日志见 $TMP_ENV/daemon.log)" >&2; return 1; }
+  [ -f "$FAKE_DSH_MARKER" ] || { echo "  /health 报 dsh:true 但伪 dsh 未真正执行(marker 缺失)" >&2; return 1; }
+}
+
 @test "lowercase origin header with correct value is accepted" {
   # 头字段名应大小写不敏感(RFC 7230):小写 origin: + 正确值不得被误拒为 CSRF(应 200 而非 403)
   start_daemon_env '{"node":"/nonexistent/dsh-unit-node","dsh":"/nonexistent/dsh-unit-dsh"}'
