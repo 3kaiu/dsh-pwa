@@ -77,7 +77,10 @@ daemon_wait_health() {
   dead=$((start + tmo))
   while :; do
     n=$((n + 1))
-    h="$(curl -fsS --max-time 2 "http://127.0.0.1:$port/health" 2>/dev/null || true)"
+    # 回环请求必须绕过代理:curl 默认把 127.0.0.1 交给 http_proxy。带 -f 时代理的 502
+    # 会让 curl 非零退出且不输出 body → h 恒为空 → 本函数会一直重试到超时,把「守护已就绪」
+    # 误报成「未就绪」(在设了 http_proxy 的机器上就是稳定的假失败)。与 smoke-test.sh 同约定。
+    h="$(curl -fsS --max-time 2 --noproxy '*' "http://127.0.0.1:$port/health" 2>/dev/null || true)"
     if [ -n "$h" ]; then
       case "$want" in
         any)

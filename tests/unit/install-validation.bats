@@ -92,44 +92,66 @@ teardown() {
   [ "$bad" -eq 0 ]
 }
 
-@test "every curl in CI-executed scripts and workflows carries a timeout" {
-  # 无超时的 curl 是一颗定时炸弹:服务「已 bind 未 listen」时 macOS 直接丢弃 SYN(不回 RST),
-  # curl 会一直挂到作业级 timeout-minutes(30min),把真实缺陷掩盖成「卡住」——本次 CI 排查
-  # 正是被这种「只看到卡住、看不到原因」拖慢的。
-  # 规则:CI 执行的 shell 脚本里每一处 curl 调用都必须带 --max-time / -m。
-  #   - awk 先合并反斜杠续行,否则「curl 在一行、URL 在下一行」会漏检(第一版就漏了)。
-  #   - 不按 127.0.0.1 过滤:URL 常写成变量(如 $ENDPOINT),按主机过滤同样会漏检(也踩过)。
-  #   - 只认「像调用」的 curl(curl 后紧跟非字母数字字符,或裸 http URL),散文里提到 curl 不误报。
-  # 范围:CI 执行的 shell 脚本 + workflow 的 run: 块。
-  #   - workflow 按纯文本扫即可:注释行以 # 开头会被跳过,反斜杠续行也会被合并。
-  #     run: 块同样是 CI 执行的 shell,漏掉它就会出现「手工改过的那处门禁覆盖不到」的缺口
-  #     (实测:ci-enhanced.yml 里那处就确实没被旧版门禁覆盖)。
-  #   - bats 用例不纳入:其 curl 都在 daemon_wait_health(自带 --max-time 2)确认守护已监听之后,
-  #     且守护已死时是连接拒绝(快速失败)而非挂起。
+@test "every curl carries a timeout, and every loopback curl bypasses the proxy" {
+  # 两条约定,同一根因家族:门禁必须覆盖它**声称**覆盖的东西,不能只覆盖一半。
+  #  (1) 超时:无超时的 curl 是一颗定时炸弹——服务「已 bind 未 listen」时 macOS 直接丢弃 SYN
+  #      (不回 RST),curl 会一直挂到作业级 timeout-minutes(30min),把真实缺陷掩盖成「卡住」;
+  #      本次 CI 排查正是被这种「只看到卡住、看不到原因」拖慢的。规则:每一处 curl 都必须带
+  #      --max-time / -m。
+  #  (2) 代理:curl **默认不豁免回环**,会把 127.0.0.1 交给 http_proxy(实测 curl 8.7.1 打印
+  #      "Uses proxy env variable http_proxy")。此时「守护已死」拿到的是代理的 502 而不是
+  #      连接拒绝(000),断言与报错全部失真。规则:回环 curl 必须带 --noproxy,或本文件已
+  #      全局 `unset ...proxy`(benchmark.sh 取后者:它只压本机,且 hyperfine 的命令字符串会
+  #      再经 sh -c 解析,未加引号的 * 有被 glob 展开的风险,故显式清代理更稳)。
+  # 已知盲区(刻意保留,写清楚而不是假装覆盖):URL 写成变量时无法静态判定是否回环
+  #   (如 benchmark.sh 的 "$ENDPOINT"),故不纳入代理检查。这与超时检查「不按 127.0.0.1
+  #   过滤」是同一教训的两面:能静态判定的必须判,判不了的必须写明。
+  # 扫描范围与形状处理(合并反斜杠续行、只认「像调用」的 curl)见下。
   offenders="$(
     for f in "$ROOT"/scripts/*.sh "$ROOT"/tests/*.sh "$ROOT"/tests/lib/*.sh \
              "$ROOT"/.github/workflows/*.yml; do
       awk -v F="$f" '
-        function bad(l,   t, c) {
-          t = l; sub(/^[ \t]+/, "", t)
-          if (substr(t, 1, 1) == "#") return 0
+        # 第一遍预扫描:本文件是否全局清掉代理环境变量(见上文 (2) 的 benchmark.sh 分支)。
+        FNR == NR {
+          if ($0 ~ /^[ \t]*unset[ \t]/ && $0 ~ /[Pp][Rr][Oo][Xx][Yy]/) unset_proxy = 1
+          next
+        }
+        # 只认「像调用」的 curl(curl 后紧跟非字母数字字符,或裸 http URL),散文里提到 curl 不误报。
+        function looks_like_call(t,   c) {
           if (!match(t, /curl[ \t]+/)) return 0
           # 刻意不用字符类 [^-A-Za-z0-9_]:BWK awk 会把 -A 解析成范围,使 "-" 落进否定类,
           # 于是所有 `curl -flag` 全被漏检(实测踩过)。改为取首字符逐个判断。
           c = substr(t, RSTART + RLENGTH, 1)
           if (c ~ /[A-Za-z0-9_]/ && c != "h") return 0
-          if (t ~ /--max-time[= ][0-9]/ || t ~ /-m [0-9]/) return 0
           return 1
         }
+        # echo/printf 里的 curl 是给人看的提示文本,不是调用(benchmark.sh:26,44-46、
+        # profile-daemon.sh:13 都是这种,含 127.0.0.1 字面量,不过滤就会误报);
+        # 但 `echo "$(curl ...)"` 里的 curl 是真调用,不能一并放过。
+        function is_prose(t) {
+          return (t ~ /^(echo|printf)[ \t]/ && t !~ /\$\(curl/)
+        }
+        function check(l, ln,   t) {
+          t = l
+          sub(/^[ \t]+/, "", t)
+          if (substr(t, 1, 1) == "#") return
+          if (!looks_like_call(t)) return
+          if (!(t ~ /--max-time[= ][0-9]/ || t ~ /-m [0-9]/))
+            printf "%s:%d: [无超时] %s\n", F, ln, t
+          if (!unset_proxy && !is_prose(t) \
+              && t ~ /127\.0\.0\.1|localhost|\[::1\]/ && t !~ /--noproxy/)
+            printf "%s:%d: [回环未绕代理] %s\n", F, ln, t
+        }
+        # awk 先合并反斜杠续行,否则「curl 在一行、URL 在下一行」会漏检(第一版就漏了)。
         { l = (buf == "" ? $0 : buf " " $0); buf = "" }
         l ~ /\\$/ { sub(/\\$/, "", l); buf = l; next }
-        bad(l) { printf "%s:%d: %s\n", F, FNR, l }
-        END { if (buf != "" && bad(buf)) printf "%s: %s\n", F, buf }
-      ' "$f"
+        { check(l, FNR) }
+        END { if (buf != "") check(buf, FNR) }
+      ' "$f" "$f"
     done
   )"
   if [ -n "$offenders" ]; then
-    printf '  无超时的 curl(请补 --max-time):\n%s\n' "$offenders" >&2
+    printf '  curl 约定违规:\n%s\n' "$offenders" >&2
   fi
   [ -z "$offenders" ]
 }
