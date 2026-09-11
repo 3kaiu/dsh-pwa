@@ -34,6 +34,17 @@ func_body() {
   awk -v h="$1" 'index($0, h "()") == 1 {f=1} f {print} f && /^}/ {exit}' "$2"
 }
 
+# 提取「后台拉起守护」的那条命令语句(向前吸收 `\` 续行,得到完整命令)
+daemon_launch_stmt() {
+  awk -v n="$1" '
+    { lines[NR]=$0 }
+    END {
+      s=n
+      while (s>1 && lines[s-1] ~ /\\[[:space:]]*$/) s--
+      for (i=s;i<=n;i++) print lines[i]
+    }' "$2"
+}
+
 @test "daemon-starting scripts register EXIT trap before first daemon start" {
   # 路径可覆盖,供 fail-before 复验(指向修复前的副本)。本用例只**读**文件,不执行,
   # 故副本放在任意位置都成立。
@@ -96,4 +107,29 @@ func_body() {
     return 1
   fi
   return 0
+}
+
+@test "workflow steps that background the daemon disable auto-update" {
+  # 守护**每次启动**都会 fork 一个 setsid 的更新检查子进程(见 src/daemon.c:1057 的注释),
+  # 它先 sleep(10) 再 exec update-dsh.sh。在那 10s 里它是一个**同名的 daemon 进程**且自成会话
+  # (setsid),因此「杀掉守护」根本杀不到它 —— 实测:父守护 95539 被杀后,子进程 95541 存活。
+  # 短作业(job 收尾早于那 10s)就会在收尾时被 runner 抓成 orphan:ci-enhanced.yml 的性能基准
+  # 步骤实测约 3.5s,run 34647776445 / 34651085008 各稳定报 1 个 orphan daemon。
+  # 故凡在 workflow 里**后台**拉起守护的命令,必须在同一条命令里置 DSH_RT_NO_AUTO_UPDATE=1。
+  # 约定出处:tests/unit/daemon-cases.bats:32「测试环境绝不触发后台更新子进程」。
+  local dir="${WORKFLOWS_DIR:-$ROOT/.github/workflows}"
+  local f="" ln="" stmt="" bad=0
+  for f in "$dir"/*.yml; do
+    [ -f "$f" ] || continue
+    for ln in $(awk '/daemon/ && /&[[:space:]]*$/ {print NR}' "$f"); do
+      stmt="$(daemon_launch_stmt "$ln" "$f")"
+      if ! printf '%s' "$stmt" | grep -q 'DSH_RT_NO_AUTO_UPDATE'; then
+        echo "$(basename "$f"):$ln 后台拉起守护,但同一条命令里没有 DSH_RT_NO_AUTO_UPDATE" >&2
+        echo "  → 更新检查子进程会在守护被杀后继续存活(sleep 10s 内同名),短作业收尾即报 orphan daemon" >&2
+        printf '%s\n' "$stmt" | sed 's/^/    /' >&2
+        bad=1
+      fi
+    done
+  done
+  [ "$bad" = "0" ]
 }

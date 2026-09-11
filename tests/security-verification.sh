@@ -83,6 +83,12 @@ h1 "2. CSRF 防护验证"
 
 # 2.1 运行时验证 - 启动临时 daemon 测试 CSRF
 info "启动临时 daemon 进行运行时 CSRF 测试..."
+# 测试期绝不触发后台更新子进程(与 tests/unit/daemon-cases.bats 同一约定)。
+# 守护每次启动都会 fork 一个 setsid 的更新检查子进程,它先 sleep(10) 再 exec update-dsh.sh;
+# 在那 10s 里它是**同名的 daemon 进程**且自成会话 —— 杀掉父守护不会杀掉它。套件跑得够久时
+# 它会自己走到 exec(改名 bash)再退出,所以只是隐患;但短作业(见 ci-enhanced.yml 性能基准)
+# 就会在 job 收尾时被抓成 orphan。另外它会在测试中途去动安装目录,与本套件互相干扰。
+export DSH_RT_NO_AUTO_UPDATE=1
 TMPD="$(mktemp -d)"
 TEST_PORT=$((30000 + RANDOM % 10000))
 

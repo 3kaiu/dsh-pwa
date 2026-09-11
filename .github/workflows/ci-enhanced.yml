@@ -118,9 +118,18 @@ jobs:
           set -euo pipefail
           # 基准需要守护在线:smoke-test 在 build-and-test 已跑完(其守护退出即自停),
           # 这里单独拉起基准实例(缺 run.json 时守护仅应答 /health,足够基准测量)
+          #
+          # DSH_RT_NO_AUTO_UPDATE=1 是必需的,不只是洁癖:
+          # 守护每次启动都会 fork 一个 setsid 的更新检查子进程(daemon.c:1057),它先 sleep(10)
+          # 再 exec update-dsh.sh;在那 10s 里它是**同名的 daemon 进程**且自成会话 —— 下面 trap
+          # 里的 kill "$BPID" 杀不到它。本步骤很短(实测约 3.5s),job 收尾时它还在睡,于是 runner
+          # 稳定报 `Terminate orphan process: pid (…) (daemon)`(实测 run 34647776445 / 34651085008
+          # 各 1 个)。顺带它还会在基准测量期间抢 CPU/网络,污染结果。
+          # 同一约定见 tests/unit/daemon-cases.bats:32 与 tests/security-verification.sh。
           DSH_RT_HOME="$HOME/.local/share/dsh-runtime" \
           DSH_RT_STATE="$HOME/.local/state/dsh-runtime" \
           DSH_HOME="$HOME/.dsh" \
+          DSH_RT_NO_AUTO_UPDATE=1 \
           DSH_RT_PORT=3080 "$HOME/.local/share/dsh-runtime/daemon" \
             >/tmp/bench-daemon.log 2>&1 &
           BPID=$!
