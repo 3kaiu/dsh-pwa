@@ -52,6 +52,19 @@ static char DSH_JSON[1100], PID_FILE[1100], DSH_HOME[1024];
 static char NODE_BIN[1024], DSH_BIN[1024];
 static int PORT = 3080, IDLE_STOP = 30, GOODBYE_GRACE = 12;
 
+// A2:上游(dsh)与客户端 socket 的读写超时(秒)。
+// relay 是纯字节管道:任一侧「只连不读」时,write_all 会**永久阻塞在 write(2)** ——
+// 连接子进程永不退出 → 主循环 waitpid 收不到 → active 恒 >0 → 空闲停机判定
+// (dsh_port>0 && active==0)永不成立 → dsh 不停、守护不自退,**零常驻承诺失效**。
+// 注意 relay 里那个 1800s 的 IDLE_LIMIT 只在 poll() 超时路径生效,覆盖不到「卡在 write 里」,
+// 所以必须由 socket 自身超时兜底,不能靠它。
+static int IO_TIMEOUT_SECS = 30;
+// E3:write_all 遇到 EAGAIN 后最多再等多久可写(毫秒)。
+// 旧实现是裸 `continue` —— 阻塞 socket 上设了发送超时后,对端不读就会返回 EAGAIN,
+// 立即重试即 **100% CPU 自旋**。所以 A2 与 E3 必须同批修,否则只是把「静默挂死」换成「烧 CPU」。
+// 超时即放弃本次写入,由 relay 据此收尾整条连接。
+static int WRITE_WAIT_MS = 30000;
+
 static const char *env_or(const char *k, const char *d) {
   const char *v = getenv(k);
   return (v && v[0]) ? v : d;
@@ -85,6 +98,18 @@ static void build_paths(void) {
   if (p && *p) {
     int parsed = atoi(p);
     if (parsed >= 1 && parsed <= 600) GOODBYE_GRACE = parsed; // 关闭信标后的快停宽限,默认 12s
+  }
+  // 上/下游 socket 读写超时(秒)。下界 1s:0 会退化成「无超时」,即 A2 缺陷本身。
+  p = getenv("DSH_RT_IO_TIMEOUT_SECS");
+  if (p && *p) {
+    int parsed = atoi(p);
+    if (parsed >= 1 && parsed <= 3600) IO_TIMEOUT_SECS = parsed;
+  }
+  // write_all 等可写的上限(毫秒)。下界 10ms,避免误配成忙等。
+  p = getenv("DSH_RT_WRITE_WAIT_MS");
+  if (p && *p) {
+    int parsed = atoi(p);
+    if (parsed >= 10 && parsed <= 600000) WRITE_WAIT_MS = parsed;
   }
   mkdir(LOG_DIR, 0700);
 }
@@ -368,9 +393,19 @@ static void request_wake(void) {
 // 日志捕获它,经 /health 交给引导页:引导页 fetch('/?token=x') 换取 dsh 的持久会话
 // cookie(由 DSH_HOME 持久密钥签名、绑定本守护端口,跨 dsh 重启有效),再 reload 进入。
 // 透传字节流保持原样,dsh 自身 cookie 会话不受影响;旧版 dsh 无 token 时回落为纯 reload。
-static char dsh_token[64];
+// token 缓冲。E1:旧值是 64,一旦 dsh 把 token 加长到 ≥64 就会**静默缓存 63 字符前缀**
+// (见 scan_token 的判定),引导页拿错 token 握手吃 401 → 无限 reload。当前 dsh token 长 43,
+// 属潜伏缺陷。这里放宽到 256(同时把 respond_health 的 JSON 缓冲提到 512),
+// 并在 scan_token 里对「撞上上限」显式判为截断、拒绝缓存 —— 缓冲够用 + 不误信截断值。
+static char dsh_token[256];
 static long token_scan_off = 0;
 static void reset_token(void) { dsh_token[0] = 0; token_scan_off = 0; token_scan_deadline = 0; }
+// token 允许的字符集(采集与 JSON 安全校验共用一处,避免两处规则漂移)
+static int token_char(char c) {
+  return c == '_' || c == '-' || (c >= '0' && c <= '9') ||
+         (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
 static void scan_token(void) {
   if (dsh_token[0]) return;
   int fd = open(LOG_FILE, O_RDONLY);
@@ -384,10 +419,20 @@ static void scan_token(void) {
   const char *hit = strstr(b, "?token=");
   if (hit) {
     const char *v = hit + 7;
+    const size_t cap = sizeof dsh_token - 1;
     size_t i = 0;
-    while (v[i] && i < sizeof dsh_token - 1 &&
-           (v[i] == '_' || v[i] == '-' || (v[i] >= '0' && v[i] <= '9') ||
-            (v[i] >= 'a' && v[i] <= 'z') || (v[i] >= 'A' && v[i] <= 'Z'))) i++;
+    while (i < cap && v[i] && token_char(v[i])) i++;
+    // E1:「值在本窗口内完整结束」的判据是**停在非 token 字符上**。
+    // 旧实现只判 `v[i] != 0`,于是 i 撞上缓冲上限时会把**前缀**当完整值:token 长度 ≥cap+1 时
+    // v[cap] 仍是 token 字符(非 0)→ 误判为「已结束」→ 缓存 cap 个字符的前缀;而本函数开头
+    // `if (dsh_token[0]) return;` 使其**永不重扫**,于是永久拿着错 token。
+    // 现在显式区分:撞上上限且下一个字符仍是 token 字符 ⇒ 判为截断,拒绝缓存、等下次重扫。
+    // (拒绝缓存比缓存错值安全:错值会让引导页无限 reload 吃 401;无值时引导页按"等 token"处理。)
+    if (i == cap && token_char(v[i])) {
+      fprintf(stderr, "daemon: token 达到缓冲上限 %zu 且未见结束符,判为截断,拒绝缓存(稍后重扫)\n", cap);
+      token_scan_off += hit - b;
+      return;
+    }
     if (v[i] != 0) { // 值完整结束于本次读取窗口内
       memcpy(dsh_token, v, i);
       dsh_token[i] = 0;
@@ -408,8 +453,7 @@ static void scan_token(void) {
 static int token_json_safe(void) {
   if (!dsh_token[0]) return 0;
   for (const char *p = dsh_token; *p; p++) {
-    if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'z') ||
-          (*p >= 'A' && *p <= 'Z') || *p == '_' || *p == '-')) return 0;
+    if (!token_char(*p)) return 0;
   }
   return 1;
 }
@@ -636,7 +680,7 @@ static void build_boot(void) {
 }
 
 // ---------- HTTP ----------
-static void write_all(int fd, const char *b, size_t n);
+static int write_all(int fd, const char *b, size_t n);
 static void respond(int c, int code, const char *ct, const char *body) {
   char hdr[256];
   int n = snprintf(hdr, sizeof hdr,
@@ -649,7 +693,8 @@ static void respond(int c, int code, const char *ct, const char *body) {
 }
 
 static void respond_health(int c) {
-  char body[256];
+  // 512:dsh_token 已放宽到 256(E1),JSON 里还要塞 port/pid,256 会截断 → token 被静默丢弃。
+  char body[512];
   // 报"就绪"(能服务 HTTP)而非仅"进程活着":引导页据此切换,避免过早 reload 进未就绪的 dsh → PWA 空白。
   // 就绪判定只看 HTTP 探测,不等 token:token 未捕获时省略该字段(dsh:true 仍报出),
   // 引导页 JS 负责在该窗口内等 token 出现再握手(见 TPL 内注释),冷启动不再多等 2s 宽限。
@@ -684,12 +729,27 @@ static const char ICON_SVG[] =
   "<line x1=\"31\" y1=\"45\" x2=\"47\" y2=\"45\" stroke=\"#E8EAED\" stroke-width=\"5.5\" stroke-linecap=\"round\"/></svg>";
 
 // ---------- 透传 ----------
-static void write_all(int fd, const char *b, size_t n) {
+// 返回 0 = 全部写出; -1 = 写失败或对端长时间不可写(已放弃)。
+static int write_all(int fd, const char *b, size_t n) {
   while (n > 0) {
     ssize_t w = write(fd, b, n);
-    if (w < 0) { if (errno == EINTR || errno == EAGAIN) continue; return; }
+    if (w < 0) {
+      if (errno == EINTR) continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        // E3:这里**绝不能裸 continue**。socket 设了 SO_SNDTIMEO 之后,对端不读就会让 write
+        // 返回 EAGAIN;立即重试就是 100% CPU 自旋 —— 修 A2 会必然触发它,所以两者必须同批改。
+        // 改为等可写,等不到就放弃本次写入并返回 -1,由 relay 收尾整条连接。
+        // 这是「对端一直不读」最终能让连接子进程退出、active 归零的唯一出口。
+        struct pollfd p;
+        p.fd = fd; p.events = POLLOUT; p.revents = 0;
+        if (poll(&p, 1, WRITE_WAIT_MS) <= 0) return -1;
+        continue;
+      }
+      return -1;
+    }
     b += w; n -= (size_t)w;
   }
+  return 0;
 }
 
 static void relay(int c, int u) {
@@ -709,12 +769,20 @@ static void relay(int c, int u) {
     }
     if (!c_eof && (pf[0].revents & (POLLIN | POLLHUP | POLLERR))) {
       ssize_t n = read(c, cb, sizeof cb);
-      if (n > 0) { last_data = mono_now(); write_all(u, cb, (size_t)n); }
+      if (n > 0) {
+        last_data = mono_now();
+        // 上游写不动(不读/已挂):整条连接没有继续的意义,直接收尾。
+        // 不能忽略返回值 —— 否则子进程会一直卡在这里,active 永不归零(A2 的表现形式)。
+        if (write_all(u, cb, (size_t)n) != 0) break;
+      }
       else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR)) { c_eof = 1; shutdown(u, SHUT_WR); }
     }
     if (!u_eof && (pf[1].revents & (POLLIN | POLLHUP | POLLERR))) {
       ssize_t n = read(u, ub, sizeof ub);
-      if (n > 0) { last_data = mono_now(); write_all(c, ub, (size_t)n); }
+      if (n > 0) {
+        last_data = mono_now();
+        if (write_all(c, ub, (size_t)n) != 0) break; // 客户端写不动:同上
+      }
       else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR)) { u_eof = 1; shutdown(c, SHUT_WR); }
     }
   }
@@ -733,7 +801,16 @@ static int connect_upstream(void) {
     a.sin_family = AF_INET;
     a.sin_port = htons(dsh_port);
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (connect(s, (struct sockaddr *)&a, sizeof a) == 0) return s;
+    if (connect(s, (struct sockaddr *)&a, sizeof a) == 0) {
+      // A2:给**上游** socket 也设读写超时。此前只有 http_probe 与客户端 socket 设了超时,
+      // 透传用的这个 fd 没有 —— 于是 dsh 一旦不再读取(挂死/卡在自身逻辑),relay 里的
+      // write_all(u,…) 就永久阻塞,子进程不退、active 不归零、零常驻失效(详见文件头 IO_TIMEOUT_SECS)。
+      // 超时后 write/read 返回 EAGAIN,由 write_all 的 poll 等待与 relay 的 IDLE_LIMIT 各自兜底。
+      struct timeval tv = { IO_TIMEOUT_SECS, 0 };
+      setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+      setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+      return s;
+    }
     close(s);
     if (i < 9) usleep(delays_us[i]);
   }
@@ -850,6 +927,11 @@ static int host_ok(const char *buf) {
 // 单次 recv 只拿到部分头(TCP 分片)或头 >8KB 被截断时,host_ok/origin_ok/find_header
 // 会误判 → 合法请求被 403、请求行/query 解析错位。循环读到空行即止:
 // GET 无体,读到空行立即返回;POST 体留给 relay 继续透传(不在此阻塞等体)。
+// 返回:>0 = 读到的头字节数,且**已见到头结束符**(\r\n\r\n 或 \n\n);
+//        0 = 对端未发任何数据;  -1 = 头不完整(缓冲区读满 / 读超时 / 对端半途关闭)。
+// 必须区分「不完整」:此前只判 >0,于是「读满 8KB」与「SO_RCVTIMEO(2s) 超时」都被当成完整请求,
+// 守护会基于**被截断的数据**做 Host/Origin/路径判定并继续透传 —— 与「relay 不解析后续请求」
+// 组合即构成安全判定绕过链(E2)。现在未见空行一律 400,不进入判定、不透传。
 static int read_request_head(int c, char *buf, size_t cap) {
   size_t off = 0;
   if (cap == 0) return 0;
@@ -860,18 +942,27 @@ static int read_request_head(int c, char *buf, size_t cap) {
     if (n == 0) break;
     off += (size_t)n;
     buf[off] = 0;
-    if (strstr(buf, "\r\n\r\n") || strstr(buf, "\n\n")) break; // 头结束(容忍裸 LF)
+    if (strstr(buf, "\r\n\r\n") || strstr(buf, "\n\n")) return (int)off; // 头结束(容忍裸 LF)
   }
   buf[off] = 0;
-  return (int)off;
+  return off == 0 ? 0 : -1;
 }
 
 static void handle_conn(int c) {
-  struct timeval tv = { 2, 0 };
-  setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+  struct timeval rtv = { 2, 0 };
+  setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof rtv);
+  // 客户端方向也要设**发送**超时:relay 里 write_all(c,…) 在客户端停止读取(暂停的标签页、
+  // 断网但未发 RST)时会永久阻塞,同样导致子进程不退、active 不归零 —— 与 A2 同一类缺陷,
+  // 只是方向相反。读超时保持 2s(只关乎请求头的及时性),发送宽限用统一的上游超时值。
+  struct timeval stv = { IO_TIMEOUT_SECS, 0 };
+  setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof stv);
   char buf[8192];
   int blen = read_request_head(c, buf, sizeof buf);
-  if (blen <= 0) return;
+  if (blen == 0) return; // 对端未发数据(空连接):静默收尾
+  if (blen < 0) {
+    respond(c, 400, "text/plain", "incomplete request head\n");
+    return;
+  }
 
   // Host 校验(防 DNS rebinding):所有请求(引导页/控制端点/透传)统一在最前面拦截,
   // 不匹配本守护端口一律 403——rebinding 攻击者控制的 Host 是 evil.com,浏览器正常路径
@@ -975,7 +1066,13 @@ static void handle_conn(int c) {
   
   int u = connect_upstream();
   if (u < 0) { respond(c, 502, "text/plain", "upstream unavailable"); return; }
-  write_all(u, buf, (size_t)blen);
+  // 首个请求都写不进去(上游不读/刚挂):直接 502 收尾,不要进入 relay —— 否则子进程会
+  // 卡在写上游上,active 不归零(与 A2 同一失效路径)。
+  if (write_all(u, buf, (size_t)blen) != 0) {
+    close(u);
+    respond(c, 502, "text/plain", "upstream not writable\n");
+    return;
+  }
   time_t relay_start = time(NULL);
   relay(c, u);
   // 长连接结束 hint:存活 ≥10s 的基本是 WS/页面通道,结束≈页面关闭(或长流结束);

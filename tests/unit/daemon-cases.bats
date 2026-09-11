@@ -79,6 +79,10 @@ teardown() {
     wait "$VICTIM_PID" 2>/dev/null || true
     VICTIM_PID=""
   fi
+  # 兜底:按二进制路径收尾。A2/E3 用例会故意制造「上游只收不读」,若修复失效,连接子进程会
+  # 卡在 write(2) 上 —— 只按 pid 杀守护本体是收不掉它的。必须在 stop_daemon_env 之前,
+  # 因为那个函数会把 TMP_ENV 清空。
+  [ -z "${TMP_ENV:-}" ] || daemon_stop_by_binary "$TMP_ENV/daemon"
   stop_daemon_env
 }
 
@@ -1122,4 +1126,223 @@ PY
     sleep 0.2
   done
   [ "$ok" = "1" ] || { echo "  stop_dsh 对非 node pid 未跳过信号(受害进程被误杀或状态未清,日志见 $TMP_ENV/daemon.log)" >&2; return 1; }
+}
+
+@test "stuck upstream does not pin the relay child" {
+  # A2 + E3 回归。上游(伪 dsh)「只收不读」时,relay 里的 write_all(u,…) 会在写满 socket
+  # 缓冲后阻塞在 write(2)。修复前:连接子进程永不退出 → 主循环 waitpid 收不到 → active 恒 >0
+  # → 空闲停机判定(dsh_port>0 && active==0)永不成立 → dsh 不停、守护不自退,零常驻承诺失效。
+  # 修复后:上游 socket 有 SO_SNDTIMEO → write 返回 EAGAIN → write_all 改为等可写且**有上限**
+  # → 放弃本次写入 → relay 收尾整条连接 → 子进程退出。
+  # 判据(可观测):发一个足以填满上游缓冲的 POST 之后,连接子进程必须在有限时间内消失,
+  # 只剩守护本体。用小子超时(1s / 300ms)把等待压到秒级,避免用例本身跑很久。
+  PY="$(command -v python3 || true)"
+  [ -n "$PY" ] || { echo "  python3 不可用" >&2; return 1; }
+  export FAKE_DSH_PORT_FILE="$BATS_TEST_TMPDIR/stuck.port"
+  cat > "$BATS_TEST_TMPDIR/fake-dsh-stuck.py" <<'PY'
+#!/usr/bin/env python3
+import os, socket, sys, time
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 0))
+s.listen(16)
+port = s.getsockname()[1]
+pf = os.environ.get("FAKE_DSH_PORT_FILE", "")
+if pf:
+    with open(pf, "w") as f:
+        f.write(str(port))
+sys.stdout.write("dsh web: http://127.0.0.1:%d/?token=stuckT0ken\n" % port)
+sys.stdout.flush()
+s.settimeout(1.0)
+deadline = time.time() + 120
+held = []
+while time.time() < deadline:
+    try:
+        c, _ = s.accept()
+    except socket.timeout:
+        continue
+    except OSError:
+        break
+    try:
+        c.settimeout(1.0)
+        first = c.recv(1024)
+    except OSError:
+        first = b""
+    if first.startswith(b"GET "):
+        try:
+            c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+        except OSError:
+            pass
+        c.close()
+    else:
+        held.append(c)
+PY
+  TMP_ENV="$(mktemp -d /tmp/dsh-unit.XXXXXX)"
+  mkdir -p "$TMP_ENV/rt" "$TMP_ENV/state/logs"
+  export DSH_RT_HOME="$TMP_ENV/rt" DSH_RT_STATE="$TMP_ENV/state" DSH_HOME="$TMP_ENV/home"
+  export DSH_RT_IDLE_STOP_SECS=60   # 本用例验证期内不要空闲停机
+  export DSH_RT_NO_AUTO_UPDATE=1
+  export DSH_RT_IO_TIMEOUT_SECS=1   # 上游写超时
+  export DSH_RT_WRITE_WAIT_MS=300   # 等可写的上限
+  PORT="$(pick_free_port)"
+  export DSH_RT_PORT="$PORT"
+  FAKE_DSH_PID=""
+  "$PY" "$BATS_TEST_TMPDIR/fake-dsh-stuck.py" >"$DSH_RT_STATE/logs/dsh.log" 2>&1 &
+  FAKE_DSH_PID=$!
+  for _ in $(seq 1 20); do [ -s "$FAKE_DSH_PORT_FILE" ] && break; sleep 0.1; done
+  [ -s "$FAKE_DSH_PORT_FILE" ] || { echo "  伪 dsh 未启动" >&2; return 1; }
+  printf '{"port":%s}\n' "$(cat "$FAKE_DSH_PORT_FILE")" > "$DSH_RT_STATE/dsh.json"
+  daemon_compile "$TMP_ENV/daemon" || { echo "  daemon 编译失败" >&2; return 1; }
+  DAEMON_PID="$(daemon_start_foreground "$TMP_ENV/daemon" "$TMP_ENV/daemon.log")"
+  # 等 dsh:true —— 即 dsh_ready() 成立,请求才会被透传而不是拿到引导页
+  daemon_wait_health "$PORT" true 8 || { echo "  守护未就绪(日志见 $TMP_ENV/daemon.log)" >&2; return 1; }
+
+  # 基线:此刻只有守护本体(每个请求的连接子进程都是短命的)
+  base="$(pgrep -f "^${TMP_ENV}/daemon( |\$)" 2>/dev/null | wc -l | tr -d ' ')"
+  [ "$base" = "1" ] || { echo "  基线进程数异常:$base(应为 1)" >&2; return 1; }
+
+  # 4MB 请求体:远超回环 socket 缓冲,必然把「只收不读」的上游写满
+  head -c 4194304 /dev/zero | tr '\0' 'x' > "$BATS_TEST_TMPDIR/big.bin"
+  curl -s -o /dev/null --max-time 30 -X POST \
+    -H "Origin: http://127.0.0.1:$PORT" \
+    --data-binary "@$BATS_TEST_TMPDIR/big.bin" \
+    "http://127.0.0.1:$PORT/api/x" >/dev/null 2>&1 || true
+
+  ok=""
+  for _ in $(seq 1 100); do
+    n="$(pgrep -f "^${TMP_ENV}/daemon( |\$)" 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "$n" = "1" ]; then ok=1; break; fi
+    sleep 0.2
+  done
+  if [ "$ok" != "1" ]; then
+    echo "  连接子进程未在 20s 内退出(残留 $n 个)—— 卡在上游写,active 永不归零(A2/E3)" >&2
+    return 1
+  fi
+}
+
+# ---- token 采集(E1)辅助:伪 dsh + dsh.json + 预置 dsh.log,走「收养运行中 dsh」路径 ----
+# 用法: start_token_env <token>;结果:TMP_ENV / PORT / DAEMON_PID
+start_token_env() {
+  local tok="$1" py="" fp=""
+  py="$(command -v python3 || true)"
+  [ -n "$py" ] || { echo "  python3 不可用" >&2; return 1; }
+  export FAKE_DSH_PORT_FILE="$BATS_TEST_TMPDIR/tok.port"
+  rm -f "$FAKE_DSH_PORT_FILE"
+  cat > "$BATS_TEST_TMPDIR/fake-dsh-tok.py" <<'PY'
+#!/usr/bin/env python3
+import os, socket, time
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 0))
+s.listen(16)
+pf = os.environ.get("FAKE_DSH_PORT_FILE", "")
+if pf:
+    with open(pf, "w") as f:
+        f.write(str(s.getsockname()[1]))
+s.settimeout(1.0)
+deadline = time.time() + 90
+while time.time() < deadline:
+    try:
+        c, _ = s.accept()
+    except socket.timeout:
+        continue
+    except OSError:
+        break
+    try:
+        c.recv(1024)
+        c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+    except OSError:
+        pass
+    c.close()
+PY
+  TMP_ENV="$(mktemp -d /tmp/dsh-unit.XXXXXX)"
+  mkdir -p "$TMP_ENV/rt" "$TMP_ENV/state/logs"
+  export DSH_RT_HOME="$TMP_ENV/rt" DSH_RT_STATE="$TMP_ENV/state" DSH_HOME="$TMP_ENV/home"
+  export DSH_RT_IDLE_STOP_SECS=60
+  export DSH_RT_NO_AUTO_UPDATE=1
+  PORT="$(pick_free_port)"
+  export DSH_RT_PORT="$PORT"
+  FAKE_DSH_PID=""
+  "$py" "$BATS_TEST_TMPDIR/fake-dsh-tok.py" >/dev/null 2>&1 &
+  FAKE_DSH_PID=$!
+  for _ in $(seq 1 20); do [ -s "$FAKE_DSH_PORT_FILE" ] && break; sleep 0.1; done
+  [ -s "$FAKE_DSH_PORT_FILE" ] || { echo "  伪 dsh 未启动" >&2; return 1; }
+  fp="$(cat "$FAKE_DSH_PORT_FILE")"
+  printf '{"port":%s}\n' "$fp" > "$DSH_RT_STATE/dsh.json"
+  # 预置 dsh.log:守护走「收养运行中 dsh」路径,启动时即扫此文件抓 token
+  printf 'dsh web: http://127.0.0.1:%s/?token=%s\n' "$fp" "$tok" > "$DSH_RT_STATE/logs/dsh.log"
+  daemon_compile "$TMP_ENV/daemon" || { echo "  daemon 编译失败" >&2; return 1; }
+  DAEMON_PID="$(daemon_start_foreground "$TMP_ENV/daemon" "$TMP_ENV/daemon.log")"
+  daemon_wait_health "$PORT" any 5 || { echo "  守护未就绪(日志见 $TMP_ENV/daemon.log)" >&2; return 1; }
+}
+
+@test "token longer than the old 64-byte buffer is captured in full" {
+  # E1 前半。旧实现 dsh_token[64] + 「循环撞上上限即当作值已完整结束」→ 缓存 63 字符**前缀**;
+  # 而 scan_token 开头 `if (dsh_token[0]) return;` 使其**永不重扫** → 引导页永远拿错 token,
+  # 握手吃 401 → 无限 reload。当前 dsh token 长 43,故这是潜伏缺陷(dsh 一加长就命中)。
+  # 判据:100 字符 token 必须**完整**出现在 /health。
+  tok="$(printf 'T%.0s' $(seq 1 100))"
+  start_token_env "$tok"
+  got=""
+  h=""
+  for _ in $(seq 1 40); do
+    h="$(curl -s --max-time 2 --noproxy '*' "http://127.0.0.1:$PORT/health" 2>/dev/null || true)"
+    if printf '%s' "$h" | grep -q "\"token\":\"$tok\""; then got=1; break; fi
+    sleep 0.2
+  done
+  if [ "$got" != "1" ]; then
+    echo "  /health 未携带完整 100 字符 token(被截断,见 $TMP_ENV/daemon.log)" >&2
+    printf '  health=%s\n' "$h" >&2
+    return 1
+  fi
+}
+
+@test "token beyond the buffer limit is refused, not truncated" {
+  # E1 后半:超过缓冲上限时必须**拒绝缓存**而不是缓存前缀 —— 错值会让引导页无限 reload 吃 401,
+  # 无值则引导页按「等 token」路径处理,是可恢复的。
+  # 判据:300 字符 token → /health 不带 token 字段,且守护日志出现截断判定。
+  tok="$(printf 'T%.0s' $(seq 1 300))"
+  start_token_env "$tok"
+  sleep 1
+  h="$(curl -s --max-time 2 --noproxy '*' "http://127.0.0.1:$PORT/health" 2>/dev/null || true)"
+  if printf '%s' "$h" | grep -q '"token"'; then
+    echo "  超长 token 被缓存(应拒绝):$h" >&2
+    return 1
+  fi
+  grep -q '判为截断' "$TMP_ENV/daemon.log" 2>/dev/null || {
+    echo "  守护日志未出现截断判定(见 $TMP_ENV/daemon.log)" >&2
+    return 1
+  }
+}
+
+@test "incomplete request head is rejected with 400" {
+  # E2 回归:read_request_head 此前只判 `>0`,于是「缓冲区读满」与「SO_RCVTIMEO 读超时」
+  # 都被当成完整请求,守护会基于**被截断的数据**做 Host/Origin/路径判定并继续透传 ——
+  # 与「relay 不解析后续请求」组合即构成安全判定绕过链。
+  # 判据:发一个**没有结束空行**的请求头,必须得到 400(而不是被当作完整请求继续处理)。
+  start_daemon_env '{"node":"/nonexistent/dsh-unit-node","dsh":"/nonexistent/dsh-unit-dsh"}'
+  PY="$(command -v python3 || true)"
+  [ -n "$PY" ] || { echo "  python3 不可用" >&2; return 1; }
+  out="$(PORT="$PORT" "$PY" -c '
+import os, socket
+p = int(os.environ["PORT"])
+s = socket.create_connection(("127.0.0.1", p), timeout=10)
+s.sendall(("GET / HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n" % p).encode())  # 故意不发结束空行
+s.settimeout(10)
+data = b""
+try:
+    while True:
+        b = s.recv(4096)
+        if not b:
+            break
+        data += b
+except OSError:
+    pass
+s.close()
+print(data.decode("latin1").split("\r\n")[0])
+' 2>/dev/null || true)"
+  case "$out" in
+    *"400"*) ;;
+    *) echo "  截断请求头未返回 400,实际:[$out]" >&2; return 1 ;;
+  esac
 }
