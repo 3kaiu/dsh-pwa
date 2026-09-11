@@ -19,8 +19,8 @@ Conventional Commits，中文 subject。历史风格举例：
 clang -O2 -Wall -Wextra -Werror -o /tmp/dsh_verify src/daemon.c   # 必须零告警
 shellcheck -S warning scripts/*.sh tests/*.sh tests/lib/*.sh      # 与 CI 同范围
 for f in scripts/*.sh tests/*.sh tests/lib/*.sh; do bash -n "$f"; done
-bats tests/unit/                                                   # 当前 43 项
-# workflow：PyYAML 真实解析 + 21 个 run block 语法检查
+bats tests/unit/                                                   # 当前 48 项
+# workflow：PyYAML 真实解析 + 23 个 run block 语法检查
 # 注意本机 `ruby` 被 rbenv 指向未安装的 3.1.0 而不可用；用**系统** python3（带 PyYAML），
 # 托管版 python 没有 PyYAML。
 /opt/homebrew/opt/python@3.13/libexec/bin/python3 -c "import yaml,glob;[yaml.safe_load(open(p)) for p in glob.glob('.github/workflows/*.yml')]"
@@ -35,6 +35,9 @@ node ~/.workbuddy-ai/skills/ci-gate-hardening/scripts/check_run_blocks.mjs .gith
 - 以上两条都已固化为门禁，见 `install-validation.bats` 的
   `every curl in CI-executed scripts and workflows carries a timeout` 与
   `every workflow job declares timeout-minutes`。
+- **测试/基准脚本退出后不得留下守护进程**：trap 必须注册在**首次启动守护之前**，且按 pid
+  与**二进制路径**各收一遍；凡在 workflow 里后台拉起守护，必须置 `DSH_RT_NO_AUTO_UPDATE=1`。
+  已固化为门禁，见 `tests/unit/harness-cleanup.bats`（3 例，理由见陷阱 23）。
 
 ## 踩过的坑（通用 shell / CI 陷阱）
 1. **`file -b` 对 universal/fat 二进制逐架构输出一行** → `grep -c arm64` 恒为 2，`= 1` 永不成立。判断架构要用子串匹配：`[[ "$(file -b "$BIN")" == *"$(uname -m)"* ]]`。
@@ -127,6 +130,28 @@ node ~/.workbuddy-ai/skills/ci-gate-hardening/scripts/check_run_blocks.mjs .gith
     **判据要收紧到对象**：`grep 'shasum -a 256 -c .*pkg\.zip'`（结果 0 行 = 真已移除）。
     同一轮里两个探针都出了假结论，靠 `sed -n '44,62p'` **直接看原始内容**才定案 ——
     **门禁/探针报异常时，先打印原始内容核对，再下结论。**
+
+22. **探针不能被「记录探针本身的文本」满足**。查 CI 孤儿时我 `grep "Terminate orphan process"`
+    命中的是**我自己刚写进 workflow 的注释** —— GitHub Actions 会把整个 `run:` block（含注释）
+    回显进日志，于是误判成「修复后仍有 1 个孤儿」。收紧成 runner 的真实格式
+    `Terminate orphan process: pid \([0-9]+\)` 后本轮 = **0 条**。
+    **凡是把诊断文字写进日志/脚本，同一轮再 grep 它，都会假阳性。**
+23. **CI 孤儿 `daemon` 有两个独立来源，且必须按 job 分组归因**（2026-09-12，3 → 1 → 0）：
+    - **归因**：`Terminate orphan process: pid (N) (daemon)` 要**逐 job** 统计。4 次 run 各 3 个，
+      但分布是「安全套件 2 + 性能基准 1」；Release workflow（只跑 smoke）**恒 0** ——
+      「某 job 恒 0」正是排除共享组件的最强证据。我最初笼统说「3 个全来自安全套件」，**是错的**。
+    - **来源一**：`tests/security-verification.sh` 的 EXIT trap 挂在第 7 节（330 行），而首次
+      启动守护在 97 行，且只 `rm -rf`、从不停守护 → 「启动成功但随后失败」的路径不受保护。
+    - **来源二**：`daemon.c:1057` **每次守护启动**都 `fork()` + `setsid()` 一个更新检查子进程，
+      `sleep(10)` 后才 `exec update-dsh.sh`。**那 10s 内它是同名的 `daemon` 进程且自成会话**，
+      所以 `kill $BPID` 杀不到它；性能基准步骤只跑约 3.5s，job 收尾时它还在睡。修法＝置
+      `DSH_RT_NO_AUTO_UPDATE=1`（既有约定见 `tests/unit/daemon-cases.bats:32`）。
+      A/B 实证：不置变量时单次启动 **2 个同名进程**、杀父后子进程存活；置变量后 **1 个**、
+      连 `last_update_check` 时间戳都不创建。
+    - **顺带**：`$!` 偏差**只出现在命令替换写法** `P="$(bin & echo $!)"`；`cmd & p=$!` 直接写法
+      实测 3/3 命中真实进程。**修之前先分清文件里用的是哪一种形状**，别无脑加兜底。
+    - **门禁**：`tests/unit/harness-cleanup.bats` 三例（trap 前移不变量 / 安全套件不留守护 /
+      workflow 后台拉起守护必须置 NO_AUTO_UPDATE），三例均验过 fail-before。
 
 ## daemon 安全模型（勿回退）
 - CSRF：Origin / Host 头**精确匹配**，防跨站与 DNS rebinding。
