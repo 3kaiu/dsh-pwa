@@ -86,6 +86,27 @@ info "启动临时 daemon 进行运行时 CSRF 测试..."
 TMPD="$(mktemp -d)"
 TEST_PORT=$((30000 + RANDOM % 10000))
 
+# 收尾:停掉本脚本启动的守护 + 清掉全部临时目录。
+# 必须注册在**第一个临时目录创建之后**,否则早期失败路径(daemon_compile 失败等)不受保护;
+# 旧实现把 trap 挂在第 7 节(脚本末尾),前面 300 行全在保护之外,且只删了**当时那个** TMPD
+# —— `TMPD_PERM` 从不清理,守护更是从不停。
+# 停守护**同时按 pid 与按二进制路径**:实测 `$!` 未必就是最终在 listen 的进程(见
+# daemon-helpers.sh 中 daemon_stop_by_binary 的注释),只按 pid 会漏,泄漏的守护要等到
+# 空闲自停(默认 30s)才消失 —— 在 CI 里就表现为作业结束时 runner 报
+# `Terminate orphan process: pid (…) (daemon)`。
+cleanup_all() {
+  daemon_stop "${DAEMON_PID:-}" 2>/dev/null || true
+  daemon_stop "${PERM_PID:-}" 2>/dev/null || true
+  [ -z "${TMPD:-}" ] || daemon_stop_by_binary "$TMPD/daemon"
+  [ -z "${TMPD_PERM:-}" ] || daemon_stop_by_binary "$TMPD_PERM/daemon"
+  [ -z "${TMPD_BUILD:-}" ] || daemon_stop_by_binary "$TMPD_BUILD/daemon"
+  [ -z "${TMPD:-}" ] || rm -rf "$TMPD"
+  [ -z "${TMPD_PERM:-}" ] || rm -rf "$TMPD_PERM"
+  [ -z "${TMPD_BUILD:-}" ] || rm -rf "$TMPD_BUILD"
+  return 0
+}
+trap cleanup_all EXIT
+
 # 编译并启动 daemon
 if daemon_compile "$TMPD/daemon" -arch arm64 -arch x86_64; then
   # 准备最小运行环境
@@ -326,18 +347,19 @@ h1 "7. 编译测试"
 
 # 7.1 编译 daemon.c
 info "编译 daemon.c(universal binary)..."
-TMPD="$(mktemp -d)"
-trap 'rm -rf "$TMPD"' EXIT
+# 用独立变量,不复用 TMPD:复用会让 cleanup_all 只记得最后一个目录,前面那个被覆盖后
+# 再无引用(旧实现正是如此)。两个目录都由 cleanup_all 统一清。
+TMPD_BUILD="$(mktemp -d)"
 
-if daemon_compile "$TMPD/daemon" -arch arm64 -arch x86_64; then
+if daemon_compile "$TMPD_BUILD/daemon" -arch arm64 -arch x86_64; then
   ok "daemon.c 编译成功(无警告)"
 else
   fail "daemon.c 编译失败"
 fi
 
 # 7.2 检查二进制架构
-if [ -f "$TMPD/daemon" ]; then
-  FILE_OUT=$(file "$TMPD/daemon")
+if [ -f "$TMPD_BUILD/daemon" ]; then
+  FILE_OUT=$(file "$TMPD_BUILD/daemon")
   if echo "$FILE_OUT" | grep -q "universal binary" && \
      echo "$FILE_OUT" | grep -q "x86_64" && \
      echo "$FILE_OUT" | grep -q "arm64"; then
@@ -348,8 +370,8 @@ if [ -f "$TMPD/daemon" ]; then
 fi
 
 # 7.3 检查符号表清理
-if [ -f "$TMPD/daemon" ]; then
-  SIZE=$(stat -f%z "$TMPD/daemon")
+if [ -f "$TMPD_BUILD/daemon" ]; then
+  SIZE=$(stat -f%z "$TMPD_BUILD/daemon")
   # Universal binary 当前约 117KB(双架构 + 内嵌引导页)
   if [ "$SIZE" -lt 150000 ]; then
     ok "daemon 二进制大小合理($SIZE 字节)"

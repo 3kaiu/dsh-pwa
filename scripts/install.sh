@@ -523,6 +523,16 @@ elif [ -x "$RT_HOME/daemon" ] && [ -n "$NODE_BIN" ] && [ -n "$DSH_BIN" ]; then
     # 清理:无论暖机是否成功,都 kill 守护前台进程
     kill "$WDPID" 2>/dev/null || true
     wait "$WDPID" 2>/dev/null || true
+    # 兜底:按**路径**再收一遍暖机守护。
+    # 理由:`$!` 未必就是最终在 listen 的那个进程 —— 实测偏差 4~15 个 pid
+    # (tests/lib/daemon-helpers.sh:daemon_stop_by_binary 有完整数据),只按 pid kill 会
+    # 漏掉真正的守护,而它要等空闲自停(默认 30s)才消失:在 CI 里就是作业结束时 runner 报
+    # `Terminate orphan process: pid (…) (daemon)`;在用户机器上则是装完还留个监听进程。
+    # WARM_RT_HOME 来自 mktemp -d(路径唯一);`^` 锚定命令行开头(守护以该路径直接启动,
+    # argv[0] 即它),不会误伤 install.sh 自身或同机其他进程。
+    for _WP in $(pgrep -f "^${WARM_RT_HOME}/daemon(\$| )" 2>/dev/null || true); do
+      kill -TERM "$_WP" 2>/dev/null || true
+    done
     # 兜底:守护被硬杀时 dsh 可能还活着 —— 失败分支的 /stop 未必生效(dsh 根本没起来时
     # 无人应答),而 dsh 因 setsid 不在守护的进程组里,不会随守护一起死。
     # 用**负 PID 打整组**,与守护自身的停止逻辑一致(daemon.c:469:负 PID 整组发信号,

@@ -33,7 +33,12 @@ teardown() {
   run clang -O2 -Wall -Wextra -Werror \
     -arch arm64 -arch x86_64 \
     -o /tmp/daemon-test "$ROOT/src/daemon.c"
-  [ "$status" -eq 0 ]
+  ST="$status"
+  # 产物即刻清理:这里用**固定路径**(非 mktemp),不删就会永久留一个 ~120KB 的二进制在 /tmp。
+  # 两个同类用例(universal / size)都已有 rm -f,唯独此处漏了。先存 $status 再删,
+  # 保证断言失败时也清理(断言放在 rm 之后会因 bats 中止而跳过清理)。
+  rm -f /tmp/daemon-test
+  [ "$ST" -eq 0 ]
 }
 
 @test "daemon binary is universal (arm64 + x86_64)" {

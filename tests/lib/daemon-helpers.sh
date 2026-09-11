@@ -134,3 +134,33 @@ daemon_stop() {
     rm -f "$DSH_RT_STATE/dsh.json" "$DSH_RT_STATE/dsh.pid"
   fi
 }
+
+# daemon_stop_by_binary <daemon 二进制路径>
+# 按「可执行文件路径」收尾,作为 daemon_stop <PID> 的**兜底**。
+#
+# 为什么需要兜底:`daemon_start_foreground` 用 `$( ... )` 取 `$!`,而 `$!` 未必就是最终
+# 在 listen 的那个进程。实测(2026-09-12,本机 3/3 次复现):`$!`=11765 而实际 LISTEN 的是
+# 11780、`$!`=12510 而实际 12516、`$!`=13253 而实际 13259 —— 偏差 4~15 个 pid,
+# 于是 `daemon_stop "$!"` 杀掉了**另一个**进程,真正的守护存活到空闲自停(默认 30s)。
+# 在 CI 里表现为作业结束时 runner 报 `Terminate orphan process: pid (…) (daemon)`。
+#
+# 路径来自 `mktemp -d`,每次唯一;`^` 锚定到命令行开头(守护以 "$bin" 直接启动,argv[0]
+# 即该路径),故不会误伤测试脚本自身或同机其他进程。
+daemon_stop_by_binary() {
+  local bin="${1:-}" p="" pat=""
+  if [ -z "$bin" ]; then
+    return 0
+  fi
+  pat="^${bin}(\$| )"
+  for p in $(pgrep -f "$pat" 2>/dev/null || true); do
+    kill "$p" 2>/dev/null || true
+  done
+  for _ in $(seq 1 20); do
+    pgrep -f "$pat" >/dev/null 2>&1 || break
+    sleep 0.1
+  done
+  for p in $(pgrep -f "$pat" 2>/dev/null || true); do
+    kill -9 "$p" 2>/dev/null || true
+  done
+  return 0
+}

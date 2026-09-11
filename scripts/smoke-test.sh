@@ -6,7 +6,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 INSTALL="${1:-$ROOT/scripts/install.sh}"
 [ -f "$INSTALL" ] || { echo "找不到 install.sh" >&2; exit 1; }
-SMOKE_ROOT="${SMOKE_ROOT:-$(mktemp -d /tmp/dsh-install-smoke.XXXXXX)}"
+# 隔离根目录。**只清理由本脚本自己创建的**:调用方显式传入 SMOKE_ROOT 视为「我要留着看」
+# (release.yml 就用 SMOKE_ROOT=/tmp/pkg-e2e-smoke 复用打包产物),那种情况一律不动。
+SMOKE_ROOT_OWNED=0
+if [ -z "${SMOKE_ROOT:-}" ]; then
+  SMOKE_ROOT="$(mktemp -d /tmp/dsh-install-smoke.XXXXXX)"
+  SMOKE_ROOT_OWNED=1
+fi
 SMOKE_PORT="${SMOKE_PORT:-13980}"
 export DSH_RT_HOME="$SMOKE_ROOT/rt" DSH_RT_STATE="$SMOKE_ROOT/state"
 export DSH_HOME="$SMOKE_ROOT/home" DSH_RT_PORT="$SMOKE_PORT" DSH_INSTALL_NO_AGENT=1
@@ -102,8 +108,24 @@ DSH_INSTALL_NO_WARMUP=1 bash "$INSTALL" >/dev/null 2>&1 || fail "端口冲突测
 
 step "3/5 守护:引导页/自动唤醒/就绪门控/透传"
 export DSH_RT_IDLE_STOP_SECS=3
+# 收尾:按 pid 与按**二进制路径**各收一遍。
+# 只按 pid 不够:`$!` 未必就是最终在 listen 的那个进程(实测偏差 4~15 个 pid,见
+# tests/lib/daemon-helpers.sh:daemon_stop_by_binary 的数据),漏掉的守护要等空闲自停
+# (默认 30s)才消失 —— 在 CI 里就是作业结束时 runner 报 orphan daemon。
+# RT_HOME / SA_RT_HOME 均由 SMOKE_ROOT 派生,路径唯一;sa_teardown 可能尚未定义(本函数在
+# 其之前),故按 type 判定后再调用。
+# **trap 必须先于首次启动守护注册**:否则「启动成功但随后失败」的路径不受保护。
+smoke_teardown() {
+  daemon_stop "${DAEMON_PID:-}" 2>/dev/null || true
+  [ -z "${RT_HOME:-}" ] || daemon_stop_by_binary "$RT_HOME/daemon"
+  [ -z "${SA_RT_HOME:-}" ] || daemon_stop_by_binary "$SA_RT_HOME/daemon"
+  if [ "$(type -t sa_teardown 2>/dev/null || true)" = "function" ]; then
+    sa_teardown
+  fi
+  return 0
+}
+trap smoke_teardown EXIT
 DAEMON_PID="$(daemon_start_foreground "$RT_HOME/daemon" "$SMOKE_ROOT/daemon.log")"
-trap 'daemon_stop "$DAEMON_PID" 2>/dev/null || true' EXIT
 # 梯度探测:前 10 次 500ms(快速启动),10-60 次 1s(正常),60+ 次 2s(慢启动)
 daemon_wait_health "$SMOKE_PORT" any 5 || fail "daemon 未就绪"
 # GET / 返回引导页,同时已自动拉起 dsh(无需引导页 JS 的 /wake 往返)
@@ -203,7 +225,7 @@ sa_teardown() {
   rm -f "$SA_PLIST"
   [ -n "$SA_LISTENER_PID" ] && kill "$SA_LISTENER_PID" 2>/dev/null || true
 }
-trap 'daemon_stop "$DAEMON_PID" 2>/dev/null || true; sa_teardown' EXIT
+# trap 已在第 121 行注册(smoke_teardown 会按 type 判定后调用 sa_teardown),此处不重复注册。
 # launchd GUI 会话可用性必须实测「能否注册 job」,只探「能否读 GUI 域」不够。
 # 实测(受限/沙箱会话):`launchctl print gui/UID` 返回 0,但 bootstrap 被拒——
 #   Bootstrap failed: 5: Input/output error   (rc=5)
@@ -349,4 +371,12 @@ for m in "$SMOKE_ROOT"/*.skipped; do
   echo "  - $(basename "$m" .skipped)"
 done
 
-echo; echo "SMOKE OK (root=$SMOKE_ROOT)"
+# 成功即清理:整个 root 实测约 485MB(内含上游 node + dsh 的完整安装)。失败路径**故意保留**
+# ——`fail()` 直接 exit 1,根本走不到这里,于是现场(daemon.log / *.skipped / 安装产物)原样留
+# 给诊断;这与 install.sh 暖机失败保留 warmup.log 是同一条原则。
+if [ "$SMOKE_ROOT_OWNED" = "1" ]; then
+  echo; echo "SMOKE OK"
+  rm -rf "$SMOKE_ROOT"
+else
+  echo; echo "SMOKE OK (root=$SMOKE_ROOT)"
+fi
