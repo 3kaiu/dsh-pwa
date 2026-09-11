@@ -63,7 +63,13 @@ echo "清理完成:"
 echo "  清理前: ${BEFORE}MB"
 echo "  清理后: ${AFTER}MB"
 if [ "$BEFORE" -gt 0 ]; then
-  echo "  节省空间: ${SAVED}MB ($(awk "BEGIN {printf \"%.1f\", $SAVED*100/$BEFORE}")%)"
+  # 百分比必须先算进变量,再拼进 echo。写成「双引号串内嵌 $( ) 、$( ) 内再用转义双引号」
+  # 在 macOS 自带的 bash 3.2 下会解析错乱:内层 \" 破坏外层引号,echo 收到 2 个参数
+  # (整行被打印两遍),awk 被调用 2 次且程序被截断(两次 syntax error),$( ) 结果为空。
+  # 实测 CI 输出「节省空间: 62MB (%)   节省空间: 62MB (%)」;shellcheck 不报此形状,
+  # 命令替换的非零退出也不会影响 echo 的退出码,故 set -e 同样拦不住(静默)。
+  SAVED_PCT="$(awk "BEGIN {printf \"%.1f\", $SAVED*100/$BEFORE}")"
+  echo "  节省空间: ${SAVED}MB (${SAVED_PCT}%)"
 else
   echo "  节省空间: ${SAVED}MB"   # BEFORE=0 时不做百分比(除零)
 fi
