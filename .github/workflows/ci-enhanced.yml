@@ -19,7 +19,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: 编译守护进程 (universal binary)
         run: |
@@ -61,7 +61,7 @@ jobs:
     # 任何一步卡住都会白烧 6 小时 runner。本 job 实测约 17s,15min 已是两个数量级余量。
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Shellcheck (Bash 脚本检查,门禁)
         run: |
@@ -86,7 +86,7 @@ jobs:
           echo "✓ clang 静态分析零告警"
 
       - name: 上传分析结果
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: static-analysis
@@ -98,7 +98,7 @@ jobs:
     # 同上:本 job 含 brew install hyperfine + 基准运行,实测约 18s;20min 足够且封顶。
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: 安装依赖
         run: brew install hyperfine
@@ -140,7 +140,7 @@ jobs:
           fi
 
       - name: 上传基准结果
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: performance-benchmark
@@ -152,7 +152,7 @@ jobs:
     # 同上:本 job 仅编译 + otool/nm 分析,实测约 10s。
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: 编译守护进程
         run: |

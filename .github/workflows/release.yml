@@ -15,7 +15,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: 编译守护(universal binary,ad-hoc 签名)
         run: clang -O2 -Wall -Wextra -arch arm64 -arch x86_64 -o /tmp/daemon src/daemon.c && codesign --force -s - /tmp/daemon
       - name: 生成 pnpm-lock.yaml(预解析依赖树,用户安装跳解析省时;与 install.sh 同配置)
