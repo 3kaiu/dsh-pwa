@@ -101,6 +101,23 @@ node ~/.workbuddy-ai/skills/ci-gate-hardening/scripts/check_run_blocks.mjs .gith
         bootstrap 一次，同样 rc=5 即说明是上下文问题而非 plist 问题（`plutil -lint` 也会 OK）。
         判据：`TERM_SESSION_ID`/`XPC_SERVICE_NAME` 未设置即非 Aqua 会话；**禁用沙箱也一样**，
         别指望 `dangerouslyDisableSandbox` 绕过。用户必须在自己 Terminal 里执行。
+18. **审计报告是快照，不是现状；当待办用之前必须逐条验证**。`docs/` 下的审计文档写的是
+    落笔那一刻的代码，行号与片段都会漂。本轮实例：`docs/DEEP_AUDIT_2026-09-11.md` 的
+    **S1(P0)** 称 `install.sh` 的 SHA-256 校验恒失败，但该问题早在 **近 5 小时前**的
+    `e55263d` 就修好了，我却在 `f4caaf7` 入库时照抄成「S1(P0) 未修」，把一条已失效的
+    P0 继续当待办传播。**验证手法：`git log -S '<关键代码片段>' -- <文件>` 直接定位
+    修复提交；或对结论里的行号 `git blame`。** 一条命令的成本，换掉一次误报。
+19. **「复刻验证」必须连上下文一起复刻**（cwd、文件相对名、目录里还有哪些文件）。
+    本轮复刻 S1 时我第一版写 `shasum -a 256 "$W/dsh-pwa.zip"` —— 绝对路径被写进清单，
+    且源文件仍在原处，于是**旧的有 bug 实现居然 rc=0**，差点据此得出「审计报告是错的」。
+    第二次严格按 `release.yml:73-74`（`cd` 到打包目录 + 相对名 `dsh-pwa.zip`）才复现出
+    `dsh-pwa.zip: No such file or directory` / rc=1。**只复刻命令、不复刻目录状态 = 假验证。**
+20. **`gh release create` 成功 ≠ 资产可下载**。实测（2026-09-12）：v0.3.1 的 Release
+    workflow 结论 success、日志打印了 release URL，但事后 `gh api .../releases` 为 **0**、
+    `releases/download/v0.3.1/dsh-pwa.zip` **404**（`releases/tag/v0.3.1` 仍是 200 ——
+    那只是 tag 页面，**不能用来判断 release 是否存在**）。仓库 CI 当时**没有任何一步**会去
+    下载自己发的资产。已给 `release.yml` 补「发布后三方比对哈希」的门禁。判据要同时看
+    `gh api repos/<o>/<r>/releases` 与 `api .../releases/tags/<tag>`，别只看网页 200。
 
 ## daemon 安全模型（勿回退）
 - CSRF：Origin / Host 头**精确匹配**，防跨站与 DNS rebinding。
