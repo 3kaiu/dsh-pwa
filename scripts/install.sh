@@ -42,9 +42,19 @@ if [ ! -f "$ROOT/src/daemon.c" ] && [ ! -f "$ROOT/daemon.c" ] && [ ! -f "$ROOT/d
   curl -fsSL --max-time 60 -o "$PKG_TMP/pkg.zip.sha256" "$SHA_URL" 2>/dev/null \
     || { warn "SHA256 校验文件缺失,发行包完整性无法验证"; rm -f "$PKG_TMP/pkg.zip"; exit 1; }
   
-  # 校验 fail-closed:不通过则中止
-  ( cd "$PKG_TMP" && shasum -a 256 -c pkg.zip.sha256 >/dev/null 2>&1 ) \
-    || { warn "发行包 SHA-256 校验失败"; rm -rf "$PKG_TMP"; exit 1; }
+  # 校验 fail-closed:不通过则中止。
+  # 直接比对哈希,而不是 `shasum -a 256 -c pkg.zip.sha256`:后者按清单里记录的**文件名**
+  # 找文件,而生成端(.github/workflows/release.yml:74)记录的资产名是 dsh-pwa.zip、
+  # 校验端下载名是 pkg.zip → shasum 报 "dsh-pwa.zip: No such file or directory" 并 rc=1,
+  # 恒落入本分支,curl|bash 安装 100% 中断(已按 release.yml 生成端忠实复现实测)。
+  # 比对哈希可永久消除「两侧文件名必须一致」这一隐式契约,且对清单格式(裸哈希/带文件名/
+  # 二进制模式 *name)与本地命名都不敏感。
+  EXPECTED_SHA="$(awk 'NF {print $1; exit}' "$PKG_TMP/pkg.zip.sha256" 2>/dev/null || true)"
+  ACTUAL_SHA="$(shasum -a 256 "$PKG_TMP/pkg.zip" 2>/dev/null | awk '{print $1}' || true)"
+  if [ -z "$EXPECTED_SHA" ] || [ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]; then
+    warn "发行包 SHA-256 校验失败(清单期望 ${EXPECTED_SHA:-<空>},实际下载 ${ACTUAL_SHA:-<空>})"
+    rm -rf "$PKG_TMP"; exit 1
+  fi
   
   KB="$(awk -v n="$(stat -f%z "$PKG_TMP/pkg.zip")" 'BEGIN{printf "%.1f", n/1024}')"
   ( cd "$PKG_TMP" && unzip -q pkg.zip )
