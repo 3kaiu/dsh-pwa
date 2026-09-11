@@ -135,7 +135,15 @@ if ps -ax -o command >/dev/null 2>&1; then
   [ "$n" = "1" ] || fail "并发双 /wake 产生了 $n 个 dsh 实例(应为 1,孤儿泄漏)"
   echo "OK: 恰 1 个 dsh 实例(无孤儿)"
 else
-  echo "  (ps 不可用,跳过进程计数检查)"
+  # ps 不可用(受限/沙箱会话:实测 rc=126 "Operation not permitted" 且无输出)→ 孤儿断言
+  # 无法执行。绝不静默假装通过:与第 5 步同约定,显式 [SKIP] + 状态文件。否则本步只留一行
+  # 括号提示,而结尾照样打印 SMOKE OK,读者会把它读成「全部断言都跑过」——
+  # 这正是「委托外部 helper 的门禁退化成 no-op」那一类。
+  echo "[SKIP] 并发孤儿检查(ps 不可用:无法统计 dsh 实例数)"
+  touch "$SMOKE_ROOT/orphan-count.skipped"
+  if [ -n "${GITHUB_ACTIONS:-}" ]; then
+    echo "::notice title=orphan count::ps 不可用,并发孤儿检查已跳过(其余冒烟项真实执行);标记文件 $SMOKE_ROOT/orphan-count.skipped"
+  fi
 fi
 
 # P2-8: 验证 token 相关日志(未来 dsh 再改鉴权能早发现)
@@ -283,5 +291,18 @@ else
     echo "::notice title=socket activation::无 GUI 会话,SA 端到端测试已跳过(其余冒烟项真实执行);标记文件 $SMOKE_ROOT/socket-activation.skipped"
   fi
 fi
+
+# 收尾:集中列出本环境跳过的检查。SMOKE OK 只代表「已执行的断言全过」,
+# 不等于「全部断言都执行过」;不列出来,这两件事在输出里无法区分。
+skipped_any=0
+for m in "$SMOKE_ROOT"/*.skipped; do
+  [ -e "$m" ] || continue
+  if [ "$skipped_any" = 0 ]; then
+    echo
+    echo "跳过项(本环境未执行,不在 SMOKE OK 的断言范围内):"
+    skipped_any=1
+  fi
+  echo "  - $(basename "$m" .skipped)"
+done
 
 echo; echo "SMOKE OK (root=$SMOKE_ROOT)"
