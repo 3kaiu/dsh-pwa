@@ -72,6 +72,23 @@ jobs:
           cp launchd/com.dshpwa.updater.plist /tmp/pkg/launchd/
           cd /tmp/pkg && zip -qr dsh-pwa.zip .
           shasum -a 256 dsh-pwa.zip > dsh-pwa.zip.sha256
+      - name: 发行包端到端门禁(解压真实产物 → 用包内 install.sh 跑完整冒烟)
+        # 深层审计 A1:上面的冒烟只跑仓库源码树,而发行包解压后的真实布局
+        # (包根 install.sh + 预编译 daemon,无 src/daemon.c)从未被安装过 —— 这正是
+        # 「SHA-256 清单文件名不匹配致 curl|bash 恒失败」能长期存活的根因。
+        # 本步骤验证「发出去的东西」能装能跑,失败即阻断发布。
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/pkg-e2e /tmp/pkg-e2e-smoke
+          mkdir -p /tmp/pkg-e2e
+          ( cd /tmp/pkg-e2e && unzip -q /tmp/pkg/dsh-pwa.zip )
+          [ -f /tmp/pkg-e2e/install.sh ] || { echo "::error::发行包内缺少 install.sh"; exit 1; }
+          [ -f /tmp/pkg-e2e/daemon ] || { echo "::error::发行包内缺少预编译 daemon"; exit 1; }
+          # 用包内 install.sh(而非仓库 scripts/install.sh)跑完整冒烟:
+          # install → 守护 → 唤醒 → 透传 → 空闲自停。SMOKE_ROOT/SMOKE_PORT 隔离,
+          # 避免与上一步冒烟互相污染。
+          SMOKE_ROOT=/tmp/pkg-e2e-smoke SMOKE_PORT=13981 \
+            bash scripts/smoke-test.sh /tmp/pkg-e2e/install.sh
       - name: 发布到 GitHub Releases(下载链接)
         env:
           GH_TOKEN: ${{ github.token }}
