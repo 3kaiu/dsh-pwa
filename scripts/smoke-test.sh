@@ -161,8 +161,35 @@ sa_teardown() {
   [ -n "$SA_LISTENER_PID" ] && kill "$SA_LISTENER_PID" 2>/dev/null || true
 }
 trap 'daemon_stop "$DAEMON_PID" 2>/dev/null || true; sa_teardown' EXIT
-if [ -d "$HOME/Library/LaunchAgents" ] && [ -w "$HOME/Library/LaunchAgents" ] \
-   && launchctl print "gui/$(id -u)" >/dev/null 2>&1; then
+# launchd GUI 会话可用性必须实测「能否注册 job」,只探「能否读 GUI 域」不够。
+# 实测(受限/沙箱会话):`launchctl print gui/UID` 返回 0,但 bootstrap 被拒——
+#   Bootstrap failed: 5: Input/output error   (rc=5)
+# 此时若径直进入 SA 分支,第 5 步会把「环境限制」报成产品 FAIL(实测 exit 1),
+# 与下方「无 GUI 会话应显式 SKIP、不返回非零」的约定相悖,也让本地 gauntlet 失真。
+# 探针用唯一 label 注册一个 no-op job 再立即 bootout,不残留任何状态。
+launchd_gui_usable() {
+  [ -d "$HOME/Library/LaunchAgents" ] && [ -w "$HOME/Library/LaunchAgents" ] || return 1
+  launchctl print "gui/$(id -u)" >/dev/null 2>&1 || return 1
+  local d plist label="com.dshpwa.probe.$$"
+  d="$(mktemp -d)" || return 1
+  plist="$d/probe.plist"
+  {
+    printf '%s\n' \
+      '<?xml version="1.0" encoding="UTF-8"?>' \
+      '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+      '<plist version="1.0"><dict>'
+    printf '<key>Label</key><string>%s</string>\n' "$label"
+    printf '%s\n' '<key>ProgramArguments</key><array><string>/usr/bin/true</string></array>' '</dict></plist>'
+  } > "$plist"
+  if launchctl bootstrap "gui/$(id -u)" "$plist" >/dev/null 2>&1; then
+    launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || true
+    rm -rf "$d"
+    return 0
+  fi
+  rm -rf "$d"
+  return 1
+}
+if launchd_gui_usable; then
   sa_teardown  # 清掉上次失败运行的残留 job
   mkdir -p "$SA_RT_HOME" "$SA_LOG_DIR"
   # 等前台守护(上一步)完全退出,避免干扰进程断言
@@ -247,9 +274,10 @@ PY
   echo "OK: socket activation 端到端通过(激活 → 自退 → 再激活 → 空闲自退)"
   sa_teardown
 else
-  # 无 GUI launchd 会话(如 CI runner):显式 SKIP + 状态文件,绝不静默假装通过。
-  # 不返回非零:release 前置冒烟在无 GUI runner 上也应继续打包,靠 [SKIP] 与状态文件可见。
-  echo "[SKIP] socket activation(无 GUI 会话:~/Library/LaunchAgents 不可写或无 launchd GUI 会话)"
+  # 无可用 GUI launchd 会话(CI runner,或受限/沙箱会话拒绝 bootstrap):显式 SKIP + 状态文件,
+  # 绝不静默假装通过。不返回非零:release 前置冒烟在无 GUI runner 上也应继续打包,
+  # 靠 [SKIP] 与状态文件可见。
+  echo "[SKIP] socket activation(无可用 GUI 会话:~/Library/LaunchAgents 不可写、无 launchd GUI 会话,或 bootstrap 被会话限制拒绝)"
   touch "$SMOKE_ROOT/socket-activation.skipped"
   if [ -n "${GITHUB_ACTIONS:-}" ]; then
     echo "::notice title=socket activation::无 GUI 会话,SA 端到端测试已跳过(其余冒烟项真实执行);标记文件 $SMOKE_ROOT/socket-activation.skipped"
