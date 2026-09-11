@@ -230,6 +230,11 @@ static void note_hint(void) { fast_hint_m = mono_now(); }
 static time_t last_spawn_time = 0;
 static int spawn_failure_count = 0;
 static time_t cooldown_until = 0; // 崩溃冷却截止(非阻塞:到期前拒绝拉起,主循环照常服务引导页)
+// token 扫描期限:必须锚定「dsh 就绪」而非「spawn」。token 是 dsh 打印在它自己启动之后
+// (实测:就绪后 0.4s 内),而实测本机 dsh 冷启动到就绪需 ~115s —— 原实现只按 spawn+120s
+// 扫描,余量仅数秒,再慢一点(负载高/慢机)token 就被永久错过:引导页永远等不到 token,
+// 只能裸 reload 吃 401,用户侧表现为 PWA 打不开。故就绪时重设本期限,与 spawn+120s 取较大者。
+static time_t token_scan_deadline = 0;
 
 // 更新期被丢弃的唤醒:update_locked() 拒绝 spawn 时置位,主循环在锁释放后自行重试。
 // 为什么重试责任在服务端(而不是等客户端再发一次 /wake):
@@ -365,7 +370,7 @@ static void request_wake(void) {
 // 透传字节流保持原样,dsh 自身 cookie 会话不受影响;旧版 dsh 无 token 时回落为纯 reload。
 static char dsh_token[64];
 static long token_scan_off = 0;
-static void reset_token(void) { dsh_token[0] = 0; token_scan_off = 0; }
+static void reset_token(void) { dsh_token[0] = 0; token_scan_off = 0; token_scan_deadline = 0; }
 static void scan_token(void) {
   if (dsh_token[0]) return;
   int fd = open(LOG_FILE, O_RDONLY);
@@ -1120,9 +1125,13 @@ int main(void) {
       fprintf(stderr, "daemon: 空闲且未运行 dsh,自退(launchd 将接管 socket)\n");
       exit(0);
     }
-    // dsh 0.1.5+ 启动 token 扫描:dsh 在跑(本进程 spawn 或重启收养)且未捕获时增量扫日志
-    // (最多追 120s:再晚说明是旧版无 token 机制,放弃以免整场空扫;收养场景窗口从守护启动算起)
-    if (!dsh_token[0] && dsh_port > 0 && time(NULL) - last_spawn_time < 120) scan_token();
+    // dsh 0.1.5+ 启动 token 扫描:dsh 在跑(本进程 spawn 或重启收养)且未捕获时增量扫日志。
+    // 期限取 spawn+120s 与 就绪+120s 的较大者:前者覆盖「未就绪就打印 token」的旧式输出,
+    // 后者覆盖慢启动(否则慢机上 token 会被永久错过)。到期仍无 token 才判定为旧版无 token
+    // 机制而放弃,避免整场空扫。
+    time_t scan_limit = last_spawn_time + 120;
+    if (token_scan_deadline > scan_limit) scan_limit = token_scan_deadline;
+    if (!dsh_token[0] && dsh_port > 0 && time(NULL) < scan_limit) scan_token();
     // 就绪推进放主进程:dsh 每次启动只在这里探测成功一次,ready_port 经 fork 传给所有连接子进程
     // (否则每个连接子进程都会各自探一次,透传期每个请求白白多一次完整 GET /)
     if (dsh_port > 0 && ready_port != dsh_port && dsh_up() && http_probe(dsh_port)) {
@@ -1130,6 +1139,9 @@ int main(void) {
       // dsh 0.1.5+ 打印 token 可能略晚于 HTTP 监听,该窗口内 /health 报 dsh:true 但省略
       // token 字段,由引导页 JS 负责等 token 出来再握手(连续 ~3s 仍无 token 才按旧版直接 reload)。
       ready_port = dsh_port;
+      // 就绪后重新起算 token 扫描期限:token 只在就绪之后才打印,期限锚定就绪时刻,
+      // 才不会把整个扫描窗口耗在「等 dsh 启动」上(实测余量仅数秒)。
+      token_scan_deadline = time(NULL) + 120;
     }
     // 更新期被丢弃的唤醒自愈:锁释放后由主循环自行重试,不依赖客户端再发请求(1s 节流)。
     // 这里位于 poll() 之前,故即使完全无连接也会按 poll_ms(空闲 1s)推进,不会永久卡住。

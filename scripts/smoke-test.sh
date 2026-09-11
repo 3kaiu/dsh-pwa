@@ -86,10 +86,13 @@ echo "$h" | grep -q '"dsh":false' || fail "dsh 刚拉起时尚未就绪,health �
 daemon_wait_health "$SMOKE_PORT" true 300 1 || fail "自动唤醒后 dsh 未就绪"
 # dsh 0.1.5+ 强制 token 鉴权:URL 带 token 换 cookie 后透传才 200(老版本无 token 则直接透传)
 # 新行为:就绪判定只看 HTTP 探测(不再等 2s token 宽限),/health 可能先报 dsh:true、
-# token 字段稍后才随响应出现 → 轮询等「日志 token」与「/health token」汇合(10s 上限;
-# 未汇合且日志也无 token 则按旧版无 token 路径继续)
+# token 字段稍后才随响应出现 → 轮询等「日志 token」与「/health token」汇合;
+# 未汇合且日志也无 token 则按旧版无 token 路径继续。
+# 窗口必须 ≥ 守护自身的扫描期限(daemon.c:1125 为 120s),否则守护还在耐心等 token、
+# 测试却已判失败。实测:同一发行产物用 10s 窗口会间歇性失败(重跑即过)——而 flaky gate
+# 与坏 gate 无法区分,故取 120s 与守护对齐。真缺陷(永不捕获)仍会在 120s 后失败。
 TOKEN=""
-for _ in $(seq 1 20); do
+for _ in $(seq 1 240); do
   T="$(grep -o 'token=[A-Za-z0-9_-]*' "$RT_STATE/logs/dsh.log" 2>/dev/null | head -1 | cut -d= -f2 || true)"
   if [ -n "$T" ] && curl -fsS --max-time 5 --noproxy '*' "http://127.0.0.1:$SMOKE_PORT/health" | grep -q "\"token\":\"$T\""; then
     TOKEN="$T"; break
