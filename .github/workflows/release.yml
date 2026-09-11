@@ -99,3 +99,41 @@ jobs:
             --title "dsh-pwa $TAG" \
             --notes-file "$GITHUB_WORKSPACE/.github/RELEASE_NOTES.md" \
             || gh release upload "$TAG" /tmp/pkg/dsh-pwa.zip /tmp/pkg/dsh-pwa.zip.sha256 --repo "$GITHUB_REPOSITORY" --clobber
+      - name: 校验发布资产真的可下载(install 路径的真实依赖)
+        # 深层审计 S1 的教训:校验逻辑再正确,只要 release 资产取不到,`curl|bash` 就是死的。
+        # 实测(2026-09-12):v0.3.1 的「发布」步骤结论是 success、日志也打印了 release URL,
+        # 但事后 `gh api .../releases` 为 0、`releases/download/v0.3.1/dsh-pwa.zip` 404 ——
+        # 发布成功 ≠ 资产可用,而 CI 里没有任何一步会去下载它。本步骤补上这个缺口:
+        # 下载「用户实际会拿到的那份」,与本次构建产物比对哈希,不一致即让 Release 变红。
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          OK=0
+          for i in 1 2 3 4 5; do
+            # 资产上传后 CDN 生效有秒级延迟:重试而非直接判死(避免把传播延迟报成缺陷)
+            if curl -fsSL --max-time 60 -o /tmp/dl.zip "$BASE/dsh-pwa.zip" \
+               && curl -fsSL --max-time 60 -o /tmp/dl.zip.sha256 "$BASE/dsh-pwa.zip.sha256"; then
+              OK=1
+              break
+            fi
+            echo "第 ${i} 次取资产失败,5s 后重试…"
+            sleep 5
+          done
+          if [ "$OK" != "1" ]; then
+            echo "::error::发布资产不可下载:${BASE}/dsh-pwa.zip —— curl|bash 安装已失效"
+            exit 1
+          fi
+          EXPECTED="$(awk 'NF {print $1; exit}' /tmp/dl.zip.sha256)"
+          ACTUAL="$(shasum -a 256 /tmp/dl.zip | awk '{print $1}')"
+          if [ -z "$EXPECTED" ] || [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "::error::下载到的资产与清单哈希不符(期望 ${EXPECTED:-<空>},实际 ${ACTUAL})"
+            exit 1
+          fi
+          LOCAL="$(shasum -a 256 /tmp/pkg/dsh-pwa.zip | awk '{print $1}')"
+          if [ "$EXPECTED" != "$LOCAL" ]; then
+            echo "::error::线上资产与本次构建产物不一致(线上 ${EXPECTED},本地 ${LOCAL})"
+            exit 1
+          fi
+          echo "✓ 发布资产可下载且与构建产物哈希一致(${EXPECTED})"
