@@ -486,10 +486,16 @@ elif [ -x "$RT_HOME/daemon" ] && [ -n "$NODE_BIN" ] && [ -n "$DSH_BIN" ]; then
       fi
       sleep 0.5
     done
+    # 收尾:无论就绪与否都先优雅停止 dsh。
+    # 旧实现只在成功分支发 /stop;失败分支直接 kill 守护,而 dsh 是守护经 setsid 自成的
+    # 进程组(daemon.c:339),父进程被硬杀后它会**孤儿化**并继续监听端口、常驻内存
+    # (实测泄漏过 5 个:守护早已自退,dsh 仍在 127.0.0.1 上 LISTEN)。故两分支都发。
+    # 先记 pid 再 /stop —— 守护停止 dsh 后会 unlink dsh.pid,那时就读不到了。
+    WARM_DSH_PID="$(cat "$RT_STATE/dsh.pid" 2>/dev/null || true)"
+    case "$WARM_DSH_PID" in ''|*[!0-9]*) WARM_DSH_PID="" ;; esac
+    curl -fsS --max-time 3 --noproxy '*' -X POST -H "Origin: $WARM_ORIGIN" "$WARM_ORIGIN/stop" >/dev/null 2>&1 || true
+    sleep 1
     if [ "$WARM_READY" = "1" ]; then
-      # 优雅停止 dsh
-      curl -fsS --max-time 3 --noproxy '*' -X POST -H "Origin: $WARM_ORIGIN" "$WARM_ORIGIN/stop" >/dev/null 2>&1 || true
-      sleep 1
       WARM_CACHE_FILES=0
       if [ -d "$WARM_CACHE_DIR" ]; then
         WARM_CACHE_FILES="$(find "$WARM_CACHE_DIR" -type f 2>/dev/null | wc -l | tr -d ' ' || true)"
@@ -517,6 +523,19 @@ elif [ -x "$RT_HOME/daemon" ] && [ -n "$NODE_BIN" ] && [ -n "$DSH_BIN" ]; then
     # 清理:无论暖机是否成功,都 kill 守护前台进程
     kill "$WDPID" 2>/dev/null || true
     wait "$WDPID" 2>/dev/null || true
+    # 兜底:守护被硬杀时 dsh 可能还活着 —— 失败分支的 /stop 未必生效(dsh 根本没起来时
+    # 无人应答),而 dsh 因 setsid 不在守护的进程组里,不会随守护一起死。
+    # 用**负 PID 打整组**,与守护自身的停止逻辑一致(daemon.c:469:负 PID 整组发信号,
+    # 防 node + pty 子进程残留)。仅在 pid 仍存活时才动手;此处距 spawn 仅 1~2s,
+    # pid 复用概率可忽略。
+    if [ -n "$WARM_DSH_PID" ] && [ "$WARM_DSH_PID" -gt 1 ] && [ "$WARM_DSH_PID" != "$$" ] \
+       && kill -0 "$WARM_DSH_PID" 2>/dev/null; then
+      kill -TERM -- "-$WARM_DSH_PID" 2>/dev/null || kill -TERM "$WARM_DSH_PID" 2>/dev/null || true
+      sleep 1
+      if kill -0 "$WARM_DSH_PID" 2>/dev/null; then
+        kill -9 -- "-$WARM_DSH_PID" 2>/dev/null || kill -9 "$WARM_DSH_PID" 2>/dev/null || true
+      fi
+    fi
     rm -f /tmp/dsh-warmup.log
     # 暖机实例已停:清掉它写下的状态(dsh.json/dsh.pid),否则会留下指向已死 dsh 的
     # 残留状态,干扰随后由 LaunchAgent 拉起的真实守护。
