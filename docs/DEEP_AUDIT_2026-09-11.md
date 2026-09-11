@@ -23,6 +23,87 @@
 
 ---
 
+## 一之二、审计后修正（2026-09-12 复核）
+
+> 本节由事后复核追加。**上面正文是 2026-09-11 的快照，未随代码演进更新**；
+> 凡与本节冲突处，以本节为准。追加原因：本报告在 `f4caaf7` 入库时，
+> 正文的 S1 已被 `e55263d` 修掉近 5 小时，但入库时未复核，导致一条**已失效的 P0**
+> 被继续当作待办传播（`f4caaf7` 的提交信息亦误写「S1(P0) 未修」）。
+
+| 条目 | 正文结论 | 实际状态 | 证据 |
+|---|---|---|---|
+| **S1**（P0，SHA-256 恒失败） | 未修 | ✅ **已修**（`e55263d`，2026-09-11 19:16） | 见下方复核实测 |
+| **A1**（产物未被端到端验证） | 未修 | ✅ **已修**（`884891f`，`release.yml` 增加「解压真实产物跑完整冒烟」） | `release.yml` 打包后 e2e 步骤 |
+| **C4**（curl 门禁不校验 `--noproxy`） | 未修 | ✅ 已修（`a81d15b`） | `install-validation.bats` |
+| **C1**（`cleanup-deps.sh` 百分比恒空） | — | ✅ 已修（`11b4cdb`，bash 3.2 嵌套引号） | 实机输出 `节省空间: 0MB (0.0%)` |
+| 第 1 批第 3 项（**0 个 release**） | 需打 tag | ❌ **仍未解决 —— 这才是当前唯一真实的 P0** | 见下方「S1 之后的真正阻断」 |
+
+### S1 复核实测（2026-09-12）
+
+`install.sh:45-57` 现为**直接比对哈希**，不再用 `shasum -c`。按 `release.yml:73-74`
+的生成端忠实复刻（cwd=打包目录、相对文件名 `dsh-pwa.zip`）后实测：
+
+```
+生成端清单:  02bdc580…5726  dsh-pwa.zip
+校验端目录:  pkg.zip  pkg.zip.sha256
+
+旧实现 shasum -a 256 -c pkg.zip.sha256
+  shasum: dsh-pwa.zip: No such file or directory
+  dsh-pwa.zip: FAILED open or read
+  rc=1                        ← 正文的复现成立
+
+新实现(裸比对哈希)
+  期望=02bdc580…5726  实际=02bdc580…5726
+  rc=0 ✅ 通过(与文件名无关)
+```
+
+且新实现对清单格式**不敏感**，三种写法均可：`<hash>  name`（当前生成端）、
+`<hash>`（裸哈希）、`<hash> *name`（GNU 二进制模式）。篡改追加一个字节后哈希改变、
+fail-closed 分支正常触发。**S1 可以关闭。**
+
+### S1 之后的真正阻断：`releases/latest` 是 404
+
+修好校验后 `curl | bash` **仍然装不上**，但失败点前移到了**下载步**：
+
+```
+gh api repos/3kaiu/dsh-pwa/releases --jq length   →  0
+远端 tag: 16 个（v0.3.0 / v0.3.1 / v0.3.2 …）
+
+releases/latest/download/dsh-pwa.zip                 → 404
+releases/next/download/dsh-pwa.zip                   → 404
+releases/download/v0.3.1/dsh-pwa.zip                 → 404
+releases/download/v0.3.1/dsh-pwa.zip.sha256          → 404
+releases/tag/v0.3.1                                  → 200  ← 只是 tag 页面，非 release
+api.github.com/repos/3kaiu/dsh-pwa/releases/tags/v0.3.1 → 404
+```
+
+**release 曾经存在过，后来消失了。** 证据链：
+
+1. Release workflow 运行 `32546682958`（`event=push`，tag `v0.3.1`，sha `4cd66a6`）
+   属于 `3kaiu/dsh-pwa`，其「发布到 GitHub Releases」步骤结论是 **success**；
+2. 该步骤日志明确打印了 `https://github.com/3kaiu/dsh-pwa/releases/tag/v0.3.1`
+   —— 即 `gh release create` 真的创建成功了（若失败会走 `||` 的 `gh release upload` 分支，
+   日志中未见）；
+3. 而现在该仓库的 release 列表是 **0**。
+
+删除者与时间无法从现有数据判定（仓库 events API 只覆盖最近 100 条事件，个人仓库无审计日志）。
+**但修复动作与原因无关**：只要重新产出一次 release（`workflow_dispatch` 触发
+`release.yml`，或推一个新 `v*` tag），`curl | bash` 即可打通。
+
+**新的门禁缺口（建议）**：`884891f` 补上了「产物端到端」，但**没有任何测试验证
+「release 资产真的可下载」**——CI 从不访问 `releases/*/download/*`。
+一条极便宜的守护即可堵住这类静默失效：
+
+```yaml
+# 定时(如每日)或 ci-enhanced 的可选 job
+- run: |
+    curl -fsSL --max-time 30 -o /dev/null \
+      https://github.com/3kaiu/dsh-pwa/releases/latest/download/dsh-pwa.zip \
+      || { echo "::error::latest release 资产不可下载 —— curl|bash 已失效"; exit 1; }
+```
+
+---
+
 ## 二、严重度定义
 
 | 等级 | 含义 |
@@ -37,6 +118,9 @@
 ## 三、P0 — 阻断级
 
 ### S1. 发行包 SHA-256 校验恒失败，`curl | bash` 安装 100% 失败
+
+> **状态：✅ 已修复（`e55263d`，2026-09-11 19:16）。** 以下为问题发现时的原始记录，
+> 保留以说明复现方法。修复方式为「直接比对哈希」，复核见 §一之二。
 
 **位置:** `scripts/install.sh:40-47`（校验端） + `.github/workflows/release.yml:74`（生成端）
 
@@ -354,11 +438,16 @@ drwx------  /Users/seeu/.local/state/dsh-runtime          ← 目录 0700 ✓
 
 ### 第 1 批 — 立即（阻断主流程）
 
-| # | 项 | 位置 | 工作量 |
-|---|---|---|---|
-| 1 | **修 SHA-256 文件名不匹配**（S1） | `install.sh:40-47` 或 `release.yml:74` | 极小 |
-| 2 | **补"发行包端到端安装"门禁**（A1）——否则 1 会再犯 | `release.yml` + 复用 `smoke-test.sh` | 小 |
-| 3 | 打通首个 release（当前 0 个，`curl\|bash` 必然 404） | 打 tag 走 `release.yml` | 小 |
+> **状态（2026-09-12 复核）**：第 1、2 项**已完成**（`e55263d` / `884891f`）；
+> **第 3 项仍未解决，且已升级为本仓库当前唯一真实的 P0** ——
+> 校验修好之后，`curl | bash` 的失败点前移到了下载步（`releases/latest` → 404）。
+> 详见 §一之二。
+
+| # | 项 | 位置 | 工作量 | 状态 |
+|---|---|---|---|---|
+| 1 | **修 SHA-256 文件名不匹配**（S1） | `install.sh:40-47` 或 `release.yml:74` | 极小 | ✅ `e55263d` |
+| 2 | **补"发行包端到端安装"门禁**（A1）——否则 1 会再犯 | `release.yml` + 复用 `smoke-test.sh` | 小 | ✅ `884891f` |
+| 3 | 打通首个 release（当前 0 个，`curl\|bash` 必然 404） | 打 tag 走 `release.yml` | 小 | ❌ **未解决（当前 P0）** |
 
 ### 第 2 批 — 本周（可靠性）
 
