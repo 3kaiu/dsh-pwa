@@ -10,6 +10,10 @@ SMOKE_ROOT="${SMOKE_ROOT:-$(mktemp -d /tmp/dsh-install-smoke.XXXXXX)}"
 SMOKE_PORT="${SMOKE_PORT:-13980}"
 export DSH_RT_HOME="$SMOKE_ROOT/rt" DSH_RT_STATE="$SMOKE_ROOT/state"
 export DSH_HOME="$SMOKE_ROOT/home" DSH_RT_PORT="$SMOKE_PORT" DSH_INSTALL_NO_AGENT=1
+# 暖机预算(秒):本套件紧随其后的 3/5 步实测 dsh 数秒即就绪,25s 已是一个数量级余量。
+# 而暖机自身出问题时,4 次 install × 默认 60s 会把 job 拖长 ~4m40s(实测 run 34631617230)。
+# 真缺陷仍会超时并留下 warmup.failed,不会被这个更短的预算掩盖。
+export DSH_RT_WARMUP_TIMEOUT_SECS="${DSH_RT_WARMUP_TIMEOUT_SECS:-25}"
 RT_HOME="$DSH_RT_HOME"; RT_STATE="$DSH_RT_STATE"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 step() { echo; echo "== $* =="; }
@@ -36,7 +40,28 @@ grep -q '"dsh"' "$SMOKE_ROOT/rt/run.json" || fail "run.json 缺 dsh"
 [ "$(stat -f %Lp "$RT_STATE")" = "700" ] || fail "RT_STATE 权限 $(stat -f %Lp "$RT_STATE"),应为 700"
 [ "$(stat -f %Lp "$RT_STATE/logs")" = "700" ] || fail "logs 目录权限 $(stat -f %Lp "$RT_STATE/logs"),应为 700"
 
-step "2/5 幂等重跑(已装同版应秒过)"
+# 暖机必须「跑过并表态」:warmup.ok / warmup.failed / warmup.skipped 恰有其一。
+# 断言的是**存在性**(liveness)而非成功——暖机是尽力而为(失败不阻断安装),但
+# **静默失败**不可接受:实测 run 34631617230 中暖机 4/4 次全部超时,而本套件照样打印
+# SMOKE OK、CI 全绿,因为当时没有任何断言提到暖机(全仓库 grep 0 命中)。缺了这条,
+# 「绿」会被读成「暖机可用」。真缺陷(永不就绪)仍会走 failed 分支并在收尾被点名。
+warm_marks=0
+for _m in warmup.ok warmup.failed warmup.skipped; do
+  [ -f "$RT_STATE/$_m" ] && warm_marks=$((warm_marks + 1))
+done
+[ "$warm_marks" -eq 1 ] || fail "暖机未留下唯一状态标记(期望恰 1 个,实得 $warm_marks;查 $RT_STATE/warmup.*)"
+# 立刻固化第 1 步的结论:后面的 install(2b、冲突后重装)会覆写 marker,
+# 收尾汇总必须引用第 1 步的结果,否则「本次冒烟测的暖机」会被后来的重装顶替。
+if [ -f "$RT_STATE/warmup.ok" ]; then
+  WARM_STATUS="ok: $(cat "$RT_STATE/warmup.ok")"
+elif [ -f "$RT_STATE/warmup.failed" ]; then
+  WARM_STATUS="FAILED: $(cat "$RT_STATE/warmup.failed")"
+  echo "  [WARN] 暖机未完成 —— 安装不受影响,但首次启动不会预热"
+else
+  WARM_STATUS="skipped: $(cat "$RT_STATE/warmup.skipped")"
+fi
+
+step "2/5 幂等重跑(已装同版,重入应成功且不破坏既有安装)"
 time bash "$INSTALL" || fail "重跑 install"
 
 step "2b/5 端口被占时 install 应显式失败(而非静默失效)"
@@ -55,18 +80,25 @@ while True:
     c.close()
 PY
 OCC_PID=$!
+# 退出作业表:下面用 kill 收掉占位监听器,bash 收割时会打印
+# 「Terminated: 15 python3 …」作业控制通知。该通知与日志交错出现在本步之后,
+# 极易被读成失败(实测 run 34631617230 的日志里它正好插在 2b 的 OK 与 3/5 之间)。
+# disown 后 kill 照常生效,只是不再产生这条噪声。
+disown "$OCC_PID" 2>/dev/null || true
 for _ in $(seq 1 20); do [ -s "$OCC_DIR/port" ] && break; sleep 0.1; done
 [ -s "$OCC_DIR/port" ] || fail "占位监听器未启动"
 OCC_PORT="$(cat "$OCC_DIR/port")"
-if DSH_RT_PORT="$OCC_PORT" bash "$INSTALL" >"$OCC_DIR/install.log" 2>&1; then
+# 本步验证的是「端口被占时 install 显式报错」,与暖机无关 → 显式关掉暖机,
+# 免得每次都为它白等一轮预算(CI 上 4 次 install 各等一轮,合计约 4m40s)。
+if DSH_RT_PORT="$OCC_PORT" DSH_INSTALL_NO_WARMUP=1 bash "$INSTALL" >"$OCC_DIR/install.log" 2>&1; then
   kill "$OCC_PID" 2>/dev/null || true
   fail "端口被占时 install 未报错(静默失效)"
 fi
 grep -q "已被占用" "$OCC_DIR/install.log" || fail "端口占用报错信息不清晰: $(tail -3 "$OCC_DIR/install.log")"
 kill "$OCC_PID" 2>/dev/null || true
 echo "OK: 端口被占时 install 显式报错退出"
-# 清理占位后正常重跑,确认冲突场景不破坏后续安装
-bash "$INSTALL" >/dev/null 2>&1 || fail "端口冲突测试后正常 install 失败"
+# 清理占位后正常重跑,确认冲突场景不破坏后续安装(同样与暖机无关)
+DSH_INSTALL_NO_WARMUP=1 bash "$INSTALL" >/dev/null 2>&1 || fail "端口冲突测试后正常 install 失败"
 
 step "3/5 守护:引导页/自动唤醒/就绪门控/透传"
 export DSH_RT_IDLE_STOP_SECS=3
@@ -295,8 +327,17 @@ else
   fi
 fi
 
-# 收尾:集中列出本环境跳过的检查。SMOKE OK 只代表「已执行的断言全过」,
-# 不等于「全部断言都执行过」;不列出来,这两件事在输出里无法区分。
+# 收尾:集中列出本环境跳过的检查与暖机结论。SMOKE OK 只代表「已执行的断言全过」,
+# 既不等于「全部断言都执行过」,也不等于「暖机成功」;不列出来,这几件事在输出里
+# 无法区分(实测:暖机 4/4 次全失败时,除了 install 阶段的一行 warn 什么都看不到)。
+echo
+case "${WARM_STATUS:-}" in
+  ok:*)      echo "暖机:成功(${WARM_STATUS#ok: })" ;;
+  FAILED:*)  echo "暖机:失败 —— ${WARM_STATUS#FAILED: }(安装不受影响,但首次启动未预热)" ;;
+  skipped:*) echo "暖机:跳过(${WARM_STATUS#skipped: })" ;;
+  *)         echo "暖机:状态未知(第 1 步未记录)" ;;
+esac
+
 skipped_any=0
 for m in "$SMOKE_ROOT"/*.skipped; do
   [ -e "$m" ] || continue
