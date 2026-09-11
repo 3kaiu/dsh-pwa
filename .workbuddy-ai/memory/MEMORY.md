@@ -91,6 +91,17 @@ node ~/.workbuddy-ai/skills/ci-gate-hardening/scripts/check_run_blocks.mjs .gith
     使 CI 里 4 次「超时」彻底无从诊断；本次只在失败分支加了一句 `cp … $LOG_DIR/warmup.log`，
     根因（陷阱 15）当场自现。**失败路径保留现场，比任何日志级别调整都值钱。**
 
+17. **绝不要在 agent 沙箱里跑 `install.sh`**（两个独立原因，2026-09-12 实测）：
+    (a) 它用 `command -v node`（install.sh:179）取 node 并写进 `run.json` —— 沙箱 PATH 里
+        WorkBuddy 内部 node 排在用户 fnm node 之前，于是**把用户的 PWA 绑到 WorkBuddy 的
+        内部 node 上**。要修就得带 `PATH=<用户的 node bin>:$PATH` 重跑 install.sh。
+    (b) 第 5 步 `launchctl bootout` + `bootstrap`：**任何不在用户 Aqua 会话里的进程**
+        bootstrap 必返回 `5: Input/output error`，而 bootout 却可能成功 —— 于是**把用户
+        本来可用的 LaunchAgent 注销掉且无法恢复**。自证方法：拿一个**已注册**的 job 再
+        bootstrap 一次，同样 rc=5 即说明是上下文问题而非 plist 问题（`plutil -lint` 也会 OK）。
+        判据：`TERM_SESSION_ID`/`XPC_SERVICE_NAME` 未设置即非 Aqua 会话；**禁用沙箱也一样**，
+        别指望 `dangerouslyDisableSandbox` 绕过。用户必须在自己 Terminal 里执行。
+
 ## daemon 安全模型（勿回退）
 - CSRF：Origin / Host 头**精确匹配**，防跨站与 DNS rebinding。
 - Cookie：必须精确匹配 `dsh-auth=` 名，不可用 `strncmp(ck, "dsh-auth", 8)`（会放行 `dsh-auth-evil`）。
