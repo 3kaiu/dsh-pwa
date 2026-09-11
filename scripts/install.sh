@@ -406,6 +406,62 @@ if [ -d "$ROOT/scripts" ]; then
   done
 fi
 
+# ---------- 4c) 暖机:首次安装后预热 NODE_COMPILE_CACHE 与文件系统缓存 ----------
+# 零常驻不改:暖机是「安装时一次性」行为,不是登录常驻。启动守护前台模式,
+# 触发 /wake → 等 dsh 就绪 → /stop → kill 守护。失败只 warn,不阻断安装。
+warmup_ok=0
+if [ -x "$RT_HOME/daemon" ] && [ -n "$NODE_BIN" ] && [ -n "$DSH_BIN" ]; then
+  h1 "4c) 暖机(填充编译缓存,加速首次启动)"
+  # 找一个空闲端口(避免与正式端口冲突)
+  WARM_PORT="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()' 2>/dev/null || true)"
+  if [ -n "$WARM_PORT" ]; then
+    WARM_ORIGIN="http://127.0.0.1:$WARM_PORT"
+    # 短空闲超时:stop 后守护 3s 内自停(前台模式不会真 exit,但 dsh 会停)
+    DSH_RT_HOME="$RT_HOME" DSH_RT_STATE="$RT_STATE" DSH_HOME="$DSH_HOME" \
+      DSH_RT_PORT="$WARM_PORT" DSH_RT_IDLE_STOP_SECS=3 \
+      "$RT_HOME/daemon" >/tmp/dsh-warmup.log 2>&1 &
+    WDPID=$!
+    # 等守护 bind 完成(最长 2s)
+    for _ in $(seq 1 20); do
+      curl -fsS --max-time 1 --noproxy '*' "$WARM_ORIGIN/health" >/dev/null 2>&1 && break
+      sleep 0.1
+    done
+    # 触发唤醒
+    curl -fsS --max-time 3 --noproxy '*' -X POST -H "Origin: $WARM_ORIGIN" "$WARM_ORIGIN/wake" >/dev/null 2>&1 || true
+    # 等 dsh 就绪(最长 60s;真实系统通常 2-5s,全新安装/慢机可能更长)
+    WARM_READY=0
+    for _ in $(seq 1 120); do
+      WARM_H="$(curl -fsS --max-time 2 --noproxy '*' "$WARM_ORIGIN/health" 2>/dev/null || true)"
+      if printf '%s' "$WARM_H" | grep -q '"dsh":true'; then
+        WARM_READY=1
+        break
+      fi
+      sleep 0.5
+    done
+    if [ "$WARM_READY" = "1" ]; then
+      # 优雅停止 dsh
+      curl -fsS --max-time 3 --noproxy '*' -X POST -H "Origin: $WARM_ORIGIN" "$WARM_ORIGIN/stop" >/dev/null 2>&1 || true
+      sleep 1
+      # 检查缓存是否生成
+      if [ -d "$RT_STATE/node-cache" ] && [ "$(find "$RT_STATE/node-cache" -type f 2>/dev/null | wc -l)" -gt 0 ]; then
+        ok "暖机完成(编译缓存已填充)"
+        warmup_ok=1
+      else
+        ok "暖机完成(缓存将在首次真实启动时生成)"
+        warmup_ok=1
+      fi
+    else
+      warn "暖机超时(dsh 未在 60s 内就绪),不影响使用"
+    fi
+    # 清理:无论暖机是否成功,都 kill 守护前台进程
+    kill "$WDPID" 2>/dev/null || true
+    wait "$WDPID" 2>/dev/null || true
+    rm -f /tmp/dsh-warmup.log
+  else
+    warn "无法分配临时端口,跳过暖机"
+  fi
+fi
+
 # ---------- 5) LaunchAgent 注册(零常驻 socket activation:launchd 持有 socket,连接到达才拉起守护) ----------
 h1 "5) LaunchAgent(零常驻,首次访问自动唤醒)"
 AGENT_OK=0
@@ -495,6 +551,9 @@ SECS=$(( $(date +%s) - START_TS ))
 echo
 echo "${G}✓${R} ${B}安装完成${R}(${D}${SECS}s${R})"
 echo "  ${D}node v$("$NODE_BIN" --version 2>/dev/null | sed 's/^v//' || echo -) · dsh $CUR_DSH · 运行时 $RT_HOME${R}"
+if [ "${warmup_ok:-0}" = "1" ]; then
+  echo "  ${D}暖机完成(首次启动已预热)${R}"
+fi
 if [ "$AGENT_OK" = "1" ]; then
   open "http://127.0.0.1:$PORT/" 2>/dev/null || true
   echo "  ${D}已自动打开 http://127.0.0.1:$PORT/${R}"
