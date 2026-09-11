@@ -66,6 +66,30 @@ node ~/.workbuddy-ai/skills/ci-gate-hardening/scripts/check_run_blocks.mjs .gith
     在 macOS 上静默无输出。**一律用 `grep -E`**。
 12. **不要用管道判定结果**：`gh run watch --exit-status | grep | head -N` 拿到的是 `head`
     的退出码（恒 0），run 还在 `in_progress` 也会「通过」。要 `cmd > log 2>&1; echo $?`。
+13. **bash 3.2 里「双引号串内嵌 `$( )`、`$( )` 内再用转义双引号」会解析错乱**。
+    `echo "x: ${A}MB ($(awk "BEGIN {printf \"%.1f\", $A*100/$B}")%)"` 在 macOS
+    `/bin/bash`(3.2.57) 下：内层 `\"` 破坏外层引号 → `echo` 收到 **2 个参数**（同一行被打印
+    两遍），`awk` 被调用 **2 次**且程序被截断 → 两次 `syntax error`，`$( )` 结果为空。
+    fish / bash 5 不这样。**修法：先算进变量，不做嵌套**——
+    `PCT="$(awk "BEGIN {printf \"%.1f\", $A*100/$B}")"; echo "  x: ${A}MB (${PCT}%)"`。
+    实测：`cleanup-deps.sh:66` 中招（CI 打印 `节省空间: 62MB (%)   节省空间: 62MB (%)`），
+    `install.sh:59` 的单引号 awk 写法安全。**shellcheck -S warning 不报此问题**，bats 也不覆盖。
+14. **「失败只 warn 不阻断」＝ 空转门禁（error swallowing）**。`install.sh` 第 4c 步暖机
+    失败只 `warn "暖机超时…不影响使用"`，且**成功与否没有任何测试断言**——于是 CI 全绿
+    而该特性 4/4 次全部失败（见 2026-09-12 日志）。凡是新增「尽力而为」步骤，必须同时给出
+    可观测的成功判据（marker 文件 / 断言 / 非零退出），否则绿 ≠ 可用。
+15. **`$RT_HOME/.install.lock` 是「安装互斥」与「守护的更新期判定」共用的同一把锁**。
+    守护 `update_locked()`（daemon.c:255）读该锁，持锁者 pid 存活即判「更新进行中」并
+    **拒绝 spawn dsh**（daemon.c:296）。install.sh 整个运行期都持这把锁，所以**任何在
+    install.sh 内部启动守护去拉起 dsh 的步骤都会 100% 失败**——暖机（4c）正是这样踩死的：
+    不是环境问题、不是慢，是构造性死结。修法是给该守护实例一个**独立的无锁临时 RT_HOME**
+    （守护从 RT_HOME 只读三处：`run.json`(119)、`.install.lock`(257)、
+    `scripts/update-dsh.sh`(539)，故复制 run.json + daemon 即可，并置
+    `DSH_RT_NO_AUTO_UPDATE=1`）。**`RT_STATE` 必须保持真实路径**，因为
+    `NODE_COMPILE_CACHE` 是按 RT_STATE 算的（daemon.c:348），指错就白暖。
+16. **诊断「超时」类缺陷前先想：日志被谁删了**。暖机旧实现无条件 `rm -f /tmp/dsh-warmup.log`，
+    使 CI 里 4 次「超时」彻底无从诊断；本次只在失败分支加了一句 `cp … $LOG_DIR/warmup.log`，
+    根因（陷阱 15）当场自现。**失败路径保留现场，比任何日志级别调整都值钱。**
 
 ## daemon 安全模型（勿回退）
 - CSRF：Origin / Host 头**精确匹配**，防跨站与 DNS rebinding。
