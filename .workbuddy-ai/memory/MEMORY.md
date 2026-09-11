@@ -63,7 +63,10 @@ node ~/.workbuddy-ai/skills/ci-gate-hardening/scripts/check_run_blocks.mjs .gith
     （step 级是 8 空格，不能算数），且只在 `jobs:` 之后计数（否则 `on:` 下的
     `push:`/`pull_request:` 会被当成 job）。
 11. **BSD grep 的 `\|` 不是「或」而是字面量**（技能里记过，我仍踩了两次）：`grep '^a:\|^b:'`
-    在 macOS 上静默无输出。**一律用 `grep -E`**。
+    在 macOS 上静默无输出。**一律用 `grep -E`**。**BSD `sed` 同理**：`sed -n '/A\|B/p'`
+    在 macOS 上按字面量 `A|B` 匹配 → **静默无输出**（本轮又踩：用它筛「EXPECTED_SHA|
+    ACTUAL_SHA|shasum」，结果空输出，一度让我以为包内 install.sh 没打上修复）。
+    `sed` 里要「或」得用 `sed -E -n '/A|B/p'`。**静默无输出 = 先怀疑分隔符语法，别先怀疑被测对象。**
 12. **不要用管道判定结果**：`gh run watch --exit-status | grep | head -N` 拿到的是 `head`
     的退出码（恒 0），run 还在 `in_progress` 也会「通过」。要 `cmd > log 2>&1; echo $?`。
 13. **bash 3.2 里「双引号串内嵌 `$( )`、`$( )` 内再用转义双引号」会解析错乱**。
@@ -118,6 +121,12 @@ node ~/.workbuddy-ai/skills/ci-gate-hardening/scripts/check_run_blocks.mjs .gith
     那只是 tag 页面，**不能用来判断 release 是否存在**）。仓库 CI 当时**没有任何一步**会去
     下载自己发的资产。已给 `release.yml` 补「发布后三方比对哈希」的门禁。判据要同时看
     `gh api repos/<o>/<r>/releases` 与 `api .../releases/tags/<tag>`，别只看网页 200。
+21. **探针模式必须锚定到被测对象，否则会命中「另一个合法用途」**。本轮查「包内 install.sh
+    是否还有旧的 `shasum -c`」时我用了 `grep 'shasum -a 256 -c'` → 报「仍有」，但命中的是
+    `install.sh:218` **校验 node 压缩包**的那行（`shasum -a 256 -c -`），与发行包校验无关。
+    **判据要收紧到对象**：`grep 'shasum -a 256 -c .*pkg\.zip'`（结果 0 行 = 真已移除）。
+    同一轮里两个探针都出了假结论，靠 `sed -n '44,62p'` **直接看原始内容**才定案 ——
+    **门禁/探针报异常时，先打印原始内容核对，再下结论。**
 
 ## daemon 安全模型（勿回退）
 - CSRF：Origin / Host 头**精确匹配**，防跨站与 DNS rebinding。
