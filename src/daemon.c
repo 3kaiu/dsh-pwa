@@ -570,8 +570,14 @@ static const char TPL_HEAD[] =
   "#err{display:none;margin-top:18px;color:#F28B82;font-size:13px;text-align:left;background:rgba(242,139,130,.08);border:1px solid rgba(242,139,130,.25);border-radius:10px;padding:10px 14px;word-break:break-all}"
   ".btn{display:none;margin:18px auto 0;background:#4D6BFE;color:#fff;border:0;border-radius:10px;padding:10px 28px;font-size:14px;cursor:pointer}"
   "#log{margin-top:22px;font-size:11px;color:#4A5468}"
+  // 进度条:启动中(dsh 未就绪但 spawn_pid>0)时显示,动画 2.5s 从 0% 到 100%
+  ".progress{width:100%;height:3px;background:rgba(77,107,254,.08);border-radius:2px;margin-top:14px;overflow:hidden;opacity:0;transition:opacity .3s}"
+  ".progress.on{opacity:1}"
+  ".bar{height:100%;width:0%;background:linear-gradient(90deg,#4D6BFE,#7B8FFE);border-radius:2px;animation:fill 2.5s ease-out forwards}"
+  "@keyframes fill{to{width:100%}}"
   "</style></head><body><div class=\"card\"><div class=\"ring\" id=\"ring\"></div>"
   "<h1>DeepSeek Harness</h1><div id=\"status\">正在连接…</div>"
+  "<div class=\"progress\" id=\"progress\"><div class=\"bar\" id=\"bar\"></div></div>"
   "<div id=\"err\"></div><button class=\"btn\" id=\"retry\">重试</button>"
   "<div id=\"log\">日志目录: ";
 static const char TPL_TAIL[] =
@@ -579,6 +585,7 @@ static const char TPL_TAIL[] =
   "var lastWake=0,t0=Date.now(),notok=0;"
   "function $(id){return document.getElementById(id)}"
   "function tick(){fetch('/health').then(function(r){return r.json()}).then(function(h){"
+  "var s=Math.floor((Date.now()-t0)/1000);"
   "if(h.dsh){"
   // token 窗口处理:dsh HTTP 已就绪但守护可能还没从日志捕获到 token(dsh 0.1.5+ 打印 token
   // 略晚于开始监听;/health 的就绪判定只看 HTTP 探测,token 字段捕获到才随响应给出)。
@@ -586,9 +593,12 @@ static const char TPL_TAIL[] =
   //   无 token 且未连续 10 次(~3s)→ 继续轮询等 token(裸 reload 在 PWA 场景会 401);
   //   无 token 且已连续 10 次 → 判定旧版 dsh 无 token 机制,直接 reload(旧 cookie 仍可用)。
   "if(!h.token&&notok<10){notok++;setTimeout(tick,300);return}"
-  "notok=0;$('ring').className='ring done';$('status').textContent='已就绪,正在进入…';setTimeout(function(){"
+  "notok=0;$('ring').className='ring done';$('progress').className='progress';$('status').textContent='已就绪,正在进入…';setTimeout(function(){"
   "h.token?fetch('/?token='+encodeURIComponent(h.token)).catch(function(){}).finally(function(){location.reload()}):location.reload()},150);return}"
   "notok=0;"
+  // 启动状态感知:/health 返回 starting:true 时守护已在 spawn_dsh 中(进度条+不发重复 /wake)
+  "if(h.starting){$('progress').className='progress on';$('status').textContent='正在启动引擎…';}"
+  "else{"
   // /wake 重发(最多每 2s 一次),不再只发一次:
   //   1) 单次 POST 丢包(瞬时网络错误)时旧实现永久卡在引导页——fetch 的 rejection 无人处理;
   //   2) 服务端可能主动丢弃唤醒(update-dsh.sh 持 .install.lock 期间 spawn_dsh() 放弃本轮),
@@ -596,8 +606,7 @@ static const char TPL_TAIL[] =
   // 守护侧 request_wake 幂等(主进程按 spawn_pid/dsh_up 判定,多个唤醒至多 spawn 一次),
   // 故 2s 重发不产生重复实例;dsh 就绪后页面即跳转,重发自然停止。
   "var nw=Date.now();if(nw-lastWake>2000){lastWake=nw;$('status').textContent='正在唤醒…';fetch('/wake',{method:'POST'}).catch(function(){})}"
-  "var s=Math.floor((Date.now()-t0)/1000);"
-  "$('status').textContent='正在启动 DeepSeek Harness…'+(s>=3?'(已等待 '+s+' 秒)':'');"
+  "$('status').textContent='正在启动 DeepSeek Harness…'+(s>=3?'(已等待 '+s+' 秒)':'');}"
   "if(s>=600){$('err').style.display='block';$('err').textContent='启动超时(超过 10 分钟)。日志: '+document.getElementById('log').textContent;$('retry').style.display='block'}"
   "}).catch(function(){}).then(function(){setTimeout(tick,300)})}"
   "document.addEventListener('DOMContentLoaded',function(){"
@@ -652,9 +661,14 @@ static void respond_health(int c) {
     // 信任级别与日志文件里的 token URL 相同;dsh 0.1.5+ 引导页用它完成 /?token= 握手。
     // token_json_safe 已保证字符集可安全嵌入(见其定义),无需转义。
     n = snprintf(body, sizeof body, "{\"dsh\":true,\"port\":%d,\"pid\":%d,\"token\":\"%s\"}", dsh_port, pid, dsh_token);
-  if (n < 0 || (size_t)n >= sizeof body)
-    snprintf(body, sizeof body, "{\"dsh\":%s,\"port\":%d,\"pid\":%d}",
-             ready ? "true" : "false", ready ? dsh_port : 0, pid);
+  if (n < 0 || (size_t)n >= sizeof body) {
+    if (!ready && spawn_pid > 0)
+      // dsh 正在启动中(spawn_dsh 已 fork 但尚未就绪):引导页据此显示进度条,不再重复发 /wake
+      snprintf(body, sizeof body, "{\"dsh\":false,\"port\":0,\"pid\":0,\"starting\":true}");
+    else
+      snprintf(body, sizeof body, "{\"dsh\":%s,\"port\":%d,\"pid\":%d}",
+               ready ? "true" : "false", ready ? dsh_port : 0, pid);
+  }
   respond(c, 200, "application/json", body);
 }
 
