@@ -1,159 +1,159 @@
 # dsh-pwa
 
-macOS 上一键安装 [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh)(官方 npm 包 `@deepseek-ai/dsh`)并把它变成桌面 PWA:零常驻架构(launchd socket activation)——登录后没有任何用户态进程,点 PWA 图标时 launchd 自动拉起守护进程与 dsh,关闭页面后 dsh 与守护进程全部退出;Safari「添加到程序坞」即得全屏 Web App。
+macOS 上一键安装 [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) 并把它变成桌面 PWA。零常驻架构：登录后没有任何用户态进程常驻，点 PWA 图标时自动拉起，关闭页面后全部退出。
 
-## 平台支持
+## Features
 
-**仅支持 macOS。** 这不是「暂时没适配」,而是架构前提 —— 零常驻承诺直接建立在 macOS 独有机制上:
+- **零常驻** — 基于 launchd socket activation，空闲时守护进程与 dsh 全部退出，不消耗内存
+- **一键安装** — `curl | bash` 或两步安装，自动下载 Node.js、安装 dsh、注册 LaunchAgent
+- **自动更新** — 后台异步检查（12h 节流），用户不在场时自动更新，失败自动回滚
+- **PWA 体验** — Safari「添加到程序坞」即得全屏 Web App，支持桌面通知与离线缓存
+- **安全默认** — CSRF/Origin 校验、Host 头防 DNS rebinding、文件权限 0700/0600、仅监听 127.0.0.1
+- **Universal Binary** — arm64 + x86_64 双架构，免本地编译
 
-- **launchd socket activation** — 零常驻的核心:launchd 持有监听 socket,首个连接才拉起守护进程,空闲即自退
-- **LaunchAgent + Aqua 会话** — 安装需 `launchctl bootstrap` 注册守护与更新器,必须在**已登录的图形会话内**执行(在 SSH/CI 等非 Aqua 上下文中会返回 `5: Input/output error`)
-- **Universal binary** — 守护进程预编译为 arm64 + x86_64,免本地编译
+## Requirements
 
-**Linux / Windows 明确不在范围内**(无适配计划):两者没有等价于 launchd socket activation 的机制,
-要做到「空闲即自退」就得常驻一个监督进程,零常驻的卖点随之消失。需要跨平台时,请把 dsh 本身作为独立服务运行。
+- **macOS**（10.15 或更高版本）
+- 已登录的图形会话（Aqua），安装脚本需在 Terminal 中执行
 
-## 安装
+> Linux / Windows 明确不在支持范围内 —— 零常驻依赖 macOS 独有的 launchd socket activation 机制。
 
-### 推荐方式（两步安装）
+## Installation
+
+### 推荐方式（两步安装，可 review）
 
 ```bash
-# 1. 下载安装脚本（给你 review 机会）
 curl -fsSL -o install.sh https://raw.githubusercontent.com/3kaiu/dsh-pwa/main/scripts/install.sh
-
-# 2. 检查后执行
 bash install.sh
 ```
 
-### 快速安装（管道执行）
+### 快速方式（管道执行）
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/3kaiu/dsh-pwa/main/scripts/install.sh | bash
 ```
 
-⚠️ **安全提示:** 管道执行会直接运行脚本，建议生产环境使用两步安装方式。
+> ⚠️ 生产环境建议使用两步安装方式。
 
-升级 = 重跑同一条命令(已最新则秒级跳过)。
+升级 = 重跑同一条命令（已最新则秒级跳过）。
 
-### Homebrew（打包就绪，**尚未发布**）
-
-formula 与发版脚本已备好并本地校验通过，但 **tap 仓库尚未创建**，所以下面的命令现在装不到 ——
-需仓库所有者先建 `3kaiu/homebrew-tap` 并放入 formula（步骤见
-[packaging/homebrew/README.md](packaging/homebrew/README.md)）：
+**版本固定：**
 
 ```bash
-brew tap 3kaiu/tap
-brew install 3kaiu/tap/dsh-pwa
-dsh-pwa-install          # 真正的运行时安装，在你自己的终端里执行
-```
-
-`brew install` 只落安装载荷，**不会**自动改你的系统：运行时安装（下载 Node、装 dsh、注册
-LaunchAgent）由 `dsh-pwa-install` 显式触发。原因是 `launchctl bootstrap` 在非图形会话
-（SSH/CI）中必失败，却可能把已有的 LaunchAgent 注销掉，而 `brew install` 完全可能被这类上下文调用。
-
-**版本固定:**
-
-```bash
-# 固定到特定版本（强烈推荐）
 DSH_RT_RELEASE_TAG=v1.0.0 bash install.sh
 ```
 
-**供应链完整性保障:**
-- ✅ 发行包 SHA-256 校验(fail-closed,校验失败则中止安装)
-- ✅ Node.js 二进制 SHA-256 校验(来自 nodejs.org 官方)
-- ✅ 支持版本固定(`DSH_RT_RELEASE_TAG`)
-- ✅ Universal binary(arm64 + x86_64,免本地编译)
+**回退到已知版本：**
 
-**版本策略:**
-- 默认自动跟随 `@deepseek-ai/dsh@latest`(dsh 官方稳定标签)
-- 出现问题时可回退到已知版本: `DSH_VERSION=0.1.1-rc.2 bash install.sh`
-- 冒烟测试作为安全网,breaking change 会在安装后立即发现
+```bash
+DSH_VERSION=0.1.1-rc.2 bash install.sh
+```
 
-## 性能优化
+## Usage
 
-- **体积优化:** 自动清理跨平台冗余文件，安装后体积 ~178MB (相比原始 212MB 减少 16%)
-- **清理内容:**
-  - node-pty Win32/Linux 预编译二进制 (~23MB)
-  - @img/sharp WASM 备用方案 (~9MB)
-  - sourcemap/文档/测试文件 (~2MB)
-- **daemon 极简:** 117KB universal binary (arm64 + x86_64)，运行时仅占 ~1.3MB RSS,且仅在活跃会话期间存在(零常驻,空闲即退出)
+安装完成后：
 
-## 卸载
+1. 在 Safari 中打开 `http://127.0.0.1:<PORT>/`（PORT 由安装脚本分配，默认 3080）
+2. 点击 Safari 菜单「文件 → 添加到程序坞」
+3. 从 Dock 点击图标即可启动全屏 PWA
+
+首次启动会自动唤醒 dsh（下载依赖、编译缓存），约 5–15 秒。后续启动复用编译缓存，秒级就绪。
+
+## Configuration
+
+| 环境变量 | 说明 | 默认值 |
+|---|---|---|
+| `DSH_RT_PORT` | 守护监听端口 | `3080` |
+| `DSH_RT_HOME` | 运行时主目录 | `~/.local/share/dsh-runtime` |
+| `DSH_RT_STATE` | 状态与日志目录 | `~/.local/state/dsh-runtime` |
+| `DSH_RT_IDLE_STOP_SECS` | 空闲后停止 dsh 的秒数 | `30` |
+| `DSH_RT_MAX_CONN` | 并发连接上限 | `256` |
+| `DSH_RT_NO_AUTO_UPDATE` | 禁用自动更新 | — |
+| `DSH_RT_PREWARM` | 登录时预热 dsh | — |
+| `DSH_VERSION` | 固定 dsh 版本（覆盖 `@latest`） | — |
+
+## Security
+
+- **CSRF 防护** — 控制端点与状态变更请求必须携带精确匹配本端口的 Origin 头
+- **Host 头校验** — 拒绝非 `127.0.0.1:PORT` / `localhost:PORT` 的请求，防 DNS rebinding
+- **Cookie 精确匹配** — `dsh-auth=` 全名匹配，防止前缀绕过
+- **文件权限** — 状态目录 0700、日志文件 0600，用户私有
+- **Localhost 绑定** — 仅监听 127.0.0.1，不暴露到网络
+- **并发上限** — 超限时直接 503 拒绝，防止 fork 耗尽
+
+### Known Limitations
+
+- **流水线请求只校验第一个** — 同 TCP 连接内的后续请求原样透传给 dsh，不再经守护校验。浏览器不会这样发包，构造该流量需本机 socket 写权限，已等同本机访问权限。
+- **透传鉴权在 dsh** — 守护的 Origin 校验是额外一层，不替代 dsh 的 token/cookie 鉴权。
+- **发行包完整性依赖发布方** — `curl | bash` 路径下 SHA-256 校验的信任根是 GitHub 发布者账号，非独立签名密钥。
+
+完整审计历史见 [docs/AUDIT_HISTORY.md](docs/AUDIT_HISTORY.md)。
+
+## Troubleshooting
+
+日志统一在 `~/.local/state/dsh-runtime/logs/`：
+
+```bash
+# 守护是否正常拉起/停止 dsh
+tail -50 ~/.local/state/dsh-runtime/logs/daemon.log
+
+# 自动更新是否成功/失败/回滚
+tail -50 ~/.local/state/dsh-runtime/logs/update.log
+
+# launchd 注册状态
+launchctl print "gui/$(id -u)/com.dshpwa.daemon"
+```
+
+## Uninstallation
 
 ```bash
 launchctl bootout "gui/$(id -u)/com.dshpwa.daemon"
 launchctl bootout "gui/$(id -u)/com.dshpwa.updater"
-rm -f ~/Library/LaunchAgents/com.dshpwa.daemon.plist
-rm -f ~/Library/LaunchAgents/com.dshpwa.updater.plist
+rm -f ~/Library/LaunchAgents/com.dshpwa.*.plist
 rm -rf ~/.local/share/dsh-runtime ~/.local/state/dsh-runtime
 
-# 可选: 清理 dsh 用户数据(会话历史等,删除前请确认无需保留)
+# 可选：清理 dsh 用户数据（会话历史等）
 rm -rf ~/.dsh
 
-# 可选: 清理 pnpm store(释放磁盘空间,累积历史版本可能占数GB)
+# 可选：清理 pnpm store（累积历史版本可能占数 GB）
 pnpm store prune
 ```
 
-## 安全特性
-
-- **CSRF 防护:** 控制端点(`/wake`/`/stop` 等)与透传的状态变更请求(POST/PUT/DELETE/PATCH)必须携带精确匹配本守护端口的 Origin 头,拒绝跨域请求
-- **安全文件权限:** 日志与状态目录 0700、文件 0600(用户私有,install.sh 安装时显式收紧)
-- **端口验证:** 仅接受 1024-65535 范围的端口配置
-- **Localhost 绑定:** 守护进程仅监听 127.0.0.1，不暴露到网络
-- **Host 头校验:** 所有请求 Host 必须精确等于 `127.0.0.1:PORT`/`localhost:PORT`,防 DNS rebinding 窃取 dsh token
-- **进程隔离:** dsh 运行在独立进程，崩溃不影响守护进程
-
-### 已知限制(威胁模型)
-
-以下是**有意的设计边界**,不是待办缺陷 —— 写在这里是为了让「已知」可检索,避免后续审计重复发现:
-
-- **流水线请求只校验第一个:** 守护每条 TCP 连接只解析**第一个**请求头,并据它做 Host / Origin / cookie 校验;同一连接里紧随其后的请求会被原样透传给 dsh,不再经过守护校验(审计 A3)。实际影响有界:守护的控制端点(`/wake`/`/stop`/`/ping`/`/goodbye`)只会被**首个**请求触发,流水线的后续请求到达的是 dsh 本身(它不实现这些端点);且浏览器不会这样发包 —— 构造该流量需要能直接写本地 socket,那已等同于本机访问权限。故按纵深防御记录而非封堵:封堵需要在热路径上做完整的多请求解析,风险高于收益。
-- **本地回环即信任边界:** 守护只监听 `127.0.0.1`。任何能在本机向该端口发起连接的进程,已具备本机用户权限,不在本威胁模型内。
-- **透传的最终鉴权在 dsh:** 透传请求由 dsh 的 token / cookie 授权;守护的 Origin 校验是额外一层,不替代它。
-- **发行包完整性依赖发布方校验和:** `curl | bash` 路径下完整性校验依赖发行方提供的 `.sha256`,信任根是 GitHub 账号而非独立签名密钥(ad-hoc 签名的 daemon 不构成发布者身份证明)。
-- **并发连接上限是「有界」而非「精确调参」:** 守护每连接 fork 一个子进程,超限时直接回 `503` 且**不 fork**(审计 E6d)。默认上限远高于单机桌面场景的真实并发,目的是把**无界**变成**有界**;可用 `DSH_RT_MAX_CONN` 覆盖(测试用它把上限压到极小以确定性地驱动拒绝路径)。
-- **`stop_dsh` 的 pid 校验是弱校验:** 对非本进程 spawn 的 pid,只校验「可执行文件是 node」(审计 E6e)。要利用它需先能写 `dsh.pid`,即已具备同用户权限 —— 故按已知限制接受,不做启动时间/端口交叉校验(成本高于收益)。
-- **`run.json` 的 JSON 解析是宽松匹配:** 取值靠键名子串定位,值内含同名子串时可误匹配(审计 E6c)。`run.json` 由本仓库的 `install.sh` 写入,不是不可信输入。
-- **僵尸回收最长延迟一个轮询周期:** 回收只在主循环 `poll` 返回后执行(审计 E6f),影响有限。
-
-## 自动更新
-
-- **后台异步更新:** daemon 激活时触发后台版本检查(12h 节流,不阻塞启动)
-- **定时自动更新:** LaunchAgent 每天凌晨 2:30 自动检查并更新到 `@deepseek-ai/dsh@latest`
-- **活跃会话保护:** dsh 正在运行(用户可能在使用)时跳过本轮更新,等下一轮用户不在场时再做
-- **增量更新优化:** 仅下载变化的包，节省 70-85% 流量和时间
-- **失败回滚:** 网络失败时静默跳过、使用现有版本;更新失败时自动回滚到更新前的依赖树,保持当前版本可用
-- **禁用开关:** 安装时设 `DSH_RT_NO_AUTO_UPDATE=1` 跳过 updater 注册;已装系统需向 daemon plist 注入该环境变量或卸载 updater(详见 [docs/AUTO_UPDATE_IMPLEMENTATION.md](docs/AUTO_UPDATE_IMPLEMENTATION.md)「环境变量控制」)
-
-## 故障排查
-
-日志统一在 `~/.local/state/dsh-runtime/logs/`:
-
-- `daemon.log` — 守护进程日志(launchd 重定向,含 dsh 启动输出与 token)
-- `update.log` — 自动更新脚本日志(超 2MB 自动轮转为 `update.log.1`)
-- `updater.log` — updater LaunchAgent 的 stdout/stderr
-
-常见排查:
-```bash
-tail -50 ~/.local/state/dsh-runtime/logs/daemon.log    # 守护是否正常拉起/停止 dsh
-tail -50 ~/.local/state/dsh-runtime/logs/update.log   # 自动更新是否成功/失败/回滚
-launchctl print "gui/$(id -u)/com.dshpwa.daemon"      # launchd 注册状态
-```
-
-## 开发
+## Development
 
 ```bash
-bash scripts/smoke-test.sh              # 隔离目录真实安装 → 幂等重跑 → 端口占用检测 → 守护(引导页/自动唤醒/就绪门控/token 握手/透传) → 并发双唤醒幂等 → 空闲自停 → socket activation 端到端(激活→自退→再激活)
-bash tests/security-verification.sh     # 验证所有安全控制是否按预期工作
-bats tests/unit/                        # 单元测试:守护黑盒 / 安装校验 / 包装器版本 / 探测脚本(不依赖真实 dsh)
-bats -c tests/unit/*.bats               # 只统计不执行:打印当前单元测试数量
+# 冒烟测试（端到端：安装 → 启动 → 透传 → 空闲自停 → socket activation）
+bash scripts/smoke-test.sh
+
+# 安全验证套件
+bash tests/security-verification.sh
+
+# 单元测试（不依赖真实 dsh）
+bats tests/unit/
+
+# 只统计用例数
+bats -c tests/unit/*.bats
 ```
 
-> 测试数量一律以运行器输出为准(如 `bats -c tests/unit/*.bats`),文档不手写数量 —— 手写值必然漂移,已由 `tests/unit/install-validation.bats` 的门禁守护。
+开发工具链与详细指引见 [docs/TOOLS_INTEGRATION.md](docs/TOOLS_INTEGRATION.md)。
 
-## 参考文档
+## Contributing
 
-- [docs/TOOLS_INTEGRATION.md](docs/TOOLS_INTEGRATION.md) — 开发工具链(shellcheck/hyperfine/bats)、性能剖析、故障排查
-- [docs/AUTO_UPDATE_IMPLEMENTATION.md](docs/AUTO_UPDATE_IMPLEMENTATION.md) — 自动更新机制设计(pnpm 增量、12h 节流、安装锁互斥)
-- [docs/AUDIT_HISTORY.md](docs/AUDIT_HISTORY.md) — 各轮审计与修复历史(对抗审计三轮 + P0-P3 批次 + 深度审计 + 冒烟复核,已合并为单一文档;**是快照,非现状**)
-- [tests/auto-update-checklist.md](tests/auto-update-checklist.md) — 自动更新人工验收清单
+欢迎 issue 和 PR。提交前请运行：
+
+```bash
+clang -O2 -Wall -Wextra -Werror -o /tmp/dsh_verify src/daemon.c
+shellcheck -S warning scripts/*.sh tests/*.sh tests/lib/*.sh
+for f in scripts/*.sh tests/*.sh tests/lib/*.sh; do bash -n "$f"; done
+bats tests/unit/
+```
+
+提交信息使用 Conventional Commits，subject 用中文。
+
+## License
+
+MIT License — 详见 [LICENSE](LICENSE)。
+
+## Acknowledgements
+
+- [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) — DeepSeek 官方提供的 Web IDE
