@@ -126,6 +126,5 @@ bats -c tests/unit/*.bats               # 只统计不执行:打印当前单元�
 
 - [docs/TOOLS_INTEGRATION.md](docs/TOOLS_INTEGRATION.md) — 开发工具链(shellcheck/hyperfine/bats)、性能剖析、故障排查
 - [docs/AUTO_UPDATE_IMPLEMENTATION.md](docs/AUTO_UPDATE_IMPLEMENTATION.md) — 自动更新机制设计(pnpm 增量、12h 节流、安装锁互斥)
-- [docs/P0_P3_FIXES_IMPLEMENTATION.md](docs/P0_P3_FIXES_IMPLEMENTATION.md) — P0-P3 修复实施记录
-- [docs/ADVERSARIAL_AUDIT_FIX.md](docs/ADVERSARIAL_AUDIT_FIX.md) / [docs/ADVERSARIAL_AUDIT_ROUND2.md](docs/ADVERSARIAL_AUDIT_ROUND2.md) / [docs/ADVERSARIAL_AUDIT_ROUND3_FIX.md](docs/ADVERSARIAL_AUDIT_ROUND3_FIX.md) — 三轮安全审计与修复记录
+- [docs/AUDIT_HISTORY.md](docs/AUDIT_HISTORY.md) — 各轮审计与修复历史(对抗审计三轮 + P0-P3 批次 + 深度审计 + 冒烟复核,已合并为单一文档;**是快照,非现状**)
 - [tests/auto-update-checklist.md](tests/auto-update-checklist.md) — 自动更新人工验收清单

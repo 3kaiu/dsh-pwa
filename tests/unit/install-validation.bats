@@ -240,10 +240,9 @@ extract_manifest_fmt() {
 # 扫描范围刻意分成两类(写清楚,而不是假装全覆盖):
 #  · 活文档(描述**当前**行为,数字会漂移):README.md、CHANGELOG.md、
 #    docs/TOOLS_INTEGRATION.md、docs/AUTO_UPDATE_IMPLEMENTATION.md
-#  · 历史快照(数字描述**当时**状态,改动等于篡改记录):docs/ADVERSARIAL_AUDIT_*.md 的
-#    「29 项测试」、docs/DEEP_AUDIT_2026-09-11.md 的「6 个测试文件」、
-#    docs/SMOKE_REVIEW_2026-09-12.md、docs/P0_P3_FIXES_IMPLEMENTATION.md(修复实施记录)。
-#    将来若要合并这些快照(roadmap 项),合并稿应带明确日期并同样不写数字。
+#  · 历史快照(数字描述**当时**状态,改动等于篡改记录):docs/AUDIT_HISTORY.md ——
+#    各轮审计的合并稿,内含「29 项测试」「6 个测试文件」这类快照事实。它带明确日期与
+#    「这是快照,不是现状」的抬头,故**刻意不纳入**本门禁;给它加数字门禁会逼人改写历史结论。
 # 背景:README 曾手写「33 项断言 / 9+30=39 项」,而实测是 security 33、unit 68 ——
 #   数字一旦手写就没人负责更新。数量必须以**运行器输出**为准:
 #   `bats -c tests/unit/*.bats` 只统计不执行,且与 bats 实际执行口径一致;
