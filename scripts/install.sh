@@ -201,9 +201,21 @@ if [ -n "$SYS_NODE" ]; then
   [ -x "$NODE_DIR/bin/node" ] && [ "$NODE_DIR/bin/node" != "$SYS_NODE" ] && rm -rf "$NODE_DIR"
 else
   h1 "1) Node 运行时(nodejs.org 最新 LTS)"
+  # 取最新 LTS 版本号。注意这条链路依赖 python3 解析 JSON,而 macOS 12.3+ 不再随系统附带
+  # python3(需装 CLT)—— 缺失时该行**静默**产出空值,直接落到下面的硬编码兜底(审计 D2/D3)。
+  # 故把两条失败路径都显式说出来:用户至少知道自己在装哪个版本、以及为什么。
+  if ! command -v python3 >/dev/null 2>&1; then
+    warn "未找到 python3,无法从 nodejs.org 解析最新 LTS 版本"
+  fi
   LTS_VER="$(curl -fsS --max-time 15 https://nodejs.org/dist/index.json 2>/dev/null \
     | python3 -c 'import json,sys;d=json.load(sys.stdin);print(next((e["version"].lstrip("v") for e in d if e.get("lts") is not False),""))' 2>/dev/null || true)"
-  [ -n "$LTS_VER" ] || LTS_VER="24.19.0"
+  if [ -z "$LTS_VER" ]; then
+    # 兜底是**最后手段**:这个数字会随上游发版而陈旧,而旧实现兜底时**没有任何输出**,
+    # 于是「装到了旧 node」永远不会被发现。故显式告警并给出规避方式。
+    LTS_VER="24.19.0"
+    warn "无法获取最新 LTS 版本(网络失败或缺 python3),回退到内置 v$LTS_VER —— 该版本可能已陈旧"
+    warn "如需指定版本:先安装系统 node 再重跑(脚本会优先复用系统 node)"
+  fi
   CUR_VER="$("$NODE_BIN" --version 2>/dev/null | sed 's/^v//' || true)"
   if [ "$CUR_VER" != "$LTS_VER" ]; then
     CACHE="$RT_HOME/.cache"; mkdir -p "$CACHE"
@@ -257,7 +269,10 @@ if [ -n "$DAEMON_SRC" ] && command -v clang >/dev/null && [ ! -x "$ROOT/daemon" 
   fi
 fi
 
-if [ -n "$LATEST" ] && [ "$CUR_DSH" != "$LATEST" ] || [ -z "$CUR_DSH" ]; then
+# 显式括号:`&&` 与 `||` 在 shell 里**同优先级且左结合**,写成 `A && B || C` 实际是 `(A && B) || C`。
+# 这里依赖的正是左结合语义(未安装时 CUR_DSH 为空 → C 成立 → 需要安装),故补括号把意图写死,
+# 避免后人重排条件时**静默**改变语义(审计 C3)。
+if { [ -n "$LATEST" ] && [ "$CUR_DSH" != "$LATEST" ]; } || [ -z "$CUR_DSH" ]; then
   printf '{"name":"dsh-runtime-app","private":true,"dependencies":{"@deepseek-ai/dsh":"%s"},"pnpm":{"onlyBuiltDependencies":["node-pty","koffi","@deepseek-ai/dsh-subprocess-local"]}}\n' "${LATEST:-latest}" > "$APP_DIR/package.json"
   # A5:依赖树的完整性锚点。发行包携带 release.yml 现场生成、并经该 workflow 的端到端冒烟
   # 真实验证过的 pnpm-lock.yaml。旧实现只是「有就拷过来」,从不冻结 —— 于是 lock 与
@@ -492,15 +507,15 @@ elif [ -x "$RT_HOME/daemon" ] && [ -n "$NODE_BIN" ] && [ -n "$DSH_BIN" ]; then
     WARM_ORIGIN="http://127.0.0.1:$WARM_PORT"
     # 暖机实例必须用**独立的 RT_HOME**。install.sh 整个运行期都持
     # $RT_HOME/.install.lock(内含自身存活 pid),而守护的 update_locked() 据此判定
-    # 「更新进行中」并直接放弃 spawn(daemon.c:296)。同一把锁既做安装互斥、又被守护
+    # 「更新进行中」并直接放弃 spawn(spawn_dsh() 里的 update_locked() 分支)。同一把锁既做安装互斥、又被守护
     # 读作「node_modules 处于半更新状态」,于是暖机成了构造性死结:实测 100% 必失败
     # (CI 4/4 次超时、本地同样),与机器快慢无关。
     # 暖机是安装期的一次性进程,不该被安装器自己的锁挡住,故给它一个无锁临时 RT_HOME。
     # 守护从 RT_HOME 只读三处:run.json、.install.lock、scripts/update-dsh.sh
-    # (daemon.c:119/257/539),故复制 run.json + daemon 即可;再置 NO_AUTO_UPDATE=1,
-    # 免得它去找这个临时目录里并不存在的更新脚本。
+    # (read_run() / update_locked() / trigger_background_update()),故复制 run.json + daemon 即可;
+    # 再置 NO_AUTO_UPDATE=1,免得它去找这个临时目录里并不存在的更新脚本。
     # RT_STATE 仍指向真实目录:预热目标正是 $RT_STATE/node-cache——NODE_COMPILE_CACHE
-    # 由守护按 RT_STATE 计算(daemon.c:348),指错地方就白暖了。
+    # 由 spawn_dsh() 按 RT_STATE 计算,指错地方就白暖了。
     cp "$RT_HOME/daemon" "$WARM_RT_HOME/daemon" 2>/dev/null || true
     cp "$RT_HOME/run.json" "$WARM_RT_HOME/run.json" 2>/dev/null || true
     # 短空闲超时:stop 后守护 3s 内自停(前台模式不会真 exit,但 dsh 会停)
@@ -527,7 +542,7 @@ elif [ -x "$RT_HOME/daemon" ] && [ -n "$NODE_BIN" ] && [ -n "$DSH_BIN" ]; then
     done
     # 收尾:无论就绪与否都先优雅停止 dsh。
     # 旧实现只在成功分支发 /stop;失败分支直接 kill 守护,而 dsh 是守护经 setsid 自成的
-    # 进程组(daemon.c:339),父进程被硬杀后它会**孤儿化**并继续监听端口、常驻内存
+    # 进程组(spawn_dsh() 里的 setsid()),父进程被硬杀后它会**孤儿化**并继续监听端口、常驻内存
     # (实测泄漏过 5 个:守护早已自退,dsh 仍在 127.0.0.1 上 LISTEN)。故两分支都发。
     # 先记 pid 再 /stop —— 守护停止 dsh 后会 unlink dsh.pid,那时就读不到了。
     WARM_DSH_PID="$(cat "$RT_STATE/dsh.pid" 2>/dev/null || true)"
@@ -574,7 +589,7 @@ elif [ -x "$RT_HOME/daemon" ] && [ -n "$NODE_BIN" ] && [ -n "$DSH_BIN" ]; then
     done
     # 兜底:守护被硬杀时 dsh 可能还活着 —— 失败分支的 /stop 未必生效(dsh 根本没起来时
     # 无人应答),而 dsh 因 setsid 不在守护的进程组里,不会随守护一起死。
-    # 用**负 PID 打整组**,与守护自身的停止逻辑一致(daemon.c:469:负 PID 整组发信号,
+    # 用**负 PID 打整组**,与守护自身的停止逻辑一致(stop_dsh():负 PID 整组发信号,
     # 防 node + pty 子进程残留)。仅在 pid 仍存活时才动手;此处距 spawn 仅 1~2s,
     # pid 复用概率可忽略。
     if [ -n "$WARM_DSH_PID" ] && [ "$WARM_DSH_PID" -gt 1 ] && [ "$WARM_DSH_PID" != "$$" ] \

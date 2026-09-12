@@ -4,6 +4,13 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      tag:
+        # 必需,且**不能**默认成 github.ref_name:workflow_dispatch 下 ref_name 是**分支名**
+        # (如 main),拿它建 release 会造出名为 "main" 的 release、以及内容为 "main" 的 VERSION。
+        description: '要发布的 tag,必须形如 v1.2.3(手动触发时 github.ref_name 是分支名,不可用)'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -16,6 +23,28 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: 解析并校验 release tag
+        id: tag
+        # 为什么单独一步:本 workflow 把 `github.ref_name` 同时用于 VERSION 文件与
+        # `gh release create` 的 tag,而 workflow_dispatch 触发时 ref_name 是**分支名**——
+        # 手动触发一次就会建出名为 "main" 的 release(审计 D5)。
+        # 这里统一解析成 $TAG 并**先校验形状**,让错误在构建早期就暴露,而不是发出去之后才发现。
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          case "$TAG" in
+            v[0-9]*) ;;
+            *)
+              echo "::error::release tag 必须形如 v<数字>…,实际得到 '$TAG'(workflow_dispatch 下 github.ref_name 是分支名,须用 inputs.tag 显式指定)"
+              exit 1
+              ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "将发布的 tag: $TAG"
       - name: 编译守护(universal binary,ad-hoc 签名)
         run: clang -O2 -Wall -Wextra -arch arm64 -arch x86_64 -o /tmp/daemon src/daemon.c && codesign --force -s - /tmp/daemon
       - name: 生成 pnpm-lock.yaml(预解析依赖树,用户安装跳解析省时;与 install.sh 同配置)
@@ -73,7 +102,7 @@ jobs:
           cp src/daemon.c /tmp/pkg/daemon.c
           # 包装器自身版本:install.sh 读包内 VERSION 写入 $RT_HOME/.wrapper-version,
           # 守护据此在 /health 报 wrapper_outdated。不写死常量,直接取触发本次构建的 tag。
-          printf '%s\n' "${{ github.ref_name }}" > /tmp/pkg/VERSION
+          printf '%s\n' "${{ steps.tag.outputs.tag }}" > /tmp/pkg/VERSION
           # 一致性记录:记录预编译 daemon 对应的 daemon.c 指纹。install.sh 预编译分支会把它
           # 落到 RT_HOME/.daemon.md5,使「发行包装机 → 后续源码安装」的免编译判断保持一致
           # (源码路径兼容:包内 daemon.c 在包根,仓库内为 src/daemon.c)。
@@ -109,7 +138,7 @@ jobs:
       - name: 发布到 GitHub Releases(下载链接)
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
           gh release create "$TAG" /tmp/pkg/dsh-pwa.zip /tmp/pkg/dsh-pwa.zip.sha256 \
             --repo "$GITHUB_REPOSITORY" \
@@ -123,7 +152,7 @@ jobs:
         # 发布成功 ≠ 资产可用,而 CI 里没有任何一步会去下载它。本步骤补上这个缺口:
         # 下载「用户实际会拿到的那份」,与本次构建产物比对哈希,不一致即让 Release 变红。
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
           BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"

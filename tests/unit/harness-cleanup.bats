@@ -110,7 +110,7 @@ daemon_launch_stmt() {
 }
 
 @test "workflow steps that background the daemon disable auto-update" {
-  # 守护**每次启动**都会 fork 一个 setsid 的更新检查子进程(见 src/daemon.c:1057 的注释),
+  # 守护**每次启动**都会 fork 一个 setsid 的更新检查子进程(见 trigger_background_update() 的注释),
   # 它先 sleep(10) 再 exec update-dsh.sh。在那 10s 里它是一个**同名的 daemon 进程**且自成会话
   # (setsid),因此「杀掉守护」根本杀不到它 —— 实测:父守护 95539 被杀后,子进程 95541 存活。
   # 短作业(job 收尾早于那 10s)就会在收尾时被 runner 抓成 orphan:ci-enhanced.yml 的性能基准

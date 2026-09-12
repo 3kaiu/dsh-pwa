@@ -323,3 +323,46 @@ detect_doc_counts() {
   [ "$n" -le 60 ] \
     || { echo "main() 又长回 $n 行(上界 60):请把新增阶段拆成具名函数,而不是堆回 main" >&2; return 1; }
 }
+
+# —— 引用锚点防漂移 ——
+detect_line_refs() { grep -nE 'daemon\.c:[0-9]+' "$1" 2>/dev/null || true; }
+
+@test "daemon.c references use symbol anchors, never line numbers" {
+  # 为什么禁行号:daemon.c 的行号引用会**系统性静默漂移**。2026-09-12 逐条核对
+  #   scripts/ 与 tests/ 里的全部引用,只有 4 处仍指向所称内容,其余全部指向无关代码
+  #   (例如某一处称「setsid 自成进程组」,该行实际是 `} else {`)。根因是行号描述的是
+  #   **位置**,而位置随任何一次编辑改变,改变之后**没有任何信号** —— 与本项目反复踩到的
+  #   「静默失效」同类。改用符号锚点(函数名)后,重命名会被编译/审查发现,而移动代码不会。
+  local probe="$BATS_TEST_TMPDIR/lineref-probe.md" C=':'
+  local f hits bad=0 scanned=0
+
+  # 反空转(正):合成违规样本必须命中。
+  #   注意用 ${C} 拼出冒号,**不能**把违规字面量直接写进本文件 —— 本文件也在扫描面内,
+  #   写字面量会让门禁被自己的探针文本触发(「探针污染被测面」)。
+  printf '%s\n' "# 见 daemon.c${C}339 的注释" > "$probe"
+  if [ -z "$(detect_line_refs "$probe")" ]; then
+    echo "门禁自检失败:检测器未命中合成违规样本(正则已失明)" >&2
+    return 1
+  fi
+  # 反空转(反):改用符号锚点后不得误报,否则门禁会拦住正确写法。
+  printf '%s\n' '# 见 spawn_dsh() 里的 setsid()' > "$probe"
+  if [ -n "$(detect_line_refs "$probe")" ]; then
+    echo "门禁自检失败:符号锚点写法被误报" >&2
+    return 1
+  fi
+
+  for f in "$ROOT"/scripts/*.sh "$ROOT"/tests/*.sh "$ROOT"/tests/unit/*.bats \
+           "$ROOT"/tests/lib/*.sh "$ROOT"/.github/workflows/*.yml; do
+    [ -f "$f" ] || continue
+    scanned=$((scanned + 1))
+    hits="$(detect_line_refs "$f")"
+    if [ -n "$hits" ]; then
+      echo "出现 daemon.c 行号引用(会静默漂移,请改用函数名锚点): $f" >&2
+      printf '%s\n' "$hits" | sed 's/^/    /' >&2
+      bad=1
+    fi
+  done
+  # 反空转(面):必须真的扫到文件。路径写错时 scanned=0 会让上面的循环空转通过。
+  [ "$scanned" -ge 10 ] || { echo "扫描面异常(只扫到 $scanned 个文件,glob 漂移?)" >&2; return 1; }
+  [ "$bad" -eq 0 ]
+}

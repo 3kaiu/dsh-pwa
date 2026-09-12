@@ -196,7 +196,7 @@ static int dsh_up(void) {
   return ok;
 }
 
-// 挑选空闲端口作为 dsh 内部端口(启动前调用,返回保持 bind 的 socket fd 以防窗口期被占)
+// 挑选空闲端口作为 dsh 内部端口(启动前调用,返回保持 bind 但未 listen 的 fd:只缩小窗口,非互斥,审计 E5)
 static int pick_port_fd(int *out_port) {
   int s = socket(AF_INET, SOCK_STREAM, 0);
   if (s < 0) return -1;

@@ -7,13 +7,13 @@ set -uo pipefail
 # 启动时暴露。无人值守的凌晨更新若留下一个起不来的 dsh,用户第二天看到的就是「服务消失」。
 #
 # 为什么不能直接在真实 RT_HOME 里探测:update-dsh.sh 整个运行期持 $RT_HOME/.install.lock,
-# 而守护的 update_locked() 据此判定「更新进行中」并**拒绝 spawn dsh**(daemon.c:321),
-# 于是「持锁者自己启动守护去拉起 dsh」是构造性死结——install.sh 暖机正是这样 100% 失败的
-# (见其 4c 注释)。故用临时 RT_HOME:守护从 RT_HOME 只读 run.json、.install.lock、
-# scripts/update-dsh.sh 三处(daemon.c:144/257/583),复制前两者即可,临时目录里没有锁,
-# 也就没有死结;再置 DSH_RT_NO_AUTO_UPDATE=1,免得它去找临时目录里并不存在的更新脚本。
+# 而守护的 update_locked() 据此判定「更新进行中」并**拒绝 spawn dsh**(spawn_dsh() 里的
+# update_locked() 分支),于是「持锁者自己启动守护去拉起 dsh」是构造性死结——install.sh 暖机
+# 正是这样 100% 失败的(见其 4c 注释)。故用临时 RT_HOME:守护从 RT_HOME 只读三处
+# (read_run() / update_locked() / trigger_background_update()),复制前两者即可,临时目录里
+# 没有锁,也就没有死结;再置 DSH_RT_NO_AUTO_UPDATE=1,免得它去找临时目录里并不存在的更新脚本。
 #
-# RT_STATE 必须保持**真实路径**:NODE_COMPILE_CACHE 由守护按 RT_STATE 计算(daemon.c:373),
+# RT_STATE 必须保持**真实路径**:NODE_COMPILE_CACHE 由 spawn_dsh() 按 RT_STATE 计算,
 # 指错地方这次启动就白起了(探测顺带把编译缓存填充好,用户下次真实启动更快)。
 # 代价是探测实例会把 dsh.json/dsh.pid 写进真实 RT_STATE,若此刻真实守护还活着就会覆盖它
 # 正在用的状态 —— 故这两个文件先快照、探测后原样恢复(见 snapshot_state/restore_state)。
