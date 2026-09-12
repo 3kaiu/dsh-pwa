@@ -12,6 +12,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Homebrew 打包(就绪,尚未发布)** — 新增 `packaging/homebrew/dsh-pwa.rb`(formula 单一真源)与 `scripts/bump-homebrew-formula.sh`(发版后更新 url/sha256,并顺手校验「下载物哈希 = 发布清单」)。formula 刻意**不自动安装运行时**:`launchctl bootstrap` 在非图形会话必失败却可能注销掉用户的 LaunchAgent,故只落载荷并暴露 `dsh-pwa-install` 由用户显式执行。已本地校验:`brew style` 零违规、sha256 与真实发布资产一致、发版脚本幂等且改写路径经「先破坏再修复」验证。**tap 仓库尚未创建**,故主 README 中标注为「尚未发布」
 - **docs/ 审计文档合并** — 把分散的审计/修复记录(对抗审计三轮、P0-P3 批次、全方位深度审计、冒烟复核)合并为单一 [docs/AUDIT_HISTORY.md](docs/AUDIT_HISTORY.md):按轮次归并去重、统一体例;**已修项一律标注修复提交号**(提交号是不可变证据,不会过期),未修项只记「记录时未修」而不承诺现状,并显式标注「这是快照,不是现状」。原文从工作树删除但可由 git 历史完整取回。docs/ 由 8 份收敛为 3 份(3,001 → 1,095 行)
 - **自动更新体系** — 新增 `scripts/update-dsh.sh`(npm view 解析 dist-tag 真实版本 → 与本地实际版本比较 → pnpm 增量更新,失败回滚保持当前版本,绝不回退 npm);updater LaunchAgent(`com.dshpwa.updater`)每天凌晨 2:30 定时触发;daemon 激活时后台触发(12h 节流,延迟 10s 不阻塞启动);与 install.sh 共用 `.install.lock`(mkdir 原子锁 + pid 存活检测 + TOCTOU claim 防护);更新前活跃度探测(dsh 运行中跳过本轮,等用户不在场);update.log 超 2MB 自动轮转(保留 update.log.1);release 打包补齐 updater 组件(update-dsh.sh + updater plist);node 路径优先从 `RT_HOME/run.json` 解析(launchd 环境无用户 PATH),PATH 前置 node 所在目录
 - **Host 头校验(防 DNS rebinding)** — 所有请求(引导页/控制端点/透传)统一在最前面校验 Host 精确等于 `127.0.0.1:PORT`/`localhost:PORT`,否则 403;防止 evil.com 解析到 127.0.0.1 后以"同源"身份读 `/health` 窃取 dsh token

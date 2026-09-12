@@ -141,7 +141,12 @@ teardown() {
           sub(/^[ \t]+/, "", t)
           if (substr(t, 1, 1) == "#") return
           if (!looks_like_call(t)) return
-          if (!(t ~ /--max-time[= ][0-9]/ || t ~ /-m [0-9]/))
+          # 允许 `--max-time 30` / `--max-time=30` / `--max-time  30`(多余空白也是合法写法)
+          # 与 `-m 30` / `-m30`。旧写法 `[= ][0-9]` 只认「恰好一个分隔符」,会把
+          # `--max-time  30` 误报成「无超时」——**对合法写法误报同样是门禁缺陷**
+          # (实测:新增脚本里 `--max-time  30` 被误判,而它与 `--max-time 30` 语义相同)。
+          # 用 POSIX 字符类 [[:space:]] 而非 [ \t]:BWK awk 的方括号内 \t 不可靠。
+          if (!(t ~ /--max-time[[:space:]=]+[0-9]/ || t ~ /-m[[:space:]]*[0-9]/))
             printf "%s:%d: [无超时] %s\n", F, ln, t
           if (!unset_proxy && !is_prose(t) \
               && t ~ /127\.0\.0\.1|localhost|\[::1\]/ && t !~ /--noproxy/)

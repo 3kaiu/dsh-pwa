@@ -35,6 +35,22 @@ curl -fsSL https://raw.githubusercontent.com/3kaiu/dsh-pwa/main/scripts/install.
 
 升级 = 重跑同一条命令(已最新则秒级跳过)。
 
+### Homebrew（打包就绪，**尚未发布**）
+
+formula 与发版脚本已备好并本地校验通过，但 **tap 仓库尚未创建**，所以下面的命令现在装不到 ——
+需仓库所有者先建 `3kaiu/homebrew-tap` 并放入 formula（步骤见
+[packaging/homebrew/README.md](packaging/homebrew/README.md)）：
+
+```bash
+brew tap 3kaiu/tap
+brew install 3kaiu/tap/dsh-pwa
+dsh-pwa-install          # 真正的运行时安装，在你自己的终端里执行
+```
+
+`brew install` 只落安装载荷，**不会**自动改你的系统：运行时安装（下载 Node、装 dsh、注册
+LaunchAgent）由 `dsh-pwa-install` 显式触发。原因是 `launchctl bootstrap` 在非图形会话
+（SSH/CI）中必失败，却可能把已有的 LaunchAgent 注销掉，而 `brew install` 完全可能被这类上下文调用。
+
 **版本固定:**
 
 ```bash
