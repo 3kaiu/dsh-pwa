@@ -126,6 +126,7 @@ bats -c tests/unit/*.bats     # 只统计数量,不执行
 - daemon-cases.bats: 守护进程黑盒用例(就绪门控/透传/启停等),不依赖真实 dsh,复用 `tests/lib/daemon-helpers.sh` 探测助手
 - wrapper-version.bats / dsh-probe.bats: 包装器自版本上报、更新后启动探测脚本(各自在隔离的临时 RT_HOME 内运行)
 - harness-cleanup.bats / warmup-orphan.bats: 测试与基准退出后不得留下守护进程、暖机孤儿清理
+- cleanup-deps.bats: `cleanup-deps.sh` 的**删除面**门禁 —— 合成 fixture 同时放入「该删」与「必须存活」两类做双向断言,dry-run 与真跑各测一遍,并带反空转(空树不得报告删除项)
 
 **覆盖:** 测试数量以运行器输出为准(`bats -c tests/unit/*.bats`),文档不手写数量 —— 手写值必然漂移,已由 `install-validation.bats` 的门禁守护。用例覆盖边界情况(端口范围、二进制大小、守护运行时行为)。
 

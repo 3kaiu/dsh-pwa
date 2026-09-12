@@ -23,6 +23,7 @@ All notable changes to this project will be documented in this file.
 - 自动更新人工验收清单(`tests/auto-update-checklist.md`)
 - **活文档防漂移门禁** — 文档不再手写测试数量(手写值必然漂移,且没人负责更新):数量一律以运行器输出为准(README「开发」段给出 `bats -c tests/unit/*.bats`,只统计不执行);新增 bats 门禁扫描 README / CHANGELOG / docs 下的设计文档,出现「数字+量词」即失败,并带正反双向自检(合成违规样本必须命中、合法内容不得误报)。带日期的历史审计快照不纳入 —— 改动它们等于篡改记录
 - **`main()` 结构门禁** — 新增 bats 用例守住 `main()` 的上界(60 行)与反空转:范围抽取必须真的命中,锚点漂移时 `n=0` 要报错,否则 `n=0` 会「通过」任何上界而使门禁恒绿。已用负控验证 —— 72 行的 `main` 与无锚点文件都必须 FAIL,现状 43 行 PASS
+- **`cleanup-deps.sh --dry-run`** — 支持 `--dry-run`(`-n`)只打印将被删除的路径、不做改动。设计上把「选谁」(各段 `find` 谓词)与「怎么处置」(唯一的 `del` 出口)分开,故 dry-run 的选中集合与真实删除**必然一致**,不会出现「dry-run 对、真删错」这种两套逻辑各写一遍导致的假保证
 
 ### Fixed
 
@@ -32,6 +33,7 @@ All notable changes to this project will be documented in this file.
 - **停止竞态修复** — `/stop` 与并发 `/wake` 的状态文件误删竞态(停止串行化,见 Changed);锁竞态(install.lock 抢占的 TOCTOU claim 防护)
 - **审计未闭合项复核与修复** — 逐条回到代码核对(审计报告是快照,不是现状),修掉 5 处:E5 `pick_port_fd` 函数头注释按实现改写(端口预留只缩小窗口、不构成互斥);C3 `install.sh` 的 `A && B || C` 补显式括号,把左结合语义写死;D2/D3 取 node LTS 版本依赖 `python3`(macOS 12.3+ 不再自带)且失败时**静默**落到硬编码兜底,改为两条失败路径都显式告警;D5 `release.yml` 用 `github.ref_name` 同时作 VERSION 与 release tag,而 `workflow_dispatch` 下它是**分支名**(会建出名为 `main` 的 release),改为显式 `inputs.tag` + 形状校验。A3(流水线请求只校验第一个)复核后确认影响有界,按审计给出的另一选项写入 README 的「已知限制(威胁模型)」
 - **`daemon.c` 引用改为符号锚点** — 复核发现 `scripts/` 与 `tests/` 里 13 处 `daemon.c:NNN` 行号引用**系统性漂移**:只有 4 处仍指向所称内容,其余指向无关代码。根因是行号描述**位置**,而位置随任何一次编辑改变且改变后**没有任何信号**。全部改为符号锚点(`read_run` / `update_locked` / `spawn_dsh` / `stop_dsh` / `trigger_background_update` / `maybe_scan_token` 等),并新增门禁禁止行号引用回归(带正反自检与扫描面反空转)
+- **`cleanup-deps.sh` 删除面纳入门禁(审计 C2)** — 该脚本在安装与更新两条路径上**真删文件**,而此前唯一的把关是 `bash -n`(只查语法),没有任何用例覆盖「它到底删了什么」。新增 `tests/unit/cleanup-deps.bats`:用合成 fixture 同时放入「该删」与「必须存活」两类做**双向**断言,dry-run 与真跑各测一遍(「选中」≠「真的删掉了」),并带两条反空转(空树不得报告删除项、缺 node_modules 应静默跳过)。已用负控验证 —— 从谓词里去掉 `! -name "README.md"` 后 dry-run 与真跑**两条**用例都 FAIL 并点名该文件
 
 ### Security
 
