@@ -47,7 +47,7 @@
 #include <time.h>
 #include <unistd.h>
 
-static char RT_HOME[1024], RT_STATE[1024], LOG_DIR[1024], LOG_FILE[1100], BOOT_PAGE[4096];
+static char RT_HOME[1024], RT_STATE[1024], LOG_DIR[1024], LOG_FILE[1100], BOOT_PAGE[8192];
 static char DSH_JSON[1100], PID_FILE[1100], DSH_HOME[1024];
 static char NODE_BIN[1024], DSH_BIN[1024];
 static int PORT = 3080, IDLE_STOP = 30, GOODBYE_GRACE = 12;
@@ -676,7 +676,13 @@ static void html_escape(const char *s, char *o, size_t cap) {
 static void build_boot(void) {
   char esc[2048];
   html_escape(LOG_DIR, esc, sizeof esc);
-  snprintf(BOOT_PAGE, sizeof BOOT_PAGE, "%s%s%s", TPL_HEAD, esc, TPL_TAIL);
+  int n = snprintf(BOOT_PAGE, sizeof BOOT_PAGE, "%s%s%s", TPL_HEAD, esc, TPL_TAIL);
+  // E4:实测 TPL_HEAD+TPL_TAIL 已占 3431/4096(85%),LOG_DIR 一变长就会静默截断成半截 HTML /
+  // 半截 <script>,引导页白屏且**没有任何信号**。缓冲提到 8192,并让截断可观测 ——
+  // 只把缓冲调大是不够的,否则下次改模板又是同一个静默失败。
+  if (n < 0 || (size_t)n >= sizeof BOOT_PAGE)
+    fprintf(stderr, "daemon: 引导页超出缓冲(%d >= %zu),已截断 —— 请调大 BOOT_PAGE\n",
+            n, sizeof BOOT_PAGE);
 }
 
 // ---------- HTTP ----------
@@ -692,28 +698,90 @@ static void respond(int c, int code, const char *ct, const char *body) {
   write_all(c, body, strlen(body));
 }
 
+// 读一行版本字符串(包装器自身版本 / 远端最新 tag):跳过前导空白、截到行尾,
+// 只接受 [A-Za-z0-9._+-],并把可选的 'v' 前缀归一化掉(v0.3.3 与 0.3.3 视为同版)。
+// 字符集白名单是必需的 —— 该值会原样嵌进 /health 的 JSON。
+// 返回 1 = 拿到可用值。
+static int read_version_file(const char *path, char *out, size_t cap) {
+  out[0] = 0;
+  if (cap < 2) return 0;
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) return 0;
+  char b[128];
+  ssize_t n = read(fd, b, sizeof b - 1);
+  close(fd);
+  if (n <= 0) return 0;
+  b[n] = 0;
+  const char *p = b;
+  while (*p == ' ' || *p == '\t') p++;
+  size_t i = 0;
+  while (i < cap - 1 && p[i]) {
+    char ch = p[i];
+    if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+          ch == '.' || ch == '-' || ch == '_' || ch == '+')) break;
+    out[i] = ch;
+    i++;
+  }
+  out[i] = 0;
+  if (out[0] == 'v' && out[1] >= '0' && out[1] <= '9') memmove(out, out + 1, strlen(out));
+  return out[0] != 0;
+}
+
+// 包装器**自身**版本(自我升级的可见性基础),产出 /health 的 JSON 片段。
+// DSH_VERSION 是 dsh 的版本,而现有自动更新也只更新 dsh —— 装了 v0.3.1 的用户永远不知道
+// 自己落后,而 v0.3.3 之前的安装是根本装不上的。这里只做**比较**,不做网络:
+//   .wrapper-version 由 install.sh 写入(安装时即已知);
+//   wrapper.latest   由 update-dsh.sh 按 12h 节流从 GitHub releases 取回。
+// 两者都在且不同 ⇒ 包装器落后。任一缺失则**不报**该字段 —— 未知不等于落后。
+// 返回写入 buf 的片段长度(0 = 不报)。
+static size_t wrapper_json(char *buf, size_t cap) {
+  buf[0] = 0;
+  if (cap == 0) return 0;
+  char path[1100], wv[64], wl[64];
+  snprintf(path, sizeof path, "%s/.wrapper-version", RT_HOME);
+  if (!read_version_file(path, wv, sizeof wv)) return 0;
+  snprintf(path, sizeof path, "%s/wrapper.latest", RT_STATE);
+  read_version_file(path, wl, sizeof wl);
+  int n;
+  if (wl[0])
+    // wv / wl 均已过字符集白名单,可安全嵌入
+    n = snprintf(buf, cap, ",\"wrapper_version\":\"%s\",\"wrapper_latest\":\"%s\",\"wrapper_outdated\":%s",
+                 wv, wl, strcmp(wv, wl) != 0 ? "true" : "false");
+  else
+    n = snprintf(buf, cap, ",\"wrapper_version\":\"%s\"", wv);
+  if (n < 0 || (size_t)n >= cap) { buf[0] = 0; return 0; }
+  return (size_t)n;
+}
+
 static void respond_health(int c) {
-  // 512:dsh_token 已放宽到 256(E1),JSON 里还要塞 port/pid,256 会截断 → token 被静默丢弃。
-  char body[512];
+  // 768:dsh_token 已放宽到 256(E1),再叠上包装器版本字段;512 会在 token 满长时截断
+  // → token 被静默丢弃(引导页无限等 token)。
+  char body[768];
   // 报"就绪"(能服务 HTTP)而非仅"进程活着":引导页据此切换,避免过早 reload 进未就绪的 dsh → PWA 空白。
   // 就绪判定只看 HTTP 探测,不等 token:token 未捕获时省略该字段(dsh:true 仍报出),
   // 引导页 JS 负责在该窗口内等 token 出现再握手(见 TPL 内注释),冷启动不再多等 2s 宽限。
   int ready = dsh_ready();
   int pid = ready ? read_pid() : 0;
-  int n = -1;
-  if (ready && token_json_safe())
-    // token 仅在本机回环端口经同源 fetch 可读(无 CORS 头,跨域页面读不到),
-    // 信任级别与日志文件里的 token URL 相同;dsh 0.1.5+ 引导页用它完成 /?token= 握手。
-    // token_json_safe 已保证字符集可安全嵌入(见其定义),无需转义。
-    n = snprintf(body, sizeof body, "{\"dsh\":true,\"port\":%d,\"pid\":%d,\"token\":\"%s\"}", dsh_port, pid, dsh_token);
-  if (n < 0 || (size_t)n >= sizeof body) {
-    if (!ready && spawn_pid > 0)
-      // dsh 正在启动中(spawn_dsh 已 fork 但尚未就绪):引导页据此显示进度条,不再重复发 /wake
-      snprintf(body, sizeof body, "{\"dsh\":false,\"port\":0,\"pid\":0,\"starting\":true}");
-    else
-      snprintf(body, sizeof body, "{\"dsh\":%s,\"port\":%d,\"pid\":%d}",
-               ready ? "true" : "false", ready ? dsh_port : 0, pid);
-  }
+  char wjson[192];
+  wrapper_json(wjson, sizeof wjson);
+  // token 仅在本机回环端口经同源 fetch 可读(无 CORS 头,跨域页面读不到),
+  // 信任级别与日志文件里的 token URL 相同;dsh 0.1.5+ 引导页用它完成 /?token= 握手。
+  // token_json_safe 已保证字符集可安全嵌入(见其定义),无需转义。
+  char tok[300] = "";
+  if (ready && token_json_safe()) snprintf(tok, sizeof tok, ",\"token\":\"%s\"", dsh_token);
+  int n;
+  if (ready)
+    n = snprintf(body, sizeof body, "{\"dsh\":true,\"port\":%d,\"pid\":%d%s%s}", dsh_port, pid, tok, wjson);
+  else if (spawn_pid > 0)
+    // dsh 正在启动中(spawn_dsh 已 fork 但尚未就绪):引导页据此显示进度条,不再重复发 /wake
+    n = snprintf(body, sizeof body, "{\"dsh\":false,\"port\":0,\"pid\":0,\"starting\":true%s}", wjson);
+  else
+    n = snprintf(body, sizeof body, "{\"dsh\":false,\"port\":0,\"pid\":0%s}", wjson);
+  if (n < 0 || (size_t)n >= sizeof body)
+    // 兜底:一个可选字段都不放。**绝不能发出被截断的 JSON** —— 旧实现只在 token 形态溢出时
+    // 兜底,且兜底体不含包装器字段,于是字段一多就静默丢失(与 E4 同一类缺陷)。
+    snprintf(body, sizeof body, "{\"dsh\":%s,\"port\":%d,\"pid\":%d}",
+             ready ? "true" : "false", ready ? dsh_port : 0, pid);
   respond(c, 200, "application/json", body);
 }
 

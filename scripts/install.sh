@@ -259,18 +259,37 @@ fi
 
 if [ -n "$LATEST" ] && [ "$CUR_DSH" != "$LATEST" ] || [ -z "$CUR_DSH" ]; then
   printf '{"name":"dsh-runtime-app","private":true,"dependencies":{"@deepseek-ai/dsh":"%s"},"pnpm":{"onlyBuiltDependencies":["node-pty","koffi","@deepseek-ai/dsh-subprocess-local"]}}\n' "${LATEST:-latest}" > "$APP_DIR/package.json"
-  [ -f "$ROOT/pnpm-lock.yaml" ] && cp "$ROOT/pnpm-lock.yaml" "$APP_DIR/"
+  # A5:依赖树的完整性锚点。发行包携带 release.yml 现场生成、并经该 workflow 的端到端冒烟
+  # 真实验证过的 pnpm-lock.yaml。旧实现只是「有就拷过来」,从不冻结 —— 于是 lock 与
+  # package.json 一旦不一致,pnpm 会**静默重新解析**整棵树,integrity 锚点形同虚设;
+  # 源码树安装($ROOT 无 lock)更是每次都现场解析,连一句提示都没有。
+  # 现在:拷进 APP_DIR 并在**首次安装**路径上冻结;缺失时显式告警而非静默降级。
+  # 只冻 install 不冻 update —— `pnpm update` 的目的就是移动版本,冻结会自相矛盾。
+  LOCK_ARG=""
+  if [ -f "$ROOT/pnpm-lock.yaml" ]; then
+    cp "$ROOT/pnpm-lock.yaml" "$APP_DIR/"
+    if [ "$DSH_VERSION" != "latest" ]; then
+      # 锁是按 latest 解析的:指定具体版本时装它必然对不上,--frozen-lockfile 会直接报错退出
+      warn "DSH_VERSION=$DSH_VERSION 与发行包锁定的依赖树不一致,本次不冻结 lockfile"
+    elif [ -n "${DSH_RT_NO_FROZEN_LOCK:-}" ]; then
+      warn "DSH_RT_NO_FROZEN_LOCK 已置位:跳过 --frozen-lockfile(依赖树将现场解析)"
+    else
+      LOCK_ARG="--frozen-lockfile"
+    fi
+  else
+    warn "未找到 pnpm-lock.yaml:本次将现场解析依赖树(无 integrity 锚点;发行包内应携带该文件)"
+  fi
   stop_active_dsh "$PORT"   # 依赖树即将被替换:先停掉正在运行的 dsh
   
   NPM_START="$SECONDS"
   if [ -z "$CUR_DSH" ] || [ -n "${DSH_RT_FORCE_REINSTALL:-}" ]; then
     # 首次安装或强制重装
     echo "  ${D}pnpm install dsh@${LATEST:-latest}(首次约 1~5 分钟视网络)${R}"
-    NPM_CMD="install"; NPM_TARGET=""
+    NPM_CMD="install"; NPM_TARGET=""; NPM_EXTRA="$LOCK_ARG"
   else
     # 增量升级 (仅下载变化的包)
     echo "  ${D}增量升级 dsh: $CUR_DSH → ${LATEST} (pnpm 仅拉差异包)${R}"
-    NPM_CMD="update"; NPM_TARGET="@deepseek-ai/dsh"
+    NPM_CMD="update"; NPM_TARGET="@deepseek-ai/dsh"; NPM_EXTRA=""
   fi
   
   # 并行启动 npm 操作和 daemon 编译
@@ -287,7 +306,7 @@ if [ -n "$LATEST" ] && [ "$CUR_DSH" != "$LATEST" ] || [ -z "$CUR_DSH" ]; then
   # npm install/update (主进程等待)
   # 追加而非覆盖:用户可能已设 NODE_OPTIONS(如企业代理需 --use-system-ca),覆盖会静默丢弃。
   if ! PATH="$NODE_DIR/bin:$PATH" NODE_OPTIONS="--max-old-space-size=4096${NODE_OPTIONS:+ $NODE_OPTIONS}" npx_pnpm \
-       --dir "$APP_DIR" --store-dir "$PNPM_STORE" $NPM_CMD $NPM_TARGET --prefer-offline; then
+       --dir "$APP_DIR" --store-dir "$PNPM_STORE" $NPM_CMD $NPM_TARGET $NPM_EXTRA --prefer-offline; then
     # 如果是 update 失败,尝试回退到全量 install
     if [ "$NPM_CMD" = "update" ]; then
       warn "增量升级失败,回退到全量重装..."
@@ -408,6 +427,23 @@ if [ -d "$ROOT/scripts" ]; then
     fi
   done
 fi
+
+# ---------- 4b2) 包装器**自身**版本(自我升级的可见性基础) ----------
+# DSH_VERSION 是 dsh 的版本;包装器此前**完全没有版本标识**,于是自动更新只更新 dsh,
+# 装了旧包装器的用户永远不知道自己落后(v0.3.3 之前的安装更是根本装不上)。
+# 来源优先级:发行包内 VERSION(release.yml 写入 tag)> git describe(从源码树运行)
+#            > DSH_RT_RELEASE_TAG > unknown。
+# **不写死常量**:可验证的数字靠手写正是本项目两次踩到的漂移根因。
+WRAPPER_VERSION=""
+if [ -f "$ROOT/VERSION" ]; then
+  WRAPPER_VERSION="$(head -n 1 "$ROOT/VERSION" 2>/dev/null | tr -d '[:space:]' || true)"
+elif [ -d "$ROOT/.git" ] && command -v git >/dev/null 2>&1; then
+  WRAPPER_VERSION="$(git -C "$ROOT" describe --tags --always 2>/dev/null || true)"
+fi
+[ -n "$WRAPPER_VERSION" ] || WRAPPER_VERSION="$RELEASE_TAG"
+[ -n "$WRAPPER_VERSION" ] || WRAPPER_VERSION="unknown"
+printf '%s\n' "$WRAPPER_VERSION" > "$RT_HOME/.wrapper-version"
+chmod 600 "$RT_HOME/.wrapper-version" 2>/dev/null || true
 
 # ---------- 4c) 暖机:安装后预热 NODE_COMPILE_CACHE 与文件系统缓存 ----------
 # 零常驻不改:暖机是「安装时一次性」行为,不是登录常驻。启动守护前台模式,
@@ -648,7 +684,7 @@ fi
 SECS=$(( $(date +%s) - START_TS ))
 echo
 echo "${G}✓${R} ${B}安装完成${R}(${D}${SECS}s${R})"
-echo "  ${D}node v$("$NODE_BIN" --version 2>/dev/null | sed 's/^v//' || echo -) · dsh $CUR_DSH · 运行时 $RT_HOME${R}"
+echo "  ${D}node v$("$NODE_BIN" --version 2>/dev/null | sed 's/^v//' || echo -) · dsh $CUR_DSH · 包装器 $WRAPPER_VERSION · 运行时 $RT_HOME${R}"
 # 暖机结论必须如实出现在收尾摘要里:成功/失败/跳过三态都要点名,
 # 不能只在成功时打印一行(否则「没打印」会被读成「不需要」)。
 if [ -f "$RT_STATE/warmup.ok" ]; then

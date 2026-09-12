@@ -89,6 +89,38 @@ if "$NODE_BIN" --use-system-ca -e '' >/dev/null 2>&1; then
   export NODE_OPTIONS
 fi
 
+# ---------- 包装器自身版本:取回远端最新 tag(自我升级的可见性基础) ----------
+# 分工:这里只负责把远端 tag 写进 $RT_STATE/wrapper.latest,**比较由守护做**(/health 的
+# wrapper_outdated)。原因是守护是 C、没有 TLS,网络只能在有 curl 的这里做;而守护每次激活
+# 都要读,必须廉价。install.sh 把本机版本写进 $RT_HOME/.wrapper-version。
+# 12h 节流用**独立**时间戳(不与 last_update_check 共用,免得一个失败拖住另一个);
+# 取不到一律静默返回 —— 拿不到 ≠ 落后,绝不能因此把用户标成 outdated。
+WRAPPER_REPO="${DSH_RT_REPO:-3kaiu/dsh-pwa}"
+# 测试接缝:门禁要能指向本地桩服务器,否则这段逻辑只能靠"读代码觉得对"来验收。
+WRAPPER_LATEST_URL="${DSH_RT_WRAPPER_LATEST_URL:-https://github.com/${WRAPPER_REPO}/releases/latest}"
+check_wrapper_version() {
+  [ -z "${DSH_RT_NO_WRAPPER_CHECK:-}" ] || return 0
+  local stamp="$RT_STATE/wrapper.latest.checked" now last latest
+  now="$(date +%s)"
+  if [ -f "$stamp" ]; then
+    last="$(head -n 1 "$stamp" 2>/dev/null || true)"
+    case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    [ "$(( now - last ))" -ge 43200 ] || return 0
+  fi
+  # 先落时间戳再取:取失败也不该在 12h 内反复打网络(与守护的更新节流同一取舍)
+  printf '%s\n' "$now" > "$stamp" 2>/dev/null || true
+  # 用 releases/latest 的 302 取 tag,而不是 GitHub API:免掉未认证请求的速率限制,
+  # 也不用解析 JSON(JSON 里的逗号会让朴素的行解析出错)。-w %{url_effective} 给最终 URL。
+  latest="$(curl -fsSL --max-time 8 -o /dev/null -w '%{url_effective}' \
+    "$WRAPPER_LATEST_URL" 2>/dev/null || true)"
+  latest="${latest##*/}"
+  # 必须形如 v<数字>:仓库没有 release 时上面会重定向到 /releases,末段是字面量
+  # "releases" —— 不挡住它就会把每个用户都标成落后(假阳性比不报更糟)。
+  case "$latest" in v[0-9]*) ;; *) return 0 ;; esac
+  printf '%s\n' "$latest" > "$RT_STATE/wrapper.latest" 2>/dev/null || true
+}
+check_wrapper_version
+
 CUR="$(read_version)"
 if [ -z "$CUR" ]; then
   log "! $(date '+%Y-%m-%d %H:%M:%S') 无法读取当前已装版本,跳过更新"

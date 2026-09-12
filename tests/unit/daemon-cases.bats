@@ -1346,3 +1346,109 @@ print(data.decode("latin1").split("\r\n")[0])
     *) echo "  截断请求头未返回 400,实际:[$out]" >&2; return 1 ;;
   esac
 }
+
+# ---- 包装器自我版本(/health 的 wrapper_* 字段)与引导页完整性 ----
+# 背景:包装器此前完全没有版本标识 —— DSH_VERSION 是 dsh 的版本,自动更新也只更新 dsh,
+# 于是装了旧包装器的用户永远不知道自己落后(v0.3.3 之前的安装更是根本装不上)。
+# 这里只验证**比较**逻辑:本机版本来自 $RT_HOME/.wrapper-version(install.sh 写入),
+# 远端最新 tag 来自 $RT_STATE/wrapper.latest(update-dsh.sh 写入)。守护不做网络。
+# 判据刻意区分「落后」与「未知」:任一文件缺失都必须**不报**该字段 —— 未知 ≠ 落后。
+
+@test "health omits wrapper fields when no wrapper version is recorded" {
+  start_daemon_env '{"node":"/nonexistent/dsh-unit-node","dsh":"/nonexistent/dsh-unit-dsh"}'
+  run curl -s --max-time 2 "http://127.0.0.1:$PORT/health"
+  [ "$status" -eq 0 ]
+  assert_body_match '"dsh":false'
+  case "$output" in
+    *wrapper_version*)
+      echo "  未安装包装器版本时不应报 wrapper_version: $output" >&2
+      return 1 ;;
+  esac
+}
+
+@test "health reports wrapper_outdated when local and remote versions differ" {
+  start_daemon_env '{"node":"/nonexistent/dsh-unit-node","dsh":"/nonexistent/dsh-unit-dsh"}'
+  printf 'v0.3.1\n' > "$TMP_ENV/rt/.wrapper-version"
+  printf 'v0.3.9\n' > "$TMP_ENV/state/wrapper.latest"
+  run curl -s --max-time 2 "http://127.0.0.1:$PORT/health"
+  [ "$status" -eq 0 ]
+  assert_body_match '"wrapper_version":"0.3.1"'
+  assert_body_match '"wrapper_latest":"0.3.9"'
+  assert_body_match '"wrapper_outdated":true'
+}
+
+@test "health normalizes the v prefix and does not flag an up-to-date wrapper" {
+  start_daemon_env '{"node":"/nonexistent/dsh-unit-node","dsh":"/nonexistent/dsh-unit-dsh"}'
+  # 两侧写法不同(v 前缀只在一侧)但语义同版 → 必须判为不落后。
+  # 若归一化失效,这里会恒报 outdated,而「永远提示升级」和「从不提示」一样是坏掉的信号。
+  printf '0.3.3\n' > "$TMP_ENV/rt/.wrapper-version"
+  printf 'v0.3.3\n' > "$TMP_ENV/state/wrapper.latest"
+  run curl -s --max-time 2 "http://127.0.0.1:$PORT/health"
+  [ "$status" -eq 0 ]
+  assert_body_match '"wrapper_outdated":false'
+}
+
+@test "health reports wrapper_version without latest when the remote tag is unknown" {
+  start_daemon_env '{"node":"/nonexistent/dsh-unit-node","dsh":"/nonexistent/dsh-unit-dsh"}'
+  printf 'v0.3.3\n' > "$TMP_ENV/rt/.wrapper-version"
+  run curl -s --max-time 2 "http://127.0.0.1:$PORT/health"
+  [ "$status" -eq 0 ]
+  assert_body_match '"wrapper_version":"0.3.3"'
+  case "$output" in
+    *wrapper_outdated*)
+      echo "  远端 tag 未知时不应报 wrapper_outdated(未知 ≠ 落后): $output" >&2
+      return 1 ;;
+  esac
+}
+
+@test "health never emits a version string outside the whitelist charset" {
+  start_daemon_env '{"node":"/nonexistent/dsh-unit-node","dsh":"/nonexistent/dsh-unit-dsh"}'
+  # 该值会被原样嵌进 JSON。被污染的文件不能把 JSON 拆掉(引号/反斜杠必须被拒)。
+  printf 'v1.0";"injected":"yes\n' > "$TMP_ENV/rt/.wrapper-version"
+  run curl -s --max-time 2 "http://127.0.0.1:$PORT/health"
+  [ "$status" -eq 0 ]
+  case "$output" in
+    *injected*)
+      echo "  非法字符集被放进了 JSON: $output" >&2
+      return 1 ;;
+  esac
+  assert_body_match '"dsh":false'
+  # 正控:同一路径换成合法值后字段必须出现 —— 证明上一步的「没有」是字符集过滤的结果,
+  # 而不是这条链路压根没生效(否则本用例在修复前也会通过,属空转)。
+  printf 'v0.3.3\n' > "$TMP_ENV/rt/.wrapper-version"
+  run curl -s --max-time 2 "http://127.0.0.1:$PORT/health"
+  assert_body_match '"wrapper_version":"0.3.3"'
+}
+
+@test "boot page survives a long LOG_DIR instead of being silently truncated" {
+  # E4 回归。TPL_HEAD+TPL_TAIL 实测 3431 字节,旧缓冲 4096 只留 665 字节给 LOG_DIR ——
+  # 一旦 LOG_DIR 变长(用户自定义 DSH_RT_STATE、或模板再长一点),snprintf 就静默截断成
+  # 半截 HTML / 半截 <script>,引导页白屏且**没有任何信号**。
+  # 用一条约 700 字符的 RT_STATE 把这个边界真实推过 4096:修复前必然丢掉 </html>,
+  # 修复后(8192)完整。判据取收尾标签 —— 截断必然丢掉它,而它不可能被别的东西补齐。
+  # 单个路径分量不能超过 NAME_MAX(255),故拆成多段拼出约 790 字符的 RT_STATE。
+  local LONG="$BATS_TEST_TMPDIR" seg i
+  seg="$(printf 'p%.0s' $(seq 1 180))"
+  for i in 1 2 3 4; do LONG="$LONG/$seg"; done
+  mkdir -p "$LONG/rt" "$LONG/state/logs"
+  export DSH_RT_HOME="$LONG/rt" DSH_RT_STATE="$LONG/state" DSH_HOME="$LONG/home"
+  export DSH_RT_IDLE_STOP_SECS=2
+  export DSH_RT_NO_AUTO_UPDATE=1
+  TMP_ENV="$LONG"
+  PORT="$(pick_free_port)"
+  export DSH_RT_PORT="$PORT"
+  if ! daemon_compile "$LONG/daemon"; then
+    echo "  daemon 编译失败" >&2
+    return 1
+  fi
+  DAEMON_PID="$(daemon_start_foreground "$LONG/daemon" "$LONG/daemon.log")"
+  if ! daemon_wait_health "$PORT" any 5; then
+    echo "  daemon 未就绪(日志见 $LONG/daemon.log)" >&2
+    return 1
+  fi
+  run curl -s --max-time 2 "http://127.0.0.1:$PORT/"
+  [ "$status" -eq 0 ]
+  # 反空转:先确认拿到的确实是一份引导页(否则「有 </html>」可能来自别的响应)
+  assert_body_match 'DeepSeek Harness'
+  assert_body_match '</html>'
+}

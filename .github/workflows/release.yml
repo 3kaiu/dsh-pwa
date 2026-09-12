@@ -24,7 +24,9 @@ jobs:
           DSH_VERSION="${DSH_VERSION:-latest}"
           npm i -g pnpm@10 >/dev/null 2>&1
           mkdir -p /tmp/dsh-lock
-          printf '{"name":"dsh-lock","private":true,"dependencies":{"@deepseek-ai/dsh":"%s"},"pnpm":{"onlyBuiltDependencies":["node-pty","koffi","@deepseek-ai/dsh-subprocess-local"]}}\n' "$DSH_VERSION" > /tmp/dsh-lock/package.json
+          # 与 install.sh 写进 $APP_DIR/package.json 的内容**逐字一致**(含 name):
+          # install.sh 现在会带 --frozen-lockfile 安装,任何字段漂移都会让冻结校验失败。
+          printf '{"name":"dsh-runtime-app","private":true,"dependencies":{"@deepseek-ai/dsh":"%s"},"pnpm":{"onlyBuiltDependencies":["node-pty","koffi","@deepseek-ai/dsh-subprocess-local"]}}\n' "$DSH_VERSION" > /tmp/dsh-lock/package.json
           cd /tmp/dsh-lock && pnpm install --lockfile-only --ignore-scripts --loglevel=error
           mkdir -p /tmp/pkg
           cp /tmp/dsh-lock/pnpm-lock.yaml /tmp/pkg/pnpm-lock.yaml
@@ -56,14 +58,22 @@ jobs:
         # release 也可能在无 GUI 会话的 runner 上跑:smoke-test.sh 对 socket activation 段
         # 做条件跳过并显式输出 [SKIP](不静默),其余冒烟项必须真实通过
         run: bash scripts/smoke-test.sh
-      - name: 打包(install.sh + daemon + daemon.c + plist + lock + cleanup + update-dsh)
+      - name: 打包(install.sh + daemon + daemon.c + plist + lock + cleanup + update-dsh + dsh-probe)
         run: |
           mkdir -p /tmp/pkg/launchd /tmp/pkg/scripts
           cp /tmp/daemon /tmp/pkg/daemon
           cp scripts/install.sh /tmp/pkg/install.sh
           cp scripts/cleanup-deps.sh /tmp/pkg/scripts/cleanup-deps.sh
           cp scripts/update-dsh.sh /tmp/pkg/scripts/update-dsh.sh
+          # dsh-probe.sh 是 A4「更新后真实启动探测」的执行体:update-dsh.sh 通过
+          # $RT_HOME/scripts/dsh-probe.sh 调用它,install.sh 从 $ROOT/scripts/ 部署。
+          # 漏打进包 ⇒ install.sh 的 [ -f ... ] 为假 ⇒ 静默不部署 ⇒ 更新器每次只打印
+          # 「启动探测脚本缺失,跳过探测」⇒ A4 在实际发行里**完全失效却全绿**。
+          cp scripts/dsh-probe.sh /tmp/pkg/scripts/dsh-probe.sh
           cp src/daemon.c /tmp/pkg/daemon.c
+          # 包装器自身版本:install.sh 读包内 VERSION 写入 $RT_HOME/.wrapper-version,
+          # 守护据此在 /health 报 wrapper_outdated。不写死常量,直接取触发本次构建的 tag。
+          printf '%s\n' "${{ github.ref_name }}" > /tmp/pkg/VERSION
           # 一致性记录:记录预编译 daemon 对应的 daemon.c 指纹。install.sh 预编译分支会把它
           # 落到 RT_HOME/.daemon.md5,使「发行包装机 → 后续源码安装」的免编译判断保持一致
           # (源码路径兼容:包内 daemon.c 在包根,仓库内为 src/daemon.c)。
@@ -84,6 +94,13 @@ jobs:
           ( cd /tmp/pkg-e2e && unzip -q /tmp/pkg/dsh-pwa.zip )
           [ -f /tmp/pkg-e2e/install.sh ] || { echo "::error::发行包内缺少 install.sh"; exit 1; }
           [ -f /tmp/pkg-e2e/daemon ] || { echo "::error::发行包内缺少预编译 daemon"; exit 1; }
+          # 脚本与版本文件是「静默降级」的高危区:缺 dsh-probe.sh ⇒ 更新器的 A4 探测永远跳过;
+          # 缺 VERSION ⇒ 包装器自我版本退化成 unknown、/health 的 wrapper_outdated 失去意义。
+          # 两者都只在运行期打一行日志,冒烟也不会因此变红 —— 故必须在打包处硬断言。
+          for f in scripts/update-dsh.sh scripts/cleanup-deps.sh scripts/dsh-probe.sh VERSION; do
+            [ -f "/tmp/pkg-e2e/$f" ] || { echo "::error::发行包内缺少 $f"; exit 1; }
+          done
+          echo "✓ 包内容完整(install.sh / daemon / 3 个脚本 / VERSION)"
           # 用包内 install.sh(而非仓库 scripts/install.sh)跑完整冒烟:
           # install → 守护 → 唤醒 → 透传 → 空闲自停。SMOKE_ROOT/SMOKE_PORT 隔离,
           # 避免与上一步冒烟互相污染。

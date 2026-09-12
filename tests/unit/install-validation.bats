@@ -187,3 +187,51 @@ teardown() {
   done
   [ "$bad" -eq 0 ]
 }
+
+# ---- A5:依赖树的完整性锚点 ----
+# 背景:仓库不跟踪任何 lockfile,发行包内的 pnpm-lock.yaml 由 release.yml 现场生成。
+# 旧实现只是「有就拷过来」却从不冻结,于是 lock 与 package.json 一旦不一致,pnpm 会
+# **静默重新解析**整棵树 —— 锚点形同虚设;源码树安装更是每次都现场解析且毫无提示。
+
+# 取 printf 的格式串(单引号内到 \n' 为止),只认含 dsh-runtime-app 的那一条。
+extract_manifest_fmt() {
+  awk '
+    {
+      i = index($0, "printf \047")
+      if (i == 0) next
+      s = substr($0, i + 8)
+      if (index(s, "dsh-runtime-app") == 0) next
+      j = index(s, "\\n\047")
+      if (j == 0) next
+      print substr(s, 1, j - 1)
+      exit
+    }
+  ' "$1"
+}
+
+@test "install.sh freezes the shipped lockfile and warns when it is absent" {
+  grep -q 'LOCK_ARG="--frozen-lockfile"' "$ROOT/scripts/install.sh" \
+    || { echo "install.sh 未在锁存在时启用 --frozen-lockfile" >&2; return 1; }
+  grep -q '未找到 pnpm-lock.yaml' "$ROOT/scripts/install.sh" \
+    || { echo "install.sh 缺锁时未显式告警(静默现场解析)" >&2; return 1; }
+  # 反空转:参数必须真的接到 pnpm 调用行上,不能只是定义完就没人用
+  grep -q '\$NPM_EXTRA --prefer-offline' "$ROOT/scripts/install.sh" \
+    || { echo "NPM_EXTRA/LOCK_ARG 未接到 pnpm 调用上(定义后无人使用)" >&2; return 1; }
+}
+
+@test "release.yml and install.sh write byte-identical app manifests" {
+  # install.sh 现在带 --frozen-lockfile 安装,而那份 lock 是 release.yml 用**它自己的**
+  # package.json 生成的。两者任何一个字段漂移,冻结校验就会在用户机器上失败 ——
+  # 而「同一份字符串写两遍」正是本项目反复踩到的漂移源(README 计数、审计行号)。
+  local a b
+  a="$(extract_manifest_fmt "$ROOT/scripts/install.sh")"
+  b="$(extract_manifest_fmt "$ROOT/.github/workflows/release.yml")"
+  [ -n "$a" ] || { echo "未能从 install.sh 提取 app manifest(锚点漂移?)" >&2; return 1; }
+  [ -n "$b" ] || { echo "未能从 release.yml 提取 app manifest(锚点漂移?)" >&2; return 1; }
+  if [ "$a" != "$b" ]; then
+    echo "app manifest 漂移:" >&2
+    echo "  install.sh : $a" >&2
+    echo "  release.yml: $b" >&2
+    return 1
+  fi
+}
