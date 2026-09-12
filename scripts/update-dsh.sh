@@ -75,6 +75,20 @@ fi
 NODE_BIN_DIR="$(dirname "$NODE_BIN")"
 export PATH="$NODE_BIN_DIR:$PATH"
 
+# 系统 CA(D4):企业 TLS 检查代理(Zscaler/Netskope 等)用自签 CA 重签证书,而 Node 默认
+# 只信内置根证书 → registry 请求报 UNABLE_TO_VERIFY_LEAF_SIGNATURE,更新**静默永不发生**
+# (只写一行日志,没人会看)。--use-system-ca 让 Node 改用系统钥匙串,与守护的
+# com.dshpwa.daemon.plist 保持一致。放在脚本里而不是 updater.plist 里,是因为它必须
+# **按当前 node 的能力决定**:
+#   NODE_OPTIONS 中的非法选项会让 node 直接拒绝启动(实测 rc≠0、一行代码都不执行),
+#   而该选项是 Node 22.15.0 才引入的,install.sh 只要求 major >= 22(MIN_NODE=22)。
+#   无条件加 → 22.0~22.14 上 read_version 恒空、脚本每次都"跳过更新",把「证书失败」
+#   换成更彻底的「同样永不更新,且连日志都说不清原因」。故先探测支持性,支持才加。
+if "$NODE_BIN" --use-system-ca -e '' >/dev/null 2>&1; then
+  NODE_OPTIONS="--use-system-ca${NODE_OPTIONS:+ $NODE_OPTIONS}"
+  export NODE_OPTIONS
+fi
+
 CUR="$(read_version)"
 if [ -z "$CUR" ]; then
   log "! $(date '+%Y-%m-%d %H:%M:%S') 无法读取当前已装版本,跳过更新"
@@ -184,13 +198,56 @@ fi
 # node_modules 由 pnpm 装出,pnpm 不可用则失败记日志,绝不回退 npm(npm 会损坏依赖树)
 # PATH 已在 NODE_BIN 确定后统一前置,此处无需再处理
 pnpm_run() {
-  NODE_OPTIONS="--max-old-space-size=4096" \
+  # NODE_OPTIONS 必须**追加**而非覆盖:覆盖会顺手抹掉上面按能力加上的 --use-system-ca,
+  # 于是变成「npm view 过得去、pnpm install 过不去」——企业代理下最难查的半通状态。
+  NODE_OPTIONS="--max-old-space-size=4096${NODE_OPTIONS:+ $NODE_OPTIONS}" \
     "$NPM_BIN" exec --yes --package=pnpm@10 -- pnpm "$@"
 }
 
 # 固定目标版本到 package.json(与 install.sh 同构),pnpm update 增量拉差异
-printf '{"name":"dsh-runtime-app","private":true,"dependencies":{"@deepseek-ai/dsh":"%s"},"pnpm":{"onlyBuiltDependencies":["node-pty","koffi","@deepseek-ai/dsh-subprocess-local"]}}\n' \
-  "$REMOTE" > "$APP_DIR/package.json"
+write_app_manifest() {
+  printf '{"name":"dsh-runtime-app","private":true,"dependencies":{"@deepseek-ai/dsh":"%s"},"pnpm":{"onlyBuiltDependencies":["node-pty","koffi","@deepseek-ai/dsh-subprocess-local"]}}\n' \
+    "$1" > "$APP_DIR/package.json"
+}
+
+# 刷新 run.json:dsh bin 路径可能随版本变化(单一事实源,守护直启依赖它)
+refresh_run_json() {
+  local bin
+  bin="$("$NODE_BIN" -e '
+    const { join, dirname } = require("path");
+    const pkg = require(process.argv[1]);
+    const bin = typeof pkg.bin === "string" ? pkg.bin : (pkg.bin && pkg.bin.dsh) || "lib/bin.js";
+    console.log(join(dirname(process.argv[1]), bin));
+  ' "$APP_DIR/node_modules/@deepseek-ai/dsh/package.json" 2>/dev/null || true)"
+  if [ -n "$bin" ]; then
+    "$NODE_BIN" -e '
+      const fs = require("fs");
+      fs.writeFileSync(process.argv[1], JSON.stringify({ node: process.argv[2], dsh: process.argv[3] }) + "\n");
+    ' "$RT_HOME/run.json" "$NODE_BIN" "$bin" 2>/dev/null || log "! run.json 刷新失败(守护将继续使用旧路径)"
+  fi
+}
+
+# 把依赖树恢复到更新前版本(A4 探测失败时用)。两条路径:
+#   1) 有 .bak(增量更新失败、走全量重装时 mv 出来的)→ 直接换回:零网络、近零成本
+#   2) 无 .bak(增量更新就地改了树)→ 按**更新前版本号**重装。store 里刚用过这些包,
+#      --prefer-offline 通常无需下载。这是真的回滚,而不是"保持现状"式的口头回滚。
+rollback_deps() {
+  if [ -d "$BAK_NM" ]; then
+    rm -rf "$APP_DIR/node_modules"
+    mv "$BAK_NM" "$APP_DIR/node_modules" 2>/dev/null || return 1
+    if [ -f "$BAK_LOCK" ]; then
+      rm -f "$APP_DIR/pnpm-lock.yaml"
+      mv "$BAK_LOCK" "$APP_DIR/pnpm-lock.yaml" 2>/dev/null || true
+    fi
+    return 0
+  fi
+  [ -n "$CUR" ] || return 1
+  write_app_manifest "$CUR"
+  pnpm_run --dir "$APP_DIR" --store-dir "$PNPM_STORE" install --prefer-offline >> "$UPDATE_LOG" 2>&1 || return 1
+  return 0
+}
+
+write_app_manifest "$REMOTE"
 
 UPDATE_OK=0
 BAK_NM="$APP_DIR/node_modules.bak.$$"
@@ -208,11 +265,9 @@ else
   fi
 fi
 
-# 重装成功(或增量直接成功)则备份已无用,清理掉;失败则留给下方回滚
-if [ "$UPDATE_OK" = "1" ]; then
-  rm -rf "$BAK_NM" "$BAK_LOCK" 2>/dev/null || true
-fi
-
+# 注意:备份**不在这里**清理。更新"成功"只代表 pnpm 把依赖树装出来了,还要过下面 A4 的
+# 启动探测;探测失败要靠这份备份回滚。清理移到探测通过之后(旧实现此处就删,等于让
+# "探测失败即回滚"永远无备份可用)。
 NEW="$(read_version)"
 if [ "$UPDATE_OK" = "1" ] && [ "$NEW" = "$REMOTE" ]; then
   # 清理跨平台冗余依赖(与 install.sh 保持一致;cleanup-deps.sh 需要传入 app 目录)
@@ -228,20 +283,56 @@ if [ "$UPDATE_OK" = "1" ] && [ "$NEW" = "$REMOTE" ]; then
       log "! $(date '+%Y-%m-%d %H:%M:%S') 清理后原生依赖验证失败(sharp/node-pty),建议重跑 install.sh 修复"
     fi
   fi
-  # 刷新 run.json:dsh bin 路径可能随版本变化(单一事实源,守护直启依赖它)
-  DSH_BIN="$("$NODE_BIN" -e '
-    const { join, dirname } = require("path");
-    const pkg = require(process.argv[1]);
-    const bin = typeof pkg.bin === "string" ? pkg.bin : (pkg.bin && pkg.bin.dsh) || "lib/bin.js";
-    console.log(join(dirname(process.argv[1]), bin));
-  ' "$APP_DIR/node_modules/@deepseek-ai/dsh/package.json" 2>/dev/null || true)"
-  if [ -n "$DSH_BIN" ]; then
-    "$NODE_BIN" -e '
-      const fs = require("fs");
-      fs.writeFileSync(process.argv[1], JSON.stringify({ node: process.argv[2], dsh: process.argv[3] }) + "\n");
-    ' "$RT_HOME/run.json" "$NODE_BIN" "$DSH_BIN" 2>/dev/null || log "! run.json 刷新失败(守护将继续使用旧路径)"
+  refresh_run_json
+
+  # ---- A4:更新后真实启动探测 ----
+  # 上面的原生依赖探针只证明「sharp/node-pty 能被 require」;它不覆盖入口解析、ESM 依赖图、
+  # 新版本对 node 版本的要求、cleanup-deps 删过头……那些只在真正启动时暴露。无人值守的
+  # 凌晨更新必须自证可用,否则用户第二天面对的就是「服务消失」。故真起一次(见
+  # scripts/dsh-probe.sh 头部:为什么必须在临时 RT_HOME 里探测)。
+  #
+  # 退出码三态,判错任何一态都有害:
+  #   0 就绪     → 保留新版本
+  #   1 未就绪   → **回滚**到更新前版本(这就是本次修复的目的)
+  #   2 无法探测 → 保留新版本。缺件(没装守护/没 run.json/没有空闲端口)是环境问题,
+  #                不是新版本的错;若也回滚,会变成"环境缺件 → 每次更新都回滚"的死循环,
+  #                把本来好的版本也折腾坏。
+  PROBE_RC=2
+  PROBE_LOG="$LOG_DIR/probe.log"
+  if [ -x "$RT_HOME/scripts/dsh-probe.sh" ]; then
+    # `|| PROBE_RC=$?`:脚本 set -e,探测返回 1 时若直接调用会当场终止本脚本,
+    # 后面判三态、回滚、写日志全部不执行(＝把"回滚"变成"静默退出")。
+    bash "$RT_HOME/scripts/dsh-probe.sh" --timeout "${DSH_RT_PROBE_TIMEOUT_SECS:-60}" \
+      --log "$PROBE_LOG" >> "$UPDATE_LOG" 2>&1 || PROBE_RC=$?
+  else
+    log "! 启动探测脚本缺失($RT_HOME/scripts/dsh-probe.sh),跳过探测(新版本可用性未验证)"
   fi
-  log "✓ $(date '+%Y-%m-%d %H:%M:%S') 更新完成: $CUR -> $NEW"
+
+  case "$PROBE_RC" in
+    1)
+      if rollback_deps; then
+        refresh_run_json
+        ROLLBACK_CUR="$(read_version)"
+        # 机器可判的痕迹:失败路径不能只写一行日志(见 install.sh 4c 的教训——"失败只 warn"
+        # 曾让暖机 4/4 全挂而 CI 全绿)。冒烟/验收据此断言"探测真的跑过并表过态"。
+        printf '%s\n' "$REMOTE" > "$RT_STATE/update.probe.failed" 2>/dev/null || true
+        log "✗ $(date '+%Y-%m-%d %H:%M:%S') 新版本 $REMOTE 启动探测失败,已回滚到 ${ROLLBACK_CUR:-$CUR}(探测日志 $PROBE_LOG)"
+      else
+        printf '%s\n' "$REMOTE" > "$RT_STATE/update.probe.failed" 2>/dev/null || true
+        log "✗ $(date '+%Y-%m-%d %H:%M:%S') 新版本 $REMOTE 启动探测失败,且回滚失败,依赖树可能损坏,请重跑 install.sh(探测日志 $PROBE_LOG)"
+      fi
+      ;;
+    *)
+      # 0(就绪)或 2(无法探测):保留新版本,备份已无用
+      rm -rf "$BAK_NM" "$BAK_LOCK" 2>/dev/null || true
+      rm -f "$RT_STATE/update.probe.failed" 2>/dev/null || true
+      if [ "$PROBE_RC" = "0" ]; then
+        log "✓ $(date '+%Y-%m-%d %H:%M:%S') 更新完成并已自证可用(启动探测通过): $CUR -> $NEW"
+      else
+        log "✓ $(date '+%Y-%m-%d %H:%M:%S') 更新完成(启动探测不可用,未验证): $CUR -> $NEW"
+      fi
+      ;;
+  esac
 else
   if [ "$UPDATE_OK" = "0" ]; then
     # 更新彻底失败(增量与全量均败):先清掉失败残留的半新树,再把备份 mv 回原位,

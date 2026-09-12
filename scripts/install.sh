@@ -285,13 +285,15 @@ if [ -n "$LATEST" ] && [ "$CUR_DSH" != "$LATEST" ] || [ -z "$CUR_DSH" ]; then
   fi
   
   # npm install/update (主进程等待)
-  if ! PATH="$NODE_DIR/bin:$PATH" NODE_OPTIONS="--max-old-space-size=4096" npx_pnpm \
+  # 追加而非覆盖:用户可能已设 NODE_OPTIONS(如企业代理需 --use-system-ca),覆盖会静默丢弃。
+  if ! PATH="$NODE_DIR/bin:$PATH" NODE_OPTIONS="--max-old-space-size=4096${NODE_OPTIONS:+ $NODE_OPTIONS}" npx_pnpm \
        --dir "$APP_DIR" --store-dir "$PNPM_STORE" $NPM_CMD $NPM_TARGET --prefer-offline; then
     # 如果是 update 失败,尝试回退到全量 install
     if [ "$NPM_CMD" = "update" ]; then
       warn "增量升级失败,回退到全量重装..."
       rm -rf "$APP_DIR/node_modules" "$APP_DIR/pnpm-lock.yaml"
-      if ! PATH="$NODE_DIR/bin:$PATH" NODE_OPTIONS="--max-old-space-size=4096" npx_pnpm \
+      # 追加而非覆盖:用户可能已设 NODE_OPTIONS(如企业代理需 --use-system-ca),覆盖会静默丢弃。
+      if ! PATH="$NODE_DIR/bin:$PATH" NODE_OPTIONS="--max-old-space-size=4096${NODE_OPTIONS:+ $NODE_OPTIONS}" npx_pnpm \
            --dir "$APP_DIR" --store-dir "$PNPM_STORE" install --prefer-offline; then
         [ -n "${DAEMON_PID:-}" ] && kill "$DAEMON_PID" 2>/dev/null || true
         warn "dsh 安装失败"
@@ -326,7 +328,8 @@ if [ -n "$LATEST" ] && [ "$CUR_DSH" != "$LATEST" ] || [ -z "$CUR_DSH" ]; then
     if ! ( cd "$APP_DIR/node_modules/@deepseek-ai/dsh" && "$NODE_BIN" -e "require('sharp'); require('node-pty')" >/dev/null 2>&1 ); then
       warn "依赖验证失败（sharp/node-pty），回退重装"
       rm -rf "$APP_DIR/node_modules"
-      if ! PATH="$NODE_DIR/bin:$PATH" NODE_OPTIONS="--max-old-space-size=4096" npx_pnpm \
+      # 追加而非覆盖:用户可能已设 NODE_OPTIONS(如企业代理需 --use-system-ca),覆盖会静默丢弃。
+      if ! PATH="$NODE_DIR/bin:$PATH" NODE_OPTIONS="--max-old-space-size=4096${NODE_OPTIONS:+ $NODE_OPTIONS}" npx_pnpm \
            --dir "$APP_DIR" --store-dir "$PNPM_STORE" install --prefer-offline; then
         warn "回退重装失败"; exit 1
       fi
@@ -398,7 +401,7 @@ fi
 # ---------- 4b) 更新脚本部署(daemon/updater 通过 $RT_HOME/scripts/ 调用;发行包临时目录装完即删,不可回溯) ----------
 if [ -d "$ROOT/scripts" ]; then
   mkdir -p "$RT_HOME/scripts"
-  for s in update-dsh.sh cleanup-deps.sh; do
+  for s in update-dsh.sh cleanup-deps.sh dsh-probe.sh; do
     if [ -f "$ROOT/scripts/$s" ]; then
       cp "$ROOT/scripts/$s" "$RT_HOME/scripts/$s"
       chmod 700 "$RT_HOME/scripts/$s"
