@@ -27,3 +27,9 @@ coverage/
 # Temporary files
 *.tmp
 /tmp/
+
+# Agent working memory (MEMORY.md / TRAPS.md / 每日日志)
+# 刻意不入库:它是**本机**的动手前参考,随会话演进、常有大段未定稿的草稿;
+# 进公开仓库会把「内部推演过程」当成对外承诺,也容易被误读为项目文档。
+# 文件保留在磁盘上(仅取消跟踪),见 README 的 Development 一节。
+.workbuddy-ai/
