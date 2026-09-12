@@ -35,6 +35,10 @@ All notable changes to this project will be documented in this file.
 - **`daemon.c` 引用改为符号锚点** — 复核发现 `scripts/` 与 `tests/` 里 13 处 `daemon.c:NNN` 行号引用**系统性漂移**:只有 4 处仍指向所称内容,其余指向无关代码。根因是行号描述**位置**,而位置随任何一次编辑改变且改变后**没有任何信号**。全部改为符号锚点(`read_run` / `update_locked` / `spawn_dsh` / `stop_dsh` / `trigger_background_update` / `maybe_scan_token` 等),并新增门禁禁止行号引用回归(带正反自检与扫描面反空转)
 - **`cleanup-deps.sh` 删除面纳入门禁(审计 C2)** — 该脚本在安装与更新两条路径上**真删文件**,而此前唯一的把关是 `bash -n`(只查语法),没有任何用例覆盖「它到底删了什么」。新增 `tests/unit/cleanup-deps.bats`:用合成 fixture 同时放入「该删」与「必须存活」两类做**双向**断言,dry-run 与真跑各测一遍(「选中」≠「真的删掉了」),并带两条反空转(空树不得报告删除项、缺 node_modules 应静默跳过)。已用负控验证 —— 从谓词里去掉 `! -name "README.md"` 后 dry-run 与真跑**两条**用例都 FAIL 并点名该文件
 
+- **守护低危项 E6 逐条处置(审计 E6a–E6f)** — 审计原文只写「其余低危项」,本身不可执行;本轮回到当前代码逐条复核后分别处置。**E6d 并发上限:** 旧实现每连接 `fork` 且**无上限**,只有 fd 耗尽(`EMFILE`)才退避 —— 即「已经太晚」之后才降速;现加 `MAX_CONN`(默认 256,`DSH_RT_MAX_CONN` 可覆盖),超限在 **`fork()` 之前**直接回 `503`。判定必须在 fork 之前,否则限额退化成「限制子进程存活数」而无界 fork 本身才是要堵的洞;且父进程手里的 accepted socket 是**阻塞**的(超时只在子进程 `handle_conn` 里设),故 503 路径先设 `SO_SNDTIMEO` 再写 —— 否则「加限额」反而引入与 A2 同类的挂死面。**E6a 安全响应头:** `respond()` 是全站唯一响应出口,故 `X-Content-Type-Options: nosniff` 与最小 CSP 集中加一次即覆盖全部响应;CSP 按引导页**真实需求**逐条放开(内联 script/style + 同源 fetch/sendBeacon + `/icon.svg` + `/manifest.webmanifest`),其余 `default-src 'none'`。**E6b:** `Content-Type` 参数做 CR/LF 净化(而非断言 —— 生产里断言等于崩溃),堵住将来传入用户数据时的响应头注入面。**E6c/E6e/E6f** 记为已知限制并写入 README 威胁模型
+- **引导页 CSP 覆盖门禁** — CSP 一旦漏掉引导页需要的来源,页面就是**白屏且没有任何信号**(与 E4 静默截断同类失效)。新增门禁从**引导页模板本身推导**所需指令与来源(而不是把指令名抄第二遍,那样模板一改两边一起错),再核对真实响应头,于是「模板加了新资源类型却忘了改 CSP」在 CI 变红而不是在用户浏览器里变白屏。该门禁细到**源列表**:只查「指令是否存在」会漏掉「指令在、但只有 `'unsafe-inline'` 而缺 `'self'`」这一真实白屏场景(外链 `<script src>`)。带负控:合成模板驱动推导函数,并另用**真实模板变异体**(给引导页插一个外链脚本)验证门禁确实变红
+- **`respond()` 响应头缓冲扩容且截断可观测** — 仅 CSP 一条就约 190 字节,旧 `hdr[256]` 装不下会静默截断成**畸形响应头**(不是少一个头,而是整块被切断);扩容并让截断打印告警,与 `build_boot` 的 E4 处理保持一致
+
 ### Security
 
 #### 🔴 High-Risk Fixes

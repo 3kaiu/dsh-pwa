@@ -1452,3 +1452,167 @@ print(data.decode("latin1").split("\r\n")[0])
   assert_body_match 'DeepSeek Harness'
   assert_body_match '</html>'
 }
+
+# ---------- E6 安全响应头 / 并发上限 ----------
+
+# boot_template <源文件> —— 抽出引导页模板区域(TPL_HEAD 起到 html_escape 前)。
+# 锚点用**符号名**而非行号:行号会随任何编辑静默漂移(见 install-validation.bats 的
+# 「daemon.c references use symbol anchors」门禁)。
+boot_template() {
+  awk '/^static const char TPL_HEAD\[\] =/,/^static void html_escape/' "$1"
+}
+
+# tpl_needs <含模板文本的文件> —— 从模板**推导** CSP 必须满足的约束。
+# 刻意不把指令名硬编码一遍:硬编码等于把「模板需要什么」抄第二遍,模板一改两边一起错,
+# 正是这条门禁要防的失败。参数化到文件是为了负控能用合成样本驱动它。
+# 输出 `<指令>+<源>`:只断言「指令存在」是不够的 —— 外链脚本需要 script-src 含 'self',
+# 而只有 'unsafe-inline' 时页面照样被拦死(白屏),门禁却全绿。故必须连源列表一起要求。
+tpl_needs() {
+  local t n=""
+  t="$(cat "$1")"
+  [ -n "$t" ] || { echo "模板为空" >&2; return 1; }
+  printf '%s' "$t" | grep -q '<script>'              && n="$n script-src+unsafe-inline"
+  printf '%s' "$t" | grep -q '<style>'               && n="$n style-src+unsafe-inline"
+  printf '%s' "$t" | grep -qE '<script[^>]*src='     && n="$n script-src+self"
+  printf '%s' "$t" | grep -qE 'rel=.stylesheet.'     && n="$n style-src+self"
+  printf '%s' "$t" | grep -qE 'fetch\(|sendBeacon'   && n="$n connect-src+self"
+  printf '%s' "$t" | grep -q 'icon\.svg'             && n="$n img-src+self"
+  printf '%s' "$t" | grep -q 'manifest\.webmanifest' && n="$n manifest-src+self"
+  printf '%s' "$n"
+}
+
+@test "security headers are sent on every response (nosniff + CSP)" {
+  start_daemon_env '{"node":"/nonexistent/node","dsh":"/nonexistent/dsh"}'
+  run curl -s -D - -o /dev/null --max-time 2 --noproxy '*' "http://127.0.0.1:$PORT/health"
+  [ "$status" -eq 0 ] || { echo "  curl 失败 rc=$status" >&2; return 1; }
+  printf '%s' "$output" | grep -qi '^X-Content-Type-Options: nosniff' \
+    || { echo "  缺少 nosniff:" >&2; printf '%s\n' "$output" | head -12 >&2; return 1; }
+  printf '%s' "$output" | grep -qi '^Content-Security-Policy: ' \
+    || { echo "  缺少 CSP:" >&2; printf '%s\n' "$output" | head -12 >&2; return 1; }
+  # CSP 必须**在响应里**且非空 —— 只断言「有这个头名」会被 `Content-Security-Policy: `(空值)
+  # 满足,那等于没设。
+  local csp
+  csp="$(printf '%s' "$output" | grep -i '^Content-Security-Policy: ' | head -1)"
+  printf '%s' "$csp" | grep -q "default-src 'none'" \
+    || { echo "  CSP 未收敛到 default-src 'none': $csp" >&2; return 1; }
+}
+
+@test "CSP covers every resource the boot page actually needs" {
+  # 为什么需要这条:引导页一旦被 CSP 打断就是**白屏**,而白屏没有任何信号 ——
+  # 与 E4(引导页静默截断)同一类失效。门禁从模板**推导**需求,再核对真实响应头,
+  # 于是「模板加了新资源类型但忘了改 CSP」会在 CI 变红,而不是在用户浏览器里变白屏。
+  start_daemon_env '{"node":"/nonexistent/node","dsh":"/nonexistent/dsh"}'
+  run curl -s -D - -o /dev/null --max-time 2 --noproxy '*' "http://127.0.0.1:$PORT/"
+  [ "$status" -eq 0 ] || { echo "  curl 失败 rc=$status" >&2; return 1; }
+  local csp
+  csp="$(printf '%s' "$output" | grep -i '^Content-Security-Policy: ' | head -1)"
+  [ -n "$csp" ] || { echo "  响应里没有 CSP" >&2; return 1; }
+
+  local tpl="$BATS_TEST_TMPDIR/tpl.txt"
+  # 必须读**构建守护所用的那份源码**($DSH_DAEMON_SRC),而不是写死 src/daemon.c ——
+  # 否则「模板」与「实际响应头」可能来自两个不同文件,门禁就成了跨文件比对,既会误报
+  # 也失去了被变异驱动的能力(本项目用 DSH_DAEMON_SRC 复验旧实现,是既有接缝)。
+  boot_template "$DSH_DAEMON_SRC" > "$tpl"
+  # 反空转(正):锚点必须真的抓到模板。抓不到时 needs 会是空集,而「空集里每条都在 CSP 里」
+  # 恒真 —— 门禁全绿却什么都没测(TRAPS §一 第 16 条:只设上界的门禁会被空提取满足)。
+  grep -q '<script' "$tpl" || { echo "模板抽取失败(锚点漂移?),见 $tpl" >&2; return 1; }
+
+  local need needs miss=""
+  needs="$(tpl_needs "$tpl")"
+  # 反空转(面):推导出的需求条数必须有下界,否则同上是空集恒真。
+  set -- $needs
+  [ "$#" -ge 4 ] || { echo "只推导出 $# 条 CSP 需求(下界 4),推导逻辑失明?[$needs]" >&2; return 1; }
+
+  for need in $needs; do
+    local d="${need%%+*}" src="${need##*+}"
+    if ! printf '%s' "$csp" | grep -q -- "$d"; then miss="$miss $need"; continue; fi
+    # 指令存在还不够:必须确认**该指令的源列表里**真的放行了所需来源。
+    printf '%s' "$csp" | grep -qE "$d[^;]*'$src'" || miss="$miss $need"
+  done
+  [ -z "$miss" ] || {
+    echo "  CSP 缺少引导页需要的指令:$miss" >&2
+    echo "  实际 CSP: $csp" >&2
+    return 1
+  }
+}
+
+@test "CSP gate self-check detects a newly introduced resource type" {
+  # 负控:门禁必须抓得住「模板新增资源类型」这一真实场景。若推导函数只会输出固定集合,
+  # 上一条用例在模板变化时不会变红 —— 那就只是把指令名抄了一遍。
+  local probe="$BATS_TEST_TMPDIR/probe.html" needs
+
+  # (a) 外链样式表:必须推出 style-src+self(内联那条挡不住外链)
+  printf '%s\n' '<style>x{}</style><link rel="stylesheet" href="/x.css">' > "$probe"
+  needs="$(tpl_needs "$probe")"
+  printf '%s' "$needs" | grep -q 'style-src+self' \
+    || { echo "  未推出 style-src+self:[$needs]" >&2; return 1; }
+
+  # (b) 外链脚本:同理必须要求 script-src 含 'self'。这正是「只查指令是否存在」会漏掉的场景 ——
+  #     CSP 里 script-src 只有 'unsafe-inline' 时 <script src> 会被浏览器拦死(白屏),
+  #     而只查指令名的门禁全绿。所以推导必须细到**源列表**。
+  printf '%s\n' '<script src="/a.js"></script>' > "$probe"
+  needs="$(tpl_needs "$probe")"
+  printf '%s' "$needs" | grep -q 'script-src+self' \
+    || { echo "  未推出 script-src+self:[$needs]" >&2; return 1; }
+
+  # (c) 内联脚本 + 内联样式:两条都要推出,且必须是内联形态
+  printf '%s\n' '<script>1</script><style>x{}</style>' > "$probe"
+  needs="$(tpl_needs "$probe")"
+  printf '%s' "$needs" | grep -q 'script-src+unsafe-inline' \
+    || { echo "  未推出 script-src+unsafe-inline:[$needs]" >&2; return 1; }
+  printf '%s' "$needs" | grep -q 'style-src+unsafe-inline' \
+    || { echo "  未推出 style-src+unsafe-inline:[$needs]" >&2; return 1; }
+  # 反向:模板里没有 manifest / icon / fetch 时不得凭空要求对应指令,否则门禁会误报
+  # (误报和漏报同样是缺陷 —— 它会逼人放宽门禁,见技能里「false positive 与 miss 同类」)。
+  printf '%s' "$needs" | grep -qE 'manifest-src|img-src|connect-src' \
+    && { echo "  误报未出现的资源类型:[$needs]" >&2; return 1; }
+  return 0
+}
+
+@test "concurrency cap refuses the N+1th connection with 503 and recovers" {
+  # E6d 回归。旧实现每连接 fork 且**无上限**,只有 fd 耗尽(EMFILE)才退避 —— 即「已经太晚」
+  # 之后才降速。这里把上限压到 1,用一条「只连不写」的连接占住唯一的额度。
+  export DSH_RT_MAX_CONN=1
+  start_daemon_env '{"node":"/nonexistent/node","dsh":"/nonexistent/dsh"}'
+  unset DSH_RT_MAX_CONN
+
+  local PY; PY="$(command -v python3 || true)"
+  [ -n "$PY" ] || { echo "  [SKIP] 无 python3,无法驱动持连接样本" >&2; return 0; }
+
+  # 每 0.4s 滴一个字节:守护对客户端 socket 的读超时是 2s,**每收到数据即重置**,
+  # 故子进程会被一直吊住(不像「发一次就睡」那样 2s 后自退)。这样断言窗口足够宽。
+  "$PY" -c '
+import socket,sys,time
+s=socket.socket(); s.connect(("127.0.0.1",int(sys.argv[1])))
+s.sendall(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n")   # 刻意不发结束空行:请求头不完整
+for _ in range(25):
+    try: s.sendall(b"X")
+    except OSError: break
+    time.sleep(0.4)
+' "$PORT" >/dev/null 2>&1 &
+  local HOLD_PID=$!
+
+  # 正控:额度被占满时 /health 必须 503(它自己也走同一条 accept 路径)
+  local got=""
+  for _ in $(seq 1 25); do
+    got="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 --noproxy '*' \
+      "http://127.0.0.1:$PORT/health" 2>/dev/null || true)"
+    [ "$got" = "503" ] && break
+    sleep 0.2
+  done
+  kill "$HOLD_PID" 2>/dev/null || true
+  wait "$HOLD_PID" 2>/dev/null || true
+
+  [ "$got" = "503" ] || { echo "  并发上限未生效:期望 503,实际 [$got]" >&2; return 1; }
+
+  # 反控(同样重要):额度释放后必须恢复 200。这一半同时证明上限**没有过度生效** ——
+  # 若把 MAX_CONN 误做成 0(`active >= 0` 恒真),上面那半照样通过,而这里会一直 503。
+  got=""
+  for _ in $(seq 1 25); do
+    got="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 --noproxy '*' \
+      "http://127.0.0.1:$PORT/health" 2>/dev/null || true)"
+    [ "$got" = "200" ] && break
+    sleep 0.2
+  done
+  [ "$got" = "200" ] || { echo "  额度释放后未恢复:期望 200,实际 [$got]" >&2; return 1; }
+}

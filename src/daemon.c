@@ -64,6 +64,14 @@ static int IO_TIMEOUT_SECS = 30;
 // 立即重试即 **100% CPU 自旋**。所以 A2 与 E3 必须同批修,否则只是把「静默挂死」换成「烧 CPU」。
 // 超时即放弃本次写入,由 relay 据此收尾整条连接。
 static int WRITE_WAIT_MS = 30000;
+// E6d:同时在场的连接数上限。守护对每个连接 fork 一个子进程,旧实现**没有任何上限** ——
+// 只有 fd 耗尽(EMFILE)时才退避 100ms,即「已经太晚」之后才降速。一个本机进程可以据此
+// 反复建连把 fork 数拉满,耗尽 fd 并让每次 accept 都空转。超限时直接 503 快速拒绝,
+// 不 fork、也不计入 active(计入会让空闲停机判定失效,零常驻承诺被破坏)。
+// 256 的依据:每个连接子进程峰值内存有限,256 × 该量级对桌面场景宽裕,而远低于 macOS
+// 默认 fd 软上限(256)之外的压力面 —— 真正的目的是**把无界变成有界**,不是精确调参。
+// 可用 DSH_RT_MAX_CONN 覆盖(测试用 1 即可确定性地驱动 503 路径)。
+static int MAX_CONN = 256;
 
 static const char *env_or(const char *k, const char *d) {
   const char *v = getenv(k);
@@ -110,6 +118,12 @@ static void build_paths(void) {
   if (p && *p) {
     int parsed = atoi(p);
     if (parsed >= 10 && parsed <= 600000) WRITE_WAIT_MS = parsed;
+  }
+  // 并发连接上限(E6d)。下界 1:0 或负数会退化成「每个连接都 503」,把守护变成完全不可用。
+  p = getenv("DSH_RT_MAX_CONN");
+  if (p && *p) {
+    int parsed = atoi(p);
+    if (parsed >= 1 && parsed <= 65536) MAX_CONN = parsed;
   }
   mkdir(LOG_DIR, 0700);
 }
@@ -687,13 +701,45 @@ static void build_boot(void) {
 
 // ---------- HTTP ----------
 static int write_all(int fd, const char *b, size_t n);
+// 全站唯一的响应出口(14 处调用全经此处),安全头集中加一次即可覆盖全部响应。
+// E6a:nosniff 阻止浏览器把 JSON/纯文本按 HTML 嗅探(需配合反射型内容才构成 XSS,属防御纵深);
+// CSP 按引导页的**真实需求**逐条放开,其余一律 default-src 'none'。引导页是自包含的 ——
+// 内联 <style>/<script> + 同源 fetch/sendBeacon + /icon.svg + /manifest.webmanifest,
+// 故只需 script/style 的 'unsafe-inline' 与 connect/img/manifest 的 'self'。
+// 若将来改引导页模板引入新的资源类型,必须同步改这里,否则页面会被 CSP **静默打断**
+// (白屏,无任何信号)—— 已由 daemon-cases.bats 的「CSP 覆盖引导页真实需求」门禁守住。
+#define SEC_HEADERS \
+  "X-Content-Type-Options: nosniff\r\n" \
+  "Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; " \
+  "style-src 'unsafe-inline'; connect-src 'self'; img-src 'self'; " \
+  "manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n"
 static void respond(int c, int code, const char *ct, const char *body) {
-  char hdr[256];
+  // E6b:ct 目前全是字面量,但它是**响应头的一部分** —— 一旦将来传入含 CR/LF 的值即成
+  // 响应头注入(可伪造额外响应头甚至提前结束头部)。这里做净化而非断言:断言在生产里
+  // 等于崩溃,净化的行为可预测且可测试。
+  if (strpbrk(ct, "\r\n")) ct = "text/plain; charset=utf-8";
+  // 状态文本必须与 code 一一对应:漏掉一个码会统一退化成 "Internal Server Error",
+  // 于是客户端看到 503 + "Internal Server Error" 会误判为守护崩溃,而不是「被限流了」。
+  const char *st = code == 200 ? "OK"
+                 : code == 403 ? "Forbidden"
+                 : code == 502 ? "Bad Gateway"
+                 : code == 503 ? "Service Unavailable"
+                 : code == 400 ? "Bad Request"
+                 : "Internal Server Error";
+  // 缓冲按「最长可能响应头」定尺寸:仅 CSP 一条就约 190 字节,旧的 hdr[256] 装不下,
+  // 会静默截断成**畸形响应头**(不是少一个头,是整块被切断)。
+  char hdr[768];
   int n = snprintf(hdr, sizeof hdr,
-    "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-    code, code == 200 ? "OK" : (code == 403 ? "Forbidden" : (code == 502 ? "Bad Gateway" : "Internal Server Error")), ct, strlen(body));
-  // 截断防护:snprintf 截断时返回"本应写入长度",直接交给 write_all 会越界读
-  if (n < 0 || (size_t)n >= sizeof hdr) n = (int)sizeof hdr - 1;
+    "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
+    "Cache-Control: no-store\r\n" SEC_HEADERS "Connection: close\r\n\r\n",
+    code, st, ct, strlen(body));
+  // 截断防护:snprintf 截断时返回"本应写入长度",直接交给 write_all 会越界读。
+  // 同时必须**可观测** —— 否则下次改头又是同一个静默失败(与 build_boot 的 E4 同理)。
+  if (n < 0 || (size_t)n >= sizeof hdr) {
+    fprintf(stderr, "daemon: 响应头超出缓冲(%d >= %zu),已截断 —— 请调大 hdr\n",
+            n, sizeof hdr);
+    n = (int)sizeof hdr - 1;
+  }
   write_all(c, hdr, (size_t)n);
   write_all(c, body, strlen(body));
 }
@@ -1390,16 +1436,29 @@ static void serve_once(int ls, int *active) {
       }
       if (c >= 0) {
         tap_use(); // 父进程 accept 即在场证据(含 /health 轮询、/ping 心跳、透传请求)
-        pid_t pid = fork();
-        if (pid == 0) {
-          close(ls);
-          handle_conn(c);
+        if (*active >= MAX_CONN) {
+          // E6d:超限快速拒绝。**必须在 fork 之前判定** —— 若放到子进程里判,限额就退化成
+          // 「限制子进程存活数」,而无界 fork 本身才是要堵的洞(每次建连都已付出 fork 代价)。
+          // 另一个关键点:父进程手里的 c 是**阻塞** socket(超时只在子进程 handle_conn 里设),
+          // 不先设发送超时,一个「只连不读」的客户端就能把主循环**永久挂在这行** ——
+          // 于是「加限额」反而引入了新的挂死面,与 A2 同类。
+          struct timeval stv = { IO_TIMEOUT_SECS, 0 };
+          setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof stv);
+          respond(c, 503, "text/plain; charset=utf-8", "too many connections\n");
           close(c);
-          _exit(0);
+          // 刻意**不** tap_use 之外的任何续租、也不计入 active:这不是一条被服务的连接。
+        } else {
+          pid_t pid = fork();
+          if (pid == 0) {
+            close(ls);
+            handle_conn(c);
+            close(c);
+            _exit(0);
+          }
+          close(c);
+          if (pid > 0) (*active)++; // fork 失败(pid<0):连接已关、无子进程,不得计入——
+          // 否则 active 永不归零,空闲停机判定失效,dsh 永不自动停、守护永不自退(零常驻被破坏)
         }
-        close(c);
-        if (pid > 0) (*active)++; // fork 失败(pid<0):连接已关、无子进程,不得计入——
-        // 否则 active 永不归零,空闲停机判定失效,dsh 永不自动停、守护永不自退(零常驻被破坏)
       }
     }
   }
