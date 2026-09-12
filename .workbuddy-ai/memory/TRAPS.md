@@ -49,6 +49,13 @@ node ~/.workbuddy-ai/skills/ci-gate-hardening/scripts/check_run_blocks.mjs .gith
     而门禁**又扫描该文件自身**，就会自己触发自己（`grep` 命中探针而非被测对象）。
     修法：用变量拼出字面量（`C=':'; printf 'daemon.c%s339' "$C"`），使违规串不以字面形式存在。
     同类：注释里写 `daemon.c:NNN` 也会被行号门禁命中 —— 注释同样在扫描面内。
+16. **只设「上界」的门禁会被空提取满足（`0 <= N` 恒真）**。`main() stays decomposed` 用
+    `awk '/^int main\(void\) \{/,/^\}/' | wc -l` 量 main 长度；若锚点漂移导致**一段都没匹配上**，
+    得到 `0`，而 `[ "$n" -le 60 ]` **照样通过** —— 门禁恒绿且看起来在管结构。
+    修法：必须配**下界**（`[ "$n" -gt 5 ]`）并在失败信息里**打印原始 `n`**，让「抽取失败」与
+    「结构合规」可区分。**凡「必须小于 N」的断言，都要问一句：这个量是怎么来的？它可能为 0 吗？**
+    同族：`bats -c` 与 `grep -c '@test'` 的差异（后者会把注释/`case` 模式里的 `@test` 数进来）
+    —— **计数必须来自产出它的那个工具**，不能来自文本模式。
 
 # 二、回环 curl（curl 8.7.1）
 - 无 `--max-time`：守护「已 bind 未 listen」时 macOS **丢 SYN**（不回 RST）→ 挂到作业级 timeout，
