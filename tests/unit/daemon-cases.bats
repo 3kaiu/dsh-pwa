@@ -1058,6 +1058,164 @@ PY
   [ "$revived" = "1" ] || { echo "  /wake 未重新拉起 dsh(或 pid 未变化)(日志见 $TMP_ENV/daemon.log)" >&2; return 1; }
 }
 
+@test "dsh exiting 9 on an unusable NODE_OPTIONS self-heals on the next wake" {
+  # F1 的服务端兜底。plist 里的 NODE_OPTIONS 已由 install.sh 按能力探测注入,但手工编辑 plist、
+  # 或安装后把 node 换到更旧版本,都会让 NODE_OPTIONS 含当前 node 不认识的选项 —— node 会
+  # **拒绝启动**并返回 9(实测:一行代码都不执行)。表现是「守护在跑、dsh 永远起不来」,
+  # 且没有任何用户可见的错误。守护观察到退出码 9 后剥掉该变量;客户端只轮询 /health、
+  # 不会自己重试,所以自愈责任必须在服务端。
+  PY="$(command -v python3 || true)"
+  [ -n "$PY" ] || { echo "  python3 不可用" >&2; return 1; }
+  # 伪 dsh:只要 NODE_OPTIONS 含 --use-system-ca 就 exit 9(忠实复刻旧 node 的行为),
+  # 否则正常打印 launch token 并服务。
+  cat > "$BATS_TEST_TMPDIR/fake-dsh-nodeopts.py" <<'PY'
+#!/usr/bin/env python3
+import os, socket, sys
+if "--use-system-ca" in os.environ.get("NODE_OPTIONS", ""):
+    sys.exit(9)  # 旧 node 拒绝 NODE_OPTIONS 里的未知选项:一行代码都不执行
+args = sys.argv
+port = 0
+for i in range(len(args) - 1):
+    if args[i] == "--port":
+        port = int(args[i + 1])
+sys.stdout.write("dsh web: http://127.0.0.1:%d/?token=nodeoptsTok\n" % port)
+sys.stdout.flush()
+ppid = os.getppid()
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port))
+s.listen(16)
+s.settimeout(1.0)
+while True:
+    if os.getppid() != ppid:
+        break
+    try:
+        c, _ = s.accept()
+    except socket.timeout:
+        continue
+    except OSError:
+        break
+    try:
+        c.recv(1024)
+        c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+    except OSError:
+        pass
+    c.close()
+PY
+  # 模拟「plist 注入了旧 node 不接受的选项」:守护继承该环境变量并透传给 dsh。
+  export NODE_OPTIONS="--use-system-ca"
+  start_daemon_env "{\"node\":\"$PY\",\"dsh\":\"$BATS_TEST_TMPDIR/fake-dsh-nodeopts.py\"}"
+  run curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "Origin: http://127.0.0.1:$PORT" \
+    "http://127.0.0.1:$PORT/wake"
+  assert_status "200"
+  # 守护必须**识别**出退出码 9 的成因(而不是只在日志里留一行普通退出记录)。
+  detected=""
+  for _ in $(seq 1 30); do
+    if grep -q '不被当前 node 接受' "$TMP_ENV/daemon.log" 2>/dev/null; then detected=1; break; fi
+    sleep 0.2
+  done
+  [ "$detected" = "1" ] || { echo "  守护未识别退出码 9(日志见 $TMP_ENV/daemon.log)" >&2; return 1; }
+  # 再唤醒:必须已剥掉 NODE_OPTIONS 并成功拉起 dsh。这一条同时是「上一条不是空转」的正控 ——
+  # 没有它,「日志里出现了那句话」可能只是打了一行日志而行为没变。
+  run curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "Origin: http://127.0.0.1:$PORT" \
+    "http://127.0.0.1:$PORT/wake"
+  assert_status "200"
+  daemon_wait_health "$PORT" true 10 \
+    || { echo "  剥离 NODE_OPTIONS 后仍未拉起 dsh(日志见 $TMP_ENV/daemon.log)" >&2; return 1; }
+  unset NODE_OPTIONS
+}
+
+@test "SIGTERM stops dsh and cleans state instead of orphaning it" {
+  # F5。plist 里 AbandonProcessGroup=true,而 dsh 又经 setsid 自成会话 —— 两者叠加使
+  # launchd **不会**连带清理 dsh。守护若不处理 SIGTERM(launchctl bootout / kickstart -k
+  # 都发它),dsh 就成了孤儿:继续常驻、继续占端口,而守护已经退出、再没有任何东西会提到它。
+  # 这是**唯一**没有用户可见信号的泄漏路径(零常驻承诺被破坏),且只在卸载/重装/升级时发生,
+  # 日常使用完全看不到。
+  PY="$(command -v python3 || true)"
+  [ -n "$PY" ] || { echo "  python3 不可用" >&2; return 1; }
+  cat > "$BATS_TEST_TMPDIR/fake-dsh-long.py" <<'PY'
+#!/usr/bin/env python3
+# 忠实复刻真实 dsh 的两点:1) 经 setsid 自成会话,**父进程死掉也不会跟着退**;
+# 2) 收到 SIGTERM 才退出(python 默认动作)。故这里**不能**加 ppid 看门狗 ——
+# 那会让伪 dsh 在守护被杀后自己退出,「孤儿」这条断言就永远测不到东西。
+import os, socket, sys
+args = sys.argv
+port = 0
+for i in range(len(args) - 1):
+    if args[i] == "--port":
+        port = int(args[i + 1])
+sys.stdout.write("dsh web: http://127.0.0.1:%d/?token=sigtermTok\n" % port)
+sys.stdout.flush()
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port))
+s.listen(16)
+s.settimeout(1.0)
+while True:
+    try:
+        c, _ = s.accept()
+    except socket.timeout:
+        continue
+    except OSError:
+        break
+    try:
+        c.recv(1024)
+        c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+    except OSError:
+        pass
+    c.close()
+PY
+  start_daemon_env "{\"node\":\"$PY\",\"dsh\":\"$BATS_TEST_TMPDIR/fake-dsh-long.py\"}"
+  run curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "Origin: http://127.0.0.1:$PORT" \
+    "http://127.0.0.1:$PORT/wake"
+  assert_status "200"
+  daemon_wait_health "$PORT" true 5 || { echo "  伪 dsh 未就绪(日志见 $TMP_ENV/daemon.log)" >&2; return 1; }
+  dsh_pid="$(cat "$DSH_RT_STATE/dsh.pid" 2>/dev/null || true)"
+  [ -n "$dsh_pid" ] || { echo "  dsh.pid 缺失,夹具无效" >&2; return 1; }
+  FAKE_DSH_PID="$dsh_pid"   # 交给 teardown 兜底:任何提前失败都不许把它留成真孤儿
+  # 反空转:伪 dsh 必须**真的在跑**,否则「没有孤儿」是假绿(它可能压根没起来)。
+  kill -0 "$dsh_pid" 2>/dev/null || { echo "  伪 dsh 未在运行,夹具无效" >&2; return 1; }
+
+  # 发 SIGTERM(与 launchctl bootout 同信号),并给收尾计时。
+  # 判退出用 kill -0:守护是 $( ) 子 shell 的后台作业,不是本 shell 的子进程,故 wait 不可用;
+  # 被 init 收养后退出即被收割,不会有僵尸让 kill -0 恒成功。
+  t0="$(date +%s)"
+  kill -TERM "$DAEMON_PID" 2>/dev/null || true
+  exited=""
+  for _ in $(seq 1 60); do
+    kill -0 "$DAEMON_PID" 2>/dev/null || { exited=1; break; }
+    sleep 0.1
+  done
+  t1="$(date +%s)"
+  DAEMON_PID=""   # 无论结果如何都不再重复杀;下面按断言归因
+  [ "$exited" = "1" ] || { echo "  守护收到 SIGTERM 后 6s 未退出(日志见 $TMP_ENV/daemon.log)" >&2; return 1; }
+  # 收尾预算:必须明显快于 stop_dsh 的 6s 优雅期 —— 否则会拖慢 launchd 卸载与测试 teardown。
+  [ "$((t1 - t0))" -le 4 ] \
+    || { echo "  守护收尾耗时 $((t1 - t0))s(应 <=4s)" >&2; return 1; }
+
+  # 核心断言:伪 dsh 必须已被停掉。不修的话它照样活着(默认 SIGTERM 动作只是杀掉守护自己)。
+  gone=""
+  for _ in $(seq 1 30); do
+    kill -0 "$dsh_pid" 2>/dev/null || { gone=1; break; }
+    sleep 0.1
+  done
+  if [ "$gone" != "1" ]; then
+    kill -9 "$dsh_pid" 2>/dev/null || true
+    FAKE_DSH_PID=""
+    echo "  SIGTERM 后 dsh(pid $dsh_pid)仍在运行 —— 孤儿(日志见 $TMP_ENV/daemon.log)" >&2
+    return 1
+  fi
+  FAKE_DSH_PID=""   # 已被守护停掉,teardown 无需再收
+  # 状态文件也必须清干净:留着会让下次守护启动收养一个已死的 pid。
+  if [ -f "$DSH_RT_STATE/dsh.json" ] || [ -f "$DSH_RT_STATE/dsh.pid" ]; then
+    echo "  SIGTERM 后状态文件未清理(dsh.json/dsh.pid)" >&2
+    return 1
+  fi
+}
+
 @test "stop skips signaling when dsh.pid points at non-node process (PID reuse guard)" {
   # stop_dsh 发信号前必须核对可执行路径(proc_pidpath)。黑盒近似「PID 被回收给无关进程」的
   # 最坏场景:dsh 就绪后把 dsh.pid 覆写为另一个活进程(sleep)的 pid——kill(pid,0) 恒通过,

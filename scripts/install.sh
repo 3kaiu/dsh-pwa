@@ -43,18 +43,24 @@ if [ ! -f "$ROOT/src/daemon.c" ] && [ ! -f "$ROOT/daemon.c" ] && [ ! -f "$ROOT/d
     || { warn "SHA256 校验文件缺失,发行包完整性无法验证"; rm -f "$PKG_TMP/pkg.zip"; exit 1; }
   
   # 校验 fail-closed:不通过则中止。
+  # >>> sha-verify(tests/unit/install-validation.bats 会提取本段用夹具执行) >>>
   # 直接比对哈希,而不是 `shasum -a 256 -c pkg.zip.sha256`:后者按清单里记录的**文件名**
-  # 找文件,而生成端(.github/workflows/release.yml:74)记录的资产名是 dsh-pwa.zip、
-  # 校验端下载名是 pkg.zip → shasum 报 "dsh-pwa.zip: No such file or directory" 并 rc=1,
-  # 恒落入本分支,curl|bash 安装 100% 中断(已按 release.yml 生成端忠实复现实测)。
+  # 找文件,而生成端(release.yml 里 `shasum -a 256 dsh-pwa.zip` 那一步)记录的资产名是
+  # dsh-pwa.zip、校验端下载名是 pkg.zip → shasum 报 "dsh-pwa.zip: No such file or directory"
+  # 并 rc=1,恒落入本分支,curl|bash 安装 100% 中断(已按 release.yml 生成端忠实复现实测)。
+  # (此处原先是一个行号引用,已漂了 39 行,故改为符号锚点:行号描述位置,位置随任何编辑
+  #  改变且改变后没有信号。)
   # 比对哈希可永久消除「两侧文件名必须一致」这一隐式契约,且对清单格式(裸哈希/带文件名/
   # 二进制模式 *name)与本地命名都不敏感。
+  # 注意:本段是**实现**,不是文档。上面那句「而不是 shasum -c」是解释性注释 ——
+  # 任何门禁若用这句注释来断言「install.sh 验证了 SHA256」,在实现被删除后照样会绿。
   EXPECTED_SHA="$(awk 'NF {print $1; exit}' "$PKG_TMP/pkg.zip.sha256" 2>/dev/null || true)"
   ACTUAL_SHA="$(shasum -a 256 "$PKG_TMP/pkg.zip" 2>/dev/null | awk '{print $1}' || true)"
   if [ -z "$EXPECTED_SHA" ] || [ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]; then
     warn "发行包 SHA-256 校验失败(清单期望 ${EXPECTED_SHA:-<空>},实际下载 ${ACTUAL_SHA:-<空>})"
     rm -rf "$PKG_TMP"; exit 1
   fi
+  # <<< sha-verify <<<
   
   KB="$(awk -v n="$(stat -f%z "$PKG_TMP/pkg.zip")" 'BEGIN{printf "%.1f", n/1024}')"
   ( cd "$PKG_TMP" && unzip -q pkg.zip )
@@ -73,16 +79,37 @@ if ! [[ "$PORT_RAW" =~ ^[0-9]+$ ]] || [ "$PORT_RAW" -lt 1024 ] || [ "$PORT_RAW" 
 fi
 PORT="$PORT_RAW"
 LOG_DIR="$RT_STATE/logs"
-# plist 模板经 sed(分隔符 |、替换串中 & 有特殊含义)注入路径:路径含这两个字符
-# 会产出损坏的 plist,替换前校验、fail-closed 拒绝(LOG_DIR 由 RT_STATE 派生,已覆盖)
-for _P in "$HOME" "$RT_HOME" "$RT_STATE"; do
-  case "$_P" in
-    *'|'*|*'&'*)
-      echo "路径含 | 或 &,无法生成 LaunchAgent 配置:$_P" >&2
-      exit 1
-      ;;
+# >>> path-charset
+# plist 模板经 sed(分隔符 |、替换串中 & 有特殊含义)注入路径,产物又是 XML:
+# 路径里的 `|` `&` 会破坏 sed 替换,`<` `>` `"` 与换行会破坏 XML —— 两者都产不出可用的
+# LaunchAgent。故在替换前校验、fail-closed 拒绝(LOG_DIR 由 RT_STATE 派生,已覆盖)。
+#
+# 判定用**白名单而非黑名单**(与本仓库 token 字符集 / 版本串字符集 / CSP 源列表一致)。
+# 审计 F15:旧实现只黑 `|` 和 `&` 两个字符,而目标是 XML,`<` `>` `"` 换行同样致命 ——
+# 黑名单要穷举「所有危险字符」,漏一个就是漏洞;白名单漏一个只会**误拒**,而误拒立刻
+# 会被用户看见并报上来,不会静默。
+#   · 允许集 = 可见 ASCII 的 [A-Za-z0-9._/~ -] **外加所有 ≥0x80 的字节**。
+#     为什么要专门放行非 ASCII:macOS 短名虽限 ASCII,但 DSH_RT_HOME 是用户可设的,
+#     纯 ASCII 白名单会把 `/Users/张三/…` 这类**合法**路径误拒。
+#   · 实现:LC_ALL=C 下用 tr 删掉允许字符,残留里若还有可见 ASCII,即含不允许的字符。
+#   · 控制字符(换行/制表/…)另行显式拒绝 —— 它们不会被上面那条 grep 命中,
+#     却会直接截断 XML,是最容易漏的一类。
+# 标记 >>> path-charset 供 tests/unit/daemon-plist.bats 提取本段做行为验证(而不是
+# 用 grep 断言源码文本 —— 那种断言删掉实现只留注释也照样绿,见 TRAPS §一.20)。
+dsh_path_charset_bad() {
+  case "$1" in
+    *[[:cntrl:]]*) return 0 ;;
   esac
+  printf '%s' "$1" | LC_ALL=C tr -d 'A-Za-z0-9._/~ -' | LC_ALL=C grep -q '[ -~]'
+}
+for _P in "$HOME" "$RT_HOME" "$RT_STATE"; do
+  if dsh_path_charset_bad "$_P"; then
+    echo "路径含不能安全写入 LaunchAgent(plist/XML)的字符:$_P" >&2
+    echo "  允许:字母 数字 . _ / ~ - 空格,以及任何非 ASCII 字符" >&2
+    exit 1
+  fi
 done
+# <<< path-charset <<<
 # daemon 编译统一参数(两处编译路径共用;universal binary 双架构,Intel Mac 也产出 arm64+x86_64)
 DAEMON_CFLAGS=(-O2 -Wall -Wextra -arch arm64 -arch x86_64)
 # daemon 源码路径兼容:仓库内为 src/daemon.c;发行包内为包根 daemon.c(两种布局都识别)
@@ -171,6 +198,44 @@ stop_active_dsh() {
   return 0
 }
 
+# >>> node-resolve-shared(与 update-dsh.sh 里的同名块**逐字节一致**;tests/unit/node-resolve.bats 断言) >>>
+# 把 shim 符号链接解析到真实二进制。
+# 为什么不用 `realpath` / `readlink -f`:`-f` 是 GNU 专有,macOS 的 BSD readlink 不支持。
+# 为什么不用 `python3 -c 'os.path.realpath(...)'`:macOS 12.3+ 不再随系统附带 python3,
+#   缺失时旧写法 `... || echo "$CAND"` 会**静默**退回未解析路径,把 fnm 的 multishell
+#   会话级临时目录写进 run.json —— 守护此后 exec 一个 shell 退出即失效的 node,表现为
+#   「守护活着、dsh 永远起不来」,且没有任何用户可见的错误(与 NODE_OPTIONS 那条同族)。
+# 纯 bash 实现:逐级 readlink 直到不再是符号链接;40 级上限防环。
+dsh_resolve_node() {
+  local p="${1:-}" d n i=0
+  [ -n "$p" ] || return 1
+  while [ -L "$p" ]; do
+    i=$((i + 1))
+    [ "$i" -le 40 ] || return 1
+    d="$(cd "$(dirname "$p")" 2>/dev/null && pwd -P)" || return 1
+    n="$(readlink "$p" 2>/dev/null)" || return 1
+    [ -n "$n" ] || return 1
+    case "$n" in
+      /*) p="$n" ;;
+      *)  p="$d/$n" ;;
+    esac
+  done
+  d="$(cd "$(dirname "$p")" 2>/dev/null && pwd -P)" || return 1
+  printf '%s/%s\n' "$d" "$(basename "$p")"
+}
+
+# 该路径是否落在**随 shell 会话失效**的 shim 目录里。
+# 只认 fnm 的 multishell 目录:`$XDG_STATE_HOME/fnm_multishells/<pid>_<ts>/` 每个会话一份,
+# shell 退出即删。volta(`~/.volta/bin`)与 nvm(`~/.nvm/versions/node/...`)的 shim 是**稳定**
+# 路径(volta 的 shim 还是普通文件、不是符号链接),把它们一并拒绝会误伤正常安装。
+dsh_node_path_is_session_scoped() {
+  case "${1:-}" in
+    */fnm_multishells/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+# <<< node-resolve-shared <<<
+
 # ---------- 1) Node:优先复用系统已有 node(fnm/volta/nvm/PATH 均可,>=22 且带 npm);
 #                否则安装 nodejs.org 最新 LTS(DSH_RT_NO_SYSTEM_NODE=1 强制走此路径) ----------
 MIN_NODE=22
@@ -179,7 +244,18 @@ if [ "${DSH_RT_NO_SYSTEM_NODE:-}" != "1" ]; then
   CAND="$(command -v node 2>/dev/null || true)"
   if [ -n "$CAND" ]; then
     # 解析 fnm/volta 等 shim 符号链接到真实二进制(fnm 的 multishell 临时目录会随 shell 退出失效)
-    CAND="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$CAND" 2>/dev/null || echo "$CAND")"
+    RESOLVED="$(dsh_resolve_node "$CAND" 2>/dev/null || true)"
+    [ -z "$RESOLVED" ] || CAND="$RESOLVED"
+    # 解析后仍落在会话级目录(解析失败,或 shim 本身就在那里)→ **拒绝复用**。
+    # 复用它的后果是「守护活着、dsh 永远起不来」,而且没有任何用户可见的错误;
+    # 落回下面的「自带 node」分支 —— 那条路径装在 RT_HOME 下,是稳定的。
+    if dsh_node_path_is_session_scoped "$CAND"; then
+      warn "系统 node 位于会话级临时目录($CAND),shell 退出后即失效,不予复用"
+      warn "将改用自带 node(如需强制此行为:DSH_RT_NO_SYSTEM_NODE=1)"
+      CAND=""
+    fi
+  fi
+  if [ -n "$CAND" ]; then
     V="$("$CAND" --version 2>/dev/null | sed 's/^v//' || true)"
     M="${V%%.*}"
     if [ -n "$M" ] && [ "$M" -ge "$MIN_NODE" ]; then
@@ -621,12 +697,28 @@ if [ "${DSH_INSTALL_NO_AGENT:-}" != "1" ]; then
     AGENT_DIR="$HOME/Library/LaunchAgents"
     AGENT="$AGENT_DIR/com.dshpwa.daemon.plist"
     mkdir -p "$AGENT_DIR"
+    # >>> node-options-entry(tests/unit/daemon-plist.bats 会提取本段用假 node 执行) >>>
+    # NODE_OPTIONS 里出现当前 node 不认识的选项时,node **直接拒绝启动**(实测 rc=9,
+    # 一行代码都不执行)→ 守护活着但 dsh 永远起不来,且没有任何用户可见的错误。
+    # --use-system-ca 是 Node 22.15.0 才引入的,而本脚本的 MIN_NODE=22 只比 major,
+    # 故 22.0–22.14 会命中。这里先探测再注入;不支持时**整行留空**(而非空字符串 ——
+    # 那仍然等于设了 NODE_OPTIONS,语义上会覆盖系统/用户的设置)。
+    # 与 update-dsh.sh 的探测保持同一形式。
+    NODE_OPTIONS_ENTRY=""
+    if "$NODE_BIN" --use-system-ca -e '' >/dev/null 2>&1; then
+      NODE_OPTIONS_ENTRY='<key>NODE_OPTIONS</key><string>--use-system-ca</string>'
+    fi
+    # <<< node-options-entry <<<
     sed -e "s|__DAEMON_BIN__|$RT_HOME/daemon|g" \
         -e "s|__HOME__|$HOME|g" \
+        -e "s|__NODE_OPTIONS_ENTRY__|$NODE_OPTIONS_ENTRY|g" \
         -e "s|__RT_HOME__|$RT_HOME|g" \
         -e "s|__RT_STATE__|$RT_STATE|g" \
         -e "s|__LOG_DIR__|$LOG_DIR|g" \
         -e "s|__DSH_RT_PORT__|$PORT|g" "$TPL" > "$AGENT"
+    # 渲染后立即 lint:模板新增占位符却忘了在这里补 sed 时,残留的 __X__ 会让 plist 非法,
+    # 而非法 plist 的后果是 launchd 静默不加载(用户看到"安装完成"却永远打不开)。
+    plutil -lint "$AGENT" >/dev/null || { echo "生成的 LaunchAgent 不是合法 plist:$AGENT" >&2; exit 1; }
     # plist 含路径拓扑(非密钥),仍显式收 0600 最小暴露
     chmod 600 "$AGENT"
     # 清理旧名残留(改名前的 com.dshlauncher.daemon),避免旧守护占住端口

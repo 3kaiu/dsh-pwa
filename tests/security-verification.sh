@@ -51,18 +51,35 @@ else
 fi
 
 # 1.3 检查 install.sh 是否验证 SHA256
+# 断言必须锚定**实现**,不能锚定解释性注释。旧写法是
+#   grep -q "shasum -a 256 -c pkg.zip.sha256" scripts/install.sh
+# 而该字符串**只**出现在 install.sh 里那句「而不是 shasum -a 256 -c …」的说明性注释中
+# (解释为什么不用 shasum -c);真实实现是 EXPECTED_SHA/ACTUAL_SHA 裸哈希比对。
+# 双向都坏:删掉实现只留注释,本断言照样 ok(假绿);有人清理掉那句「不该做什么」的注释,
+# 门禁反而变红(误报)。这里改为锚定实现标识符(重命名会被看见,像符号锚点一样)。
+# **行为验证**(哈希相符必须放行、不符必须中止)在
+# tests/unit/install-validation.bats 的
+# "install.sh aborts the install when the release SHA-256 does not match"。
 info "检查 install.sh 是否验证 SHA256..."
-if grep -q "shasum -a 256 -c pkg.zip.sha256" scripts/install.sh; then
-  ok "install.sh 验证 SHA256 校验和"
+if grep -qF 'EXPECTED_SHA="$(awk' scripts/install.sh \
+   && grep -qF 'ACTUAL_SHA="$(shasum -a 256' scripts/install.sh \
+   && grep -qF '"$EXPECTED_SHA" != "$ACTUAL_SHA"' scripts/install.sh; then
+  ok "install.sh 验证 SHA256 校验和(裸哈希比对)"
 else
-  fail "install.sh 缺少 SHA256 验证"
+  fail "install.sh 缺少 SHA256 验证实现(仅有解释性注释不算)"
 fi
 
 # 1.4 检查 install.sh 是否 fail-closed
-if grep -q 'warn "SHA256 校验文件缺失' scripts/install.sh && grep -q 'exit 1' scripts/install.sh; then
-  ok "install.sh 使用 fail-closed 策略"
+# 旧写法只要求「文件里出现过 exit 1」—— 全文件有十余处 exit 1,把整段校验逻辑删光也照样绿,
+# 对「校验是否 fail-closed」毫无约束。改为锚定**两个**失败分支各自的告警文案:
+# 清单缺失 与 哈希不符,两者必须同时存在。
+missing_ok=0; mismatch_ok=0
+if grep -qF 'warn "SHA256 校验文件缺失' scripts/install.sh; then missing_ok=1; fi
+if grep -qF 'warn "发行包 SHA-256 校验失败' scripts/install.sh; then mismatch_ok=1; fi
+if [ "$missing_ok" = "1" ] && [ "$mismatch_ok" = "1" ]; then
+  ok "install.sh 使用 fail-closed 策略(清单缺失 + 哈希不符两分支)"
 else
-  fail "install.sh 未使用 fail-closed 策略"
+  fail "install.sh 未使用 fail-closed 策略(缺失分支=$missing_ok 不符分支=$mismatch_ok)"
 fi
 
 # 1.5 检查版本固定支持
@@ -287,11 +304,40 @@ else
   fail "daemon.c 未验证端口范围"
 fi
 
-# 4.3 检查端口预留机制
-if grep -q "pick_port_fd" src/daemon.c; then
-  ok "daemon.c 使用端口预留机制(消除 TOCTOU)"
+# 4.3 检查端口预留机制(断言**机制与时序**,不是函数名存在)
+# 旧写法 `grep -q "pick_port_fd"` 只证明「函数名出现过」,删掉函数体只留名字照样绿;
+# 文案还停在**已撤回的结论**上 —— E5(5503968)已把 pick_port_fd 的头注释按实现改写为
+# 「保持 bind 但未 listen 的 fd:只缩小窗口,非互斥,审计 E5」,断言却说「消除 TOCTOU」。
+# 改为断言两条真实机制:
+#   (a) 预留 = bind 后**不** listen 的占位 socket —— 若加了 listen,dsh 自己 bind 同端口必失败;
+#   (b) 释放(close(reserve_fd))必须**早于** execl —— 即窗口收窄而非互斥。
+# 抽取按**符号名 + 花括号配平**定位(helper `extract_fn`,见 tests/lib/daemon-helpers.sh);
+# 旧写法 `sed -n '/^static int pick_port_fd/,/^}/p'` 的终点是「第一行列 0 的 }」,函数体内
+# 一旦出现列 0 的 } 就被静默截断(审计 F10)。三层判据依次是:
+#   「抽到没有」→「长度够不够(下界,兜住截断)」→「机制对不对」,
+# 三种失败给出**不同**的文案,便于一眼归因。
+pick_fn="$(extract_fn pick_port_fd)"
+spawn_fn="$(extract_fn spawn_dsh)"
+if [ -z "$pick_fn" ] || [ -z "$spawn_fn" ]; then
+  fail "未能定位端口预留相关函数(源码抽取为空,断言失效)"
+elif [ "$(printf '%s\n' "$pick_fn" | wc -l)" -lt 6 ] || [ "$(printf '%s\n' "$spawn_fn" | wc -l)" -lt 20 ]; then
+  fail "端口预留函数抽取过短(疑似被截断,断言不可信)"
+elif printf '%s\n' "$pick_fn" | grep -q 'listen('; then
+  fail "pick_port_fd 对预留 socket 调用了 listen(dsh 将无法 bind 同一端口)"
+elif ! printf '%s\n' "$pick_fn" | grep -q 'bind(s'; then
+  fail "pick_port_fd 未先 bind 占位,端口预留机制缺失"
+elif printf '%s\n' "$spawn_fn" | awk '
+      # 取「最后一次 close(reserve_fd)」与「第一次 execl」比:任何一次释放晚于 exec
+      # 都会让预留 fd 泄漏进 dsh —— dsh 自己 bind 同端口会 EADDRINUSE,唤醒直接失败。
+      /execl\(/            { if (!e) e = NR }
+      /close\(reserve_fd\)/ { c = NR }
+      END {
+        if (!e || !c) exit 1   # 抽取失效(没找到 exec 或没找到释放)
+        exit (c < e) ? 0 : 1
+      }'; then
+  ok "端口预留:先 bind 占位、spawn 前释放(窗口收窄,非互斥)"
 else
-  fail "daemon.c 存在端口分配竞态条件"
+  fail "预留 socket 的释放未早于 execl(时序退化,窗口被放大)"
 fi
 
 # 4.4 检查 reserve_fd 使用
@@ -319,34 +365,64 @@ else
 fi
 
 # 5.3 检查缓冲区大小
-if sed -n '/^static int http_probe/,/^}/p' src/daemon.c | grep -q "char b\[512\]"; then
+# 旧写法 else 走 info:该断言在**任何情况下**都不会让套件变红,却仍占着「33 项测试」的名额
+# (TRAPS §一.5「失败只 warn 不阻断 = 空转门禁」)。探测缓冲过小会让响应头被静默截断,
+# 与「截断必须可观测」相悖,是真实安全属性 → 改 fail。
+# 抽取改用符号锚点 + 花括号配平(旧 `sed` 行范围会被函数体内列 0 的 `}` 静默截断,审计 F10);
+# 三层判据「抽到没有 → 长度够不够 → 容量对不对」各给不同文案。
+probe_fn="$(extract_fn http_probe)"
+if [ -z "$probe_fn" ]; then
+  fail "未能定位 http_probe 函数(源码抽取为空,断言失效)"
+elif [ "$(printf '%s\n' "$probe_fn" | wc -l)" -lt 10 ]; then
+  fail "http_probe 抽取过短(疑似被截断,断言不可信)"
+elif printf '%s\n' "$probe_fn" | grep -q 'char b\[512\]'; then
   ok "HTTP 探测使用足够大的缓冲区(512 字节)"
 else
-  info "HTTP 探测缓冲区可能需要扩大"
+  fail "HTTP 探测缓冲区不足 512 字节(响应头可能被静默截断)"
 fi
 
 h1 "6. 低风险问题修复"
 
 # 6.1 检查 PID 验证
-info "检查 stop_dsh 是否验证 PID..."
-if sed -n '/^static void stop_dsh/,/^}/p' src/daemon.c | grep -q "kill(pid, 0)"; then
-  ok "stop_dsh 在发送信号前验证 PID"
+# 旧写法 `sed -n '/^static void stop_dsh/,/^}/p'` 的起点正则**同时匹配** `stop_dsh_wait`,
+# 于是实际抽到的是 stop_dsh_wait 的函数体 —— 断言「通过」是因为它测的是**另一个函数**;
+# 而 F5 把 stop_dsh 改成一行委托后,stop_dsh 自身已不含任何 kill 调用。这是 F10 所说的
+# 「结论与真实结构无关」的活样本。改为按符号精确抽取**真正承载该逻辑的函数**。
+info "检查停机路径是否验证 PID..."
+stop_fn="$(extract_fn stop_dsh_wait)"
+if [ -z "$stop_fn" ]; then
+  fail "未能定位 stop_dsh_wait(源码抽取为空,断言失效)"
+elif [ "$(printf '%s\n' "$stop_fn" | wc -l)" -lt 20 ]; then
+  fail "stop_dsh_wait 抽取过短(疑似被截断,断言不可信)"
+elif printf '%s\n' "$stop_fn" | grep -q 'kill(pid, 0)'; then
+  ok "停机路径在发信号前用 kill(pid,0) 验证 PID 存在"
 else
-  fail "stop_dsh 未验证 PID 存在性"
+  fail "停机路径未在发信号前验证 PID 存在性"
 fi
 
 # 6.2 检查 HTML 转义
-if grep -q "HTML 转义" src/daemon.c || grep -q "&lt;" src/daemon.c; then
-  ok "build_boot 对 LOG_DIR 进行 HTML 转义"
+# 旧写法 `grep -q "HTML 转义" || grep -q "&lt;"`:第一个分支命中的是**解释性注释**
+# (daemon.c 里「HTML 转义(防路径注入…)」那行),删掉实现只留注释照样绿(TRAPS §一.20 探针污染);
+# 第二个分支只证明「文件某处出现过 &lt;」,与 LOG_DIR 是否被转义无关。else 又走 info 永不失败。
+# 改为锚定实现:build_boot 必须**实际调用** html_escape 处理 LOG_DIR,且三个映射齐全。
+if grep -qF 'html_escape(LOG_DIR, esc, sizeof esc)' src/daemon.c \
+   && grep -qF '"&lt;"' src/daemon.c \
+   && grep -qF '"&amp;"' src/daemon.c \
+   && grep -qF '"&quot;"' src/daemon.c; then
+  ok "build_boot 对 LOG_DIR 调用 html_escape 且 < & \" 映射齐全"
 else
-  info "build_boot 可能未转义 LOG_DIR(低风险)"
+  fail "build_boot 未对 LOG_DIR 做完整 HTML 转义(路径注入防御缺失)"
 fi
 
 # 6.3 检查 JSON 转义处理
-if grep -q "反转义" src/daemon.c || grep -q '\\\\\\\\' src/daemon.c; then
-  ok "extract_str 处理 JSON 转义字符"
+# 旧写法 `grep -q "反转义" || grep -q '\\\\'`:第一个分支命中的同样是注释
+# (「简单的反转义:只处理 \\ 和 \"」),第二个分支过宽。else 又走 info 永不失败。
+# 改为锚定 extract_str 里真实的反转义分支:\\\\ 与 \" 成对还原。
+if grep -qF "q[i] == '\\\\' && i + 1 < l" src/daemon.c \
+   && grep -qF "(q[i+1] == '\\\\' || q[i+1] == '\"')" src/daemon.c; then
+  ok "extract_str 对 \\\\ 与 \" 成对反转义"
 else
-  info "extract_str 可能未处理转义(低风险)"
+  fail "extract_str 未处理 JSON 转义(含转义的路径会被错误解析)"
 fi
 
 h1 "7. 编译测试"
@@ -376,22 +452,32 @@ if [ -f "$TMPD_BUILD/daemon" ]; then
 fi
 
 # 7.3 检查符号表清理
+# 旧写法 else 走 info:体积暴涨(误带调试符号 / 误嵌资产)永远不会让套件变红 → 改 fail。
+# 阈值 150000 是「双架构 + 内嵌引导页」的合理上界(实测约 120KB);真的合理增长时应当
+# **显式上调阈值**并说明原因,而不是靠 info 静默放过。
 if [ -f "$TMPD_BUILD/daemon" ]; then
   SIZE=$(stat -f%z "$TMPD_BUILD/daemon")
-  # Universal binary 当前约 117KB(双架构 + 内嵌引导页)
   if [ "$SIZE" -lt 150000 ]; then
     ok "daemon 二进制大小合理($SIZE 字节)"
   else
-    info "daemon 二进制较大($SIZE 字节,可能包含调试符号)"
+    fail "daemon 二进制过大($SIZE 字节 ≥ 150000,疑似误带调试符号)"
   fi
 fi
 
 h1 "测试总结"
 echo
-if [ "$FAIL" = "0" ]; then
-  echo "${G}${B}✓ 全部通过${RST} ($PASS 项测试)"
-  exit 0
-else
+# 反空转(TRAPS §一.16):只断言 `FAIL=0` 会被「一条都没跑到」满足 —— 脚本若在早期被
+# `set -e` 掐断,或某个 if 分支整段没进,PASS 会**静默变小**而仍然 exit 0(且最后一行
+# 照样打印「全部通过」)。故给 PASS 设下界,并在失败信息里打印实际值。
+# 下界随用例增减**人工上调**(新增断言后忘了调大只是少一层保护,不会误报)。
+PASS_MIN=33
+if [ "$FAIL" != "0" ]; then
   echo "${R}${B}✗ 发现问题${RST} (${G}$PASS 通过${RST}, ${R}$FAIL 失败${RST})"
   exit 1
 fi
+if [ "$PASS" -lt "$PASS_MIN" ]; then
+  echo "${R}${B}✗ 断言数不足${RST} (${G}$PASS 通过${RST} < 下界 $PASS_MIN —— 有断言被静默跳过?)"
+  exit 1
+fi
+echo "${G}${B}✓ 全部通过${RST} ($PASS 项测试)"
+exit 0

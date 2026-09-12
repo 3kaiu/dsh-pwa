@@ -46,7 +46,9 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "将发布的 tag: $TAG"
       - name: 编译守护(universal binary,ad-hoc 签名)
-        run: clang -O2 -Wall -Wextra -arch arm64 -arch x86_64 -o /tmp/daemon src/daemon.c && codesign --force -s - /tmp/daemon
+        # -Werror 必须与 ci-enhanced.yml 的三个 job 一致(审计 F13):release 可被
+        # workflow_dispatch **单独触发**,缺 -Werror 就存在一条「绕过 CI 直接产出带告警发行包」的路径。
+        run: clang -O2 -Wall -Wextra -Werror -arch arm64 -arch x86_64 -o /tmp/daemon src/daemon.c && codesign --force -s - /tmp/daemon
       - name: 生成 pnpm-lock.yaml(预解析依赖树,用户安装跳解析省时;与 install.sh 同配置)
         run: |
           # 自动跟随上游 latest 标签(dsh 稳定版本;与 install.sh 的 DSH_VERSION 默认一致)

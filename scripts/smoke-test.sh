@@ -295,8 +295,19 @@ PY
 
   TPL="$ROOT/launchd/com.dshpwa.daemon.plist"
   [ -f "$TPL" ] || TPL="$ROOT/com.dshpwa.daemon.plist"
+  # 与 install.sh 的「node-options-entry」段同形式:--use-system-ca 是 Node 22.15.0 才
+  # 引入的选项,写死进 NODE_OPTIONS 会让更旧的 node 拒绝启动(rc=9)。本处渲染的 plist
+  # 只用于 socket activation 验证(NODE_OPTIONS 对假 dsh 无影响),但必须与 install.sh
+  # 用同一套占位符,否则模板改了这里没跟上 → __NODE_OPTIONS_ENTRY__ 原样落进 plist,
+  # 下面那行 plutil -lint 会报错(这正是我们想要的:宁可红也不要静默失效)。
+  NODE_BIN="$(command -v node || true)"
+  NODE_OPTIONS_ENTRY=""
+  if "$NODE_BIN" --use-system-ca -e '' >/dev/null 2>&1; then
+    NODE_OPTIONS_ENTRY='<key>NODE_OPTIONS</key><string>--use-system-ca</string>'
+  fi
   sed -e "s|__DAEMON_BIN__|$RT_HOME/daemon|g" \
       -e "s|__HOME__|$HOME|g" \
+      -e "s|__NODE_OPTIONS_ENTRY__|$NODE_OPTIONS_ENTRY|g" \
       -e "s|__RT_HOME__|$SA_RT_HOME|g" \
       -e "s|__RT_STATE__|$SA_RT_STATE|g" \
       -e "s|__LOG_DIR__|$SA_LOG_DIR|g" \

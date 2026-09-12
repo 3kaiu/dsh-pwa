@@ -35,6 +35,44 @@ read_version() {
     "$APP_DIR/node_modules/@deepseek-ai/dsh/package.json" 2>/dev/null || echo ""
 }
 
+# >>> node-resolve-shared(与 install.sh 里的同名块**逐字节一致**;tests/unit/node-resolve.bats 断言) >>>
+# 把 shim 符号链接解析到真实二进制。
+# 为什么不用 `realpath` / `readlink -f`:`-f` 是 GNU 专有,macOS 的 BSD readlink 不支持。
+# 为什么不用 `python3 -c 'os.path.realpath(...)'`:macOS 12.3+ 不再随系统附带 python3,
+#   缺失时旧写法 `... || echo "$CAND"` 会**静默**退回未解析路径,把 fnm 的 multishell
+#   会话级临时目录写进 run.json —— 守护此后 exec 一个 shell 退出即失效的 node,表现为
+#   「守护活着、dsh 永远起不来」,且没有任何用户可见的错误(与 NODE_OPTIONS 那条同族)。
+# 纯 bash 实现:逐级 readlink 直到不再是符号链接;40 级上限防环。
+dsh_resolve_node() {
+  local p="${1:-}" d n i=0
+  [ -n "$p" ] || return 1
+  while [ -L "$p" ]; do
+    i=$((i + 1))
+    [ "$i" -le 40 ] || return 1
+    d="$(cd "$(dirname "$p")" 2>/dev/null && pwd -P)" || return 1
+    n="$(readlink "$p" 2>/dev/null)" || return 1
+    [ -n "$n" ] || return 1
+    case "$n" in
+      /*) p="$n" ;;
+      *)  p="$d/$n" ;;
+    esac
+  done
+  d="$(cd "$(dirname "$p")" 2>/dev/null && pwd -P)" || return 1
+  printf '%s/%s\n' "$d" "$(basename "$p")"
+}
+
+# 该路径是否落在**随 shell 会话失效**的 shim 目录里。
+# 只认 fnm 的 multishell 目录:`$XDG_STATE_HOME/fnm_multishells/<pid>_<ts>/` 每个会话一份,
+# shell 退出即删。volta(`~/.volta/bin`)与 nvm(`~/.nvm/versions/node/...`)的 shim 是**稳定**
+# 路径(volta 的 shim 还是普通文件、不是符号链接),把它们一并拒绝会误伤正常安装。
+dsh_node_path_is_session_scoped() {
+  case "${1:-}" in
+    */fnm_multishells/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+# <<< node-resolve-shared <<<
+
 # 未安装则无事可做(记日志,便于排查"定时任务在跑却从未更新"的情况)
 if [ ! -d "$APP_DIR/node_modules/@deepseek-ai/dsh" ]; then
   log "! $(date '+%Y-%m-%d %H:%M:%S') 未检测到已安装的 dsh($APP_DIR),跳过更新"
@@ -53,7 +91,15 @@ if [ -n "$RUN_NODE" ] && [ -x "$RUN_NODE" ]; then
 fi
 if [ -z "$NODE_BIN" ] && command -v node >/dev/null 2>&1; then
   CAND="$(command -v node)"
-  CAND="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$CAND" 2>/dev/null || echo "$CAND")"
+  # shim 解析用与 install.sh **同一段实现**(见上面的 node-resolve-shared 块)。
+  # 解析后仍落在会话级目录 → 拒绝复用(否则更新器会 exec 一个 shell 退出即失效的 node);
+  # 下方 `[ "${SYS_VER:-0}" -ge 22 ]` 对空值不成立,自然落回 $NODE_DIR/bin/node。
+  RESOLVED="$(dsh_resolve_node "$CAND" 2>/dev/null || true)"
+  [ -z "$RESOLVED" ] || CAND="$RESOLVED"
+  if dsh_node_path_is_session_scoped "$CAND"; then
+    log "! $(date '+%Y-%m-%d %H:%M:%S') 系统 node 位于会话级临时目录($CAND),不予复用"
+    CAND=""
+  fi
   SYS_VER="$("$CAND" --version 2>/dev/null | sed 's/^v//' | cut -d. -f1)"
   if [ "${SYS_VER:-0}" -ge 22 ]; then
     NODE_BIN="$CAND"

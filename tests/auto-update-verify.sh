@@ -488,10 +488,18 @@ skip "路径注入防护:DSH_RT_HOME 注入会在真实文件系统落地脏目�
 
 h1 "测试总结"
 echo
-if [ "$FAIL" = "0" ]; then
-  echo "${G}${B}✓ 全部通过${RST} ($PASS 项通过, $SKIP_COUNT 项 SKIP)"
-  exit 0
-else
+# 反空转(TRAPS §一.16):只断言 `FAIL=0` 会被「一条都没跑到」满足 —— 脚本若在早期被
+# `set -e` 掐断,或某个 if 分支整段没进,PASS 会**静默变小**而仍然 exit 0。
+# 故给 PASS 设下界(下界随用例增减人工上调);SKIP 数不设下界 —— SKIP 是本套件的
+# 正常形态(破坏性/需真实环境的用例刻意保留人工验收),锁死它只会让合理调整变红。
+PASS_MIN=28
+if [ "$FAIL" != "0" ]; then
   echo "${R}${B}✗ 发现问题${RST} (${G}$PASS 通过${RST}, ${R}$FAIL 失败${RST}, $SKIP_COUNT 项 SKIP)"
   exit 1
 fi
+if [ "$PASS" -lt "$PASS_MIN" ]; then
+  echo "${R}${B}✗ 通过数不足${RST} (${G}$PASS 通过${RST} < 下界 $PASS_MIN —— 有用例被静默跳过?)"
+  exit 1
+fi
+echo "${G}${B}✓ 全部通过${RST} ($PASS 项通过, $SKIP_COUNT 项 SKIP)"
+exit 0

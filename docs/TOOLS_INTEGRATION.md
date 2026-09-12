@@ -160,7 +160,7 @@ bats -c tests/unit/*.bats     # 只统计数量,不执行
 
 4. **binary-analysis** - 二进制分析
    - 体积分析
-   - 体积回归检测 (>90KB 警告)
+   - 体积回归检测 (>150KB 警告;阈值同 `scripts/analyze-binary.sh` 与 `tests/unit/install-validation.bats`)
 
 ---
 
@@ -175,9 +175,9 @@ cat > .git/hooks/pre-commit <<'EOF'
 command -v shellcheck >/dev/null && shellcheck scripts/*.sh tests/*.sh || true
 # 2. C 编译检查 (零警告)
 clang -O2 -Wall -Wextra -Werror -arch arm64 -arch x86_64 -o /tmp/daemon-precommit src/daemon.c || exit 1
-# 3. 二进制体积检查 (>90KB 警告)
+# 3. 二进制体积检查 (>150KB 警告;阈值与 CI/单测保持一致,见 scripts/analyze-binary.sh)
 SIZE=$(stat -f%z /tmp/daemon-precommit)
-[ "$SIZE" -gt 92160 ] && echo "⚠️ 二进制超过 90KB: ${SIZE}B"
+[ "$SIZE" -gt 153600 ] && echo "⚠️ 二进制超过 150KB: ${SIZE}B"
 EOF
 chmod +x .git/hooks/pre-commit
 ```
@@ -245,7 +245,7 @@ bats tests/unit/
 | **RSS 内存** | ~1330KB | ~1270KB | <1300KB |
 | **系统调用** | 5次/秒 | 2次/秒 | <3次/秒 |
 | **/health 延迟** | ~10ms | ~5-10ms | <15ms |
-| **二进制体积** | 85KB | 83KB | <90KB |
+| **二进制体积** | 85KB | 83KB | universal <150KB(阈值见 `scripts/analyze-binary.sh`;实测值以 `tests/security-verification.sh` 输出为准) |
 
 ### 质量指标
 
@@ -253,8 +253,8 @@ bats tests/unit/
 |------|------|
 | **编译警告** | 0 |
 | **Shellcheck 问题** | 0 (critical) |
-| **单元测试通过率** | 100% |
-| **安全测试通过率** | 100% (33/33) |
+| **单元测试通过率** | 100%(用例数以 `bats -c tests/unit/*.bats` 的输出为准) |
+| **安全测试通过率** | 100%(断言数以 `bash tests/security-verification.sh` 的输出为准) |
 
 ---
 

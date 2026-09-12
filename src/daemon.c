@@ -22,6 +22,9 @@
 //   launchd 持有监听 socket(Sockets/Listeners),登录时不启动任何进程(零 RSS);
 //   PWA 点图标 → 首个 TCP 连接 → launchd 拉起守护(launch_activate_socket 接管 fd)→ 拉起 dsh;
 //   页面关闭 → 连接归零 → 守护停止 dsh 后 exit(0) 自退,launchd 重新接管 socket 等待下次连接。
+//   收到 SIGTERM/SIGINT(launchctl bootout / kickstart -k / 前台 Ctrl-C)→ **先停 dsh 再退出**:
+//   plist 的 AbandonProcessGroup=true 且 dsh 经 setsid 自成会话,launchd 不会连带清理它,
+//   不处理就会留下一个继续常驻占端口的孤儿 dsh(零常驻承诺被破坏,且无任何用户可见信号)。
 //   手动前台运行(冒烟测试/dev)时无 launchd sockets,自动回退自建 socket,空闲停机后继续循环不退出。
 //   后台更新检查按 RT_STATE/last_update_check 时间戳节流(>12h 才触发),避免每次激活都跑更新。
 // 安全:状态变更端点校验 Origin 精确匹配本端口(防 CSRF);所有请求校验 Host 必须精确等于
@@ -269,6 +272,13 @@ static void note_hint(void) { fast_hint_m = mono_now(); }
 static time_t last_spawn_time = 0;
 static int spawn_failure_count = 0;
 static time_t cooldown_until = 0; // 崩溃冷却截止(非阻塞:到期前拒绝拉起,主循环照常服务引导页)
+// NODE_OPTIONS 兜底标记(仅本守护进程生命周期内有效)。
+// plist 里的 NODE_OPTIONS 已由 install.sh 按能力探测注入,但手工编辑 plist、或安装后把
+// node 换到更旧版本,都会让 NODE_OPTIONS 含当前 node 不认识的选项 —— 此时 node **拒绝启动**
+// 并返回 9(实测:一行代码都不执行),表现为「守护在跑、dsh 永远起不来」且无用户可见错误。
+// 守护不重复探测(每次唤醒多一次 node 进程,违背零常驻的时延预算),而是观察到退出码 9 后
+// 剥掉该变量;引导页持续轮询,下一个请求即成功。
+static int node_options_bad = 0;
 // token 扫描期限:必须锚定「dsh 就绪」而非「spawn」。token 是 dsh 打印在它自己启动之后
 // (实测:就绪后 0.4s 内),而实测本机 dsh 冷启动到就绪需 ~115s —— 原实现只按 spawn+120s
 // 扫描,余量仅数秒,再慢一点(负载高/慢机)token 就被永久错过:引导页永远等不到 token,
@@ -388,6 +398,9 @@ static void spawn_dsh(void) {
   mkdir(nc, 0700);
   setenv("NODE_COMPILE_CACHE", nc, 1);
   char port_s[16]; snprintf(port_s, sizeof port_s, "%d", port);
+  // 上一轮观察到 dsh 以退出码 9 退出 → 判定继承来的 NODE_OPTIONS 不被当前 node 接受,剥掉它。
+  // 只在本守护进程内生效:进程退出后标记丢失,但那时 install.sh 重生成的 plist 已是正解。
+  if (node_options_bad) unsetenv("NODE_OPTIONS");
   // --no-open:dsh 0.1.5+ 不再尊重 BROWSER=none,必须显式传参,否则每次唤醒都弹浏览器
   execl(NODE_BIN, "node", DSH_BIN, "web", "--no-open", "--host", "127.0.0.1", "--port", port_s, (char *)NULL);
   _exit(127);
@@ -493,7 +506,13 @@ static int pid_is_node(int pid, char *pbuf, size_t pcap) {
   return strcmp(bn ? bn + 1 : pb, "node") == 0;
 }
 
-static void stop_dsh(void) {
+// 停止 dsh:先对**整个进程组**发 SIGTERM 等它优雅退出,超时再整组 SIGKILL。
+// wait_ticks × tick_us 是优雅等待上限,调用方按场景给预算:
+//   - 常规路径(/stop、空闲停机):30 × 200ms = 6s —— node 收尾可能要落盘/关连接;
+//   - 终止信号路径(见 on_shutdown_signal):15 × 100ms = 1.5s —— 此刻 launchd 正在等本
+//     进程退出,测试收尾也只给守护 2s;而 SIGKILL 兜底已足以保证「绝不留下孤儿」,
+//     故不必再等满 6s 去拖慢收尾。
+static void stop_dsh_wait(int wait_ticks, int tick_us) {
   int pid = read_pid();
   // 本函数收割 dsh 后必须同步清 spawn_pid:主循环靠 waitpid(-1)+is_spawn 清它,
   // 若这里已收走尸体而 spawn_pid 残留,下次 /wake 会误判"在启动中"而永不拉起。
@@ -530,10 +549,10 @@ static void stop_dsh(void) {
       // 必须先 waitpid 收割:dsh 死后若未收割会呈僵尸态,kill(pid,0) 对僵尸恒成功,
       // 不收就会白等满 6s。/stop 经命令管道也跑在主进程里,waitpid 直接有效;
       // idle 停机路径同样在主进程调用本函数。
-      for (int i = 0; i < 30; i++) {
+      for (int i = 0; i < wait_ticks; i++) {
         if (waitpid(pid, NULL, WNOHANG) == pid) break; // 已退出并收割
         if (kill(pid, 0) != 0) break;                  // 已彻底消失
-        usleep(200000);
+        usleep(tick_us);
       }
       // 超时则强制 SIGKILL(同样整组)
       if (waitpid(pid, NULL, WNOHANG) != pid && kill(pid, 0) == 0) { kill(-pid, SIGKILL); kill(pid, SIGKILL); }
@@ -542,6 +561,9 @@ static void stop_dsh(void) {
   unlink(DSH_JSON);
   unlink(PID_FILE);
 }
+
+// 常规停机入口:6s 优雅期(/stop、空闲停机等)。终止信号路径直接用 stop_dsh_wait 传更短预算。
+static void stop_dsh(void) { stop_dsh_wait(30, 200000); }
 
 // 连接子进程里请求停止:与 /wake 同法只写命令字节,由主进程串行执行 stop_dsh。
 // 若在子进程里直连 stop_dsh(旧实现),其最长 6s 等待循环期间主进程可 spawn 新 dsh,
@@ -701,23 +723,33 @@ static void build_boot(void) {
 
 // ---------- HTTP ----------
 static int write_all(int fd, const char *b, size_t n);
-// 全站唯一的响应出口(14 处调用全经此处),安全头集中加一次即可覆盖全部响应。
+// 全站唯一的响应出口(17 处调用全经此处),安全头集中加一次即可覆盖全部响应。
 // E6a:nosniff 阻止浏览器把 JSON/纯文本按 HTML 嗅探(需配合反射型内容才构成 XSS,属防御纵深);
 // CSP 按引导页的**真实需求**逐条放开,其余一律 default-src 'none'。引导页是自包含的 ——
 // 内联 <style>/<script> + 同源 fetch/sendBeacon + /icon.svg + /manifest.webmanifest,
 // 故只需 script/style 的 'unsafe-inline' 与 connect/img/manifest 的 'self'。
 // 若将来改引导页模板引入新的资源类型,必须同步改这里,否则页面会被 CSP **静默打断**
 // (白屏,无任何信号)—— 已由 daemon-cases.bats 的「CSP 覆盖引导页真实需求」门禁守住。
+// 响应体媒体类型集中定义:17 个 respond() 调用点全部引用这里,不再散落字面量。
+// 动因(审计 F11):`-Wall -Wextra` **不报未使用宏**,半截重构会留下「编译全绿的死代码」;
+// 而字面量散落时 charset 会自然漂移 —— 收口前实测 `"text/plain"` 与
+// `"text/plain; charset=utf-8"` 并存。JSON 按 RFC 8259 恒为 UTF-8,故不带 charset 参数。
+// 本地 gauntlet 已加 `-Wunused-macros`,以后再有「定义了却没人用」的宏会被编译挡下。
+#define CT_HTML     "text/html; charset=utf-8"
+#define CT_PLAIN    "text/plain; charset=utf-8"
+#define CT_JSON     "application/json"
+#define CT_MANIFEST "application/manifest+json"
+#define CT_SVG      "image/svg+xml"
 #define SEC_HEADERS \
   "X-Content-Type-Options: nosniff\r\n" \
   "Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; " \
   "style-src 'unsafe-inline'; connect-src 'self'; img-src 'self'; " \
   "manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n"
 static void respond(int c, int code, const char *ct, const char *body) {
-  // E6b:ct 目前全是字面量,但它是**响应头的一部分** —— 一旦将来传入含 CR/LF 的值即成
-  // 响应头注入(可伪造额外响应头甚至提前结束头部)。这里做净化而非断言:断言在生产里
-  // 等于崩溃,净化的行为可预测且可测试。
-  if (strpbrk(ct, "\r\n")) ct = "text/plain; charset=utf-8";
+  // E6b:ct 现在是 CT_* 宏(编译期常量),但签名收的是 const char* —— 一旦将来传入
+  // 运行期拼接的、含 CR/LF 的值即成响应头注入(可伪造额外响应头甚至提前结束头部)。
+  // 这里做净化而非断言:断言在生产里等于崩溃,净化的行为可预测且可测试。
+  if (strpbrk(ct, "\r\n")) ct = CT_PLAIN;
   // 状态文本必须与 code 一一对应:漏掉一个码会统一退化成 "Internal Server Error",
   // 于是客户端看到 503 + "Internal Server Error" 会误判为守护崩溃,而不是「被限流了」。
   const char *st = code == 200 ? "OK"
@@ -828,7 +860,7 @@ static void respond_health(int c) {
     // 兜底,且兜底体不含包装器字段,于是字段一多就静默丢失(与 E4 同一类缺陷)。
     snprintf(body, sizeof body, "{\"dsh\":%s,\"port\":%d,\"pid\":%d}",
              ready ? "true" : "false", ready ? dsh_port : 0, pid);
-  respond(c, 200, "application/json", body);
+  respond(c, 200, CT_JSON, body);
 }
 
 static const char MANIFEST[] =
@@ -1074,7 +1106,7 @@ static void handle_conn(int c) {
   int blen = read_request_head(c, buf, sizeof buf);
   if (blen == 0) return; // 对端未发数据(空连接):静默收尾
   if (blen < 0) {
-    respond(c, 400, "text/plain", "incomplete request head\n");
+    respond(c, 400, CT_PLAIN, "incomplete request head\n");
     return;
   }
 
@@ -1082,7 +1114,7 @@ static void handle_conn(int c) {
   // 不匹配本守护端口一律 403——rebinding 攻击者控制的 Host 是 evil.com,浏览器正常路径
   // (含透传:浏览器发给 3080 的 Host 同样是 127.0.0.1:3080)不受影响。
   if (!host_ok(buf)) {
-    respond(c, 403, "application/json", "{\"error\":\"Host header invalid\"}");
+    respond(c, 403, CT_JSON, "{\"error\":\"Host header invalid\"}");
     return;
   }
 
@@ -1098,57 +1130,67 @@ static void handle_conn(int c) {
     char *q = strchr(path, '?'); if (q) { snprintf(query, sizeof query, "%s", q + 1); *q = 0; }
   }
 
-  // 每次请求都重读 dsh.json:/wake 拉起 dsh 后端口是守护挑的,停止后文件被删,自动跟随
+  // 每次请求都重读 dsh.json:/wake 拉起 dsh 后端口是守护挑的,停止后文件被删,自动跟随。
+  // 这条**不能**延后(审计 F14 评估结论):子进程是在 accept 时 fork 的,若父进程在 fork
+  // 之后 spawn 了新 dsh,子进程继承的 dsh_port/ready_port 就都是旧的;重读文件能让
+  // dsh_ready() 立刻看到「端口已变 → 未就绪」。否则 /health 会拿旧端口报 dsh:true,
+  // 引导页据此去一个没人监听的端口握手 → 白屏。一次 open+read+close 换掉这个竞态,划算。
   refresh_port();
-  int up = dsh_up();
 
   // ---- 控制端点:不依赖就绪状态,守护自身处理(含 CSRF 防护) ----
+  // /health 必须在 dsh_up() **之前**返回:respond_health() 只用内存里的 dsh_ready()
+  // 和 read_pid(),从不读 up。而 /health 是引导页轮询**最频繁**的端点,原先每次都要
+  // 多付一次回环 TCP connect(socket+connect+close)——纯开销(审计 F14)。
   if (strcmp(path, "/health") == 0) { respond_health(c); return; }
+
+  // 到这里才真正需要「dsh 是否在监听」:它决定 /wake 的幂等应答、/stop 要不要真停,
+  // 以及是透传还是回引导页。必须**新鲜** —— dsh 刚死时不能再往它上面透传。
+  int up = dsh_up();
   
   // CSRF 防护:状态变更端点要求 Origin 精确匹配本守护端口(防跨域页面驱动启停/续租)
   if (strcmp(method, "POST") == 0 && (strcmp(path, "/wake") == 0 || strcmp(path, "/stop") == 0 ||
       strcmp(path, "/ping") == 0 || strcmp(path, "/goodbye") == 0)) {
     if (!origin_ok(buf)) {
-      respond(c, 403, "application/json", "{\"error\":\"Origin header required\"}");
+      respond(c, 403, CT_JSON, "{\"error\":\"Origin header required\"}");
       return;
     }
   }
   
   if (strcmp(method, "POST") == 0 && strcmp(path, "/wake") == 0) {
-    if (!NODE_BIN[0] || !DSH_BIN[0]) { respond(c, 500, "application/json", "{\"error\":\"runtime not installed\"}"); return; }
+    if (!NODE_BIN[0] || !DSH_BIN[0]) { respond(c, 500, CT_JSON, "{\"error\":\"runtime not installed\"}"); return; }
     if (!up) request_wake(); // 幂等:主进程按 spawn_pid/dsh_up 判定,不重复 spawn
-    respond(c, 200, "application/json", up ? "{\"dsh\":true}" : "{\"started\":true}");
+    respond(c, 200, CT_JSON, up ? "{\"dsh\":true}" : "{\"started\":true}");
     return;
   }
   if (strcmp(method, "POST") == 0 && strcmp(path, "/stop") == 0) {
     // 只投递命令字节,由主进程串行执行 stop_dsh(消除与 /wake spawn 的竞态,见 request_stop);
     // 响应立即返回,停止异步完成——旧实现会在本连接子进程里阻塞最长 6s。
     if (up) request_stop();
-    respond(c, 200, "application/json", "{\"stopped\":true}");
+    respond(c, 200, CT_JSON, "{\"stopped\":true}");
     return;
   }
   if (strcmp(method, "POST") == 0 && strcmp(path, "/ping") == 0) {
     // 在场心跳:accept 瞬间父进程已续租,这里只回 200(引导页/外部持有者用)
-    respond(c, 200, "application/json", "{\"ok\":true}");
+    respond(c, 200, CT_JSON, "{\"ok\":true}");
     return;
   }
   if (strcmp(method, "POST") == 0 && strcmp(path, "/goodbye") == 0) {
     // 关闭信标:经 hint_pipe 知会父进程(子进程不能直接写父进程全局量);写端 NONBLOCK,可丢
     if (hint_pipe[1] >= 0) { char b = 1; (void)write(hint_pipe[1], &b, 1); }
-    respond(c, 200, "application/json", "{\"ok\":true}");
+    respond(c, 200, CT_JSON, "{\"ok\":true}");
     return;
   }
   // ---- PWA 资产:守护永远自己应答,不透传 ----
   // dsh 的 manifest(display/fullscreen、start_url 解析依其内部地址)会让「添加到程序坞」
   // 生成的 PWA 绑定到错误行为;PWA 的安装身份必须始终由守护定义。
-  if (strcmp(path, "/manifest.webmanifest") == 0) { respond(c, 200, "application/manifest+json", MANIFEST); return; }
-  if (strcmp(path, "/icon.svg") == 0) { respond(c, 200, "image/svg+xml", ICON_SVG); return; }
+  if (strcmp(path, "/manifest.webmanifest") == 0) { respond(c, 200, CT_MANIFEST, MANIFEST); return; }
+  if (strcmp(path, "/icon.svg") == 0) { respond(c, 200, CT_SVG, ICON_SVG); return; }
 
   // ---- 未就绪(未启动 / 启动中尚不能服务 HTTP):引导页,绝不透传 → 根治 PWA 空白 ----
   if (!up || !dsh_ready()) {
     // 页面请求即自动拉起(不再等引导页 JS 的 /wake 往返)→ 启动提速
     if (!up && NODE_BIN[0] && DSH_BIN[0]) request_wake();
-    respond(c, 200, "text/html; charset=utf-8", BOOT_PAGE);
+    respond(c, 200, CT_HTML, BOOT_PAGE);
     return;
   }
 
@@ -1163,7 +1205,7 @@ static void handle_conn(int c) {
   // (has_cookie:名字整体等于 dsh-auth 且紧跟 '=',支持多 cookie,防 dsh-auth-evil 前缀绕过)。
   if (strcmp(method, "GET") == 0 && strcmp(path, "/") == 0 && strncmp(query, "token=", 6) != 0) {
     if (!has_cookie(buf, "dsh-auth")) {
-      respond(c, 200, "text/html; charset=utf-8", BOOT_PAGE);
+      respond(c, 200, CT_HTML, BOOT_PAGE);
       return;
     }
   }
@@ -1173,18 +1215,18 @@ static void handle_conn(int c) {
   if (strcmp(method, "POST") == 0 || strcmp(method, "PUT") == 0 ||
       strcmp(method, "DELETE") == 0 || strcmp(method, "PATCH") == 0) {
     if (!origin_ok(buf)) {
-      respond(c, 403, "application/json", "{\"error\":\"Origin header required for state-changing requests\"}");
+      respond(c, 403, CT_JSON, "{\"error\":\"Origin header required for state-changing requests\"}");
       return;
     }
   }
   
   int u = connect_upstream();
-  if (u < 0) { respond(c, 502, "text/plain", "upstream unavailable"); return; }
+  if (u < 0) { respond(c, 502, CT_PLAIN, "upstream unavailable"); return; }
   // 首个请求都写不进去(上游不读/刚挂):直接 502 收尾,不要进入 relay —— 否则子进程会
   // 卡在写上游上,active 不归零(与 A2 同一失效路径)。
   if (write_all(u, buf, (size_t)blen) != 0) {
     close(u);
-    respond(c, 502, "text/plain", "upstream not writable\n");
+    respond(c, 502, CT_PLAIN, "upstream not writable\n");
     return;
   }
   time_t relay_start = time(NULL);
@@ -1267,6 +1309,28 @@ static int open_listener(void) {
   return ls;
 }
 
+// ---------- 终止信号(launchd bootout / kickstart -k / 前台 Ctrl-C) ----------
+// 处理函数**只置位**(异步信号安全);真正的收尾在主循环里做 —— stop_dsh_wait 要
+// kill/waitpid/usleep,全都不是异步信号安全的函数,在 handler 里调用属未定义行为。
+static volatile sig_atomic_t shutdown_requested = 0;
+static void on_shutdown_signal(int sig) { (void)sig; shutdown_requested = 1; }
+
+// 每 tick 0:终止信号结算。收到 SIGTERM/SIGINT 时**先停 dsh 再退出** —— 绝不把 dsh 留成孤儿。
+// 为什么必须做:plist 里 AbandonProcessGroup=true(launchd 明确不清理该 job 的进程组),
+// 而 dsh 又经 setsid 自成会话,两者叠加使 launchd 不会连带清理它。不处理的话,`launchctl
+// bootout`(卸载/重装/升级)之后 dsh 会继续常驻并占着端口 —— 零常驻承诺被破坏,而这是
+// **唯一**没有用户可见信号的泄漏路径:守护已经退出,再没有任何东西会提到那个 dsh。
+// 时序:处理函数只置位,poll 要么被 EINTR 打断、要么按 poll_ms(≤1s)超时返回,
+// 故这里最多迟 1s 看到标志 —— 无需给 poll 加特殊唤醒通道。
+// 用更短的优雅期(1.5s):此刻 launchd 正等本进程退出,且 SIGKILL 兜底已足够保证不留孤儿,
+// 不必等满 stop_dsh 的 6s 去拖慢 launchd 卸载与测试 teardown。
+static void maybe_shutdown(void) {
+  if (!shutdown_requested) return;
+  fprintf(stderr, "daemon: 收到终止信号,停止 dsh 后退出(launchd 将接管 socket)\n");
+  stop_dsh_wait(15, 100000);
+  exit(0);
+}
+
 // 每 tick 1:收割已退出的子进程,并维护活跃连接计数 *active。
 // dsh 本体与后台更新子进程都**不是连接**,必须从计数中剔除——否则它们退出会误减 active,
 // WS 长连接独占(active=1)时被误归 0 → 30s 内误停 dsh 且守护自退,透传子进程被孤儿化。
@@ -1283,6 +1347,18 @@ static void reap_children(int *active) {
         fprintf(stderr, "daemon: dsh 已退出(pid %d,信号 %d),清理状态\n", reaped, WTERMSIG(reaped_st));
       else
         fprintf(stderr, "daemon: dsh 已退出(pid %d),清理状态\n", reaped);
+      // NODE_OPTIONS 含当前 node 不认识的选项 → node 拒绝启动、返回 9(实测一行代码都不执行)。
+      // 这是唯一「守护在跑而 dsh 永远起不来」的配置类故障,且只有服务端能观察到;记一次并
+      // 剥掉它,让后续唤醒自愈(客户端只轮询 /health,不会自己重试)。getenv 判空是为了
+      // 只在真的注入了该变量时才认定(否则剥了也没用,徒增误导日志)。
+      if (WIFEXITED(reaped_st) && WEXITSTATUS(reaped_st) == 9 && !node_options_bad) {
+        const char *no = getenv("NODE_OPTIONS");
+        if (no && no[0]) {
+          node_options_bad = 1;
+          fprintf(stderr, "daemon: dsh 以退出码 9 立即退出,判定 NODE_OPTIONS(%s) 不被当前 node 接受;"
+                          "后续唤醒不再注入该变量。修复:重新运行 install.sh 重新生成 LaunchAgent\n", no);
+        }
+      }
       spawn_pid = 0;
       ready_port = 0;
       reset_token(); // 进程已死,launch token 随之作废
@@ -1444,7 +1520,7 @@ static void serve_once(int ls, int *active) {
           // 于是「加限额」反而引入了新的挂死面,与 A2 同类。
           struct timeval stv = { IO_TIMEOUT_SECS, 0 };
           setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof stv);
-          respond(c, 503, "text/plain; charset=utf-8", "too many connections\n");
+          respond(c, 503, CT_PLAIN, "too many connections\n");
           close(c);
           // 刻意**不** tap_use 之外的任何续租、也不计入 active:这不是一条被服务的连接。
         } else {
@@ -1466,6 +1542,12 @@ static void serve_once(int ls, int *active) {
 
 int main(void) {
   signal(SIGPIPE, SIG_IGN);
+  // 必须处理 SIGTERM/SIGINT:plist 里 AbandonProcessGroup=true,而 dsh 又经 setsid 自成会话,
+  // 两者叠加使 launchd **不会**连带清理 dsh。不处理的话,`launchctl bootout`(卸载/重装/升级)
+  // 之后 dsh 会继续常驻并占着端口 —— 零常驻承诺被破坏,而这是**唯一**没有用户可见信号的
+  // 泄漏路径:守护已经退出,再没有任何东西会提到那个 dsh。(收尾逻辑见 maybe_shutdown。)
+  signal(SIGTERM, on_shutdown_signal);
+  signal(SIGINT, on_shutdown_signal);
   build_paths();
   build_boot();
   read_run();
@@ -1494,9 +1576,11 @@ int main(void) {
 
   int active = 0;
   last_use_m = mono_now(); // 守护刚启动:给 IDLE_STOP 完整窗口,不因残留状态被秒杀
-  // 主循环 = 每 tick 六步,顺序即语义(收割 → 结算 → 扫描 → 就绪 → 重试 → 分派):
-  // 先结算完上一 tick 遗留的活跃连接数与在场租约,再推进探测,最后才 poll 等新事件。
+  // 主循环 = 每 tick 七步,顺序即语义(终止信号 → 收割 → 结算 → 扫描 → 就绪 → 重试 → 分派):
+  // 先看终止信号(可能直接退出),再结算完上一 tick 遗留的活跃连接数与在场租约,
+  // 然后推进探测,最后才 poll 等新事件。
   for (;;) {
+    maybe_shutdown();              // 终止信号结算(可能 exit)
     double now = mono_now();
     reap_children(&active);        // 收割子进程,维护活跃连接计数
     settle_presence(now, active);  // 在场租约结算(可能 exit(0) 自退)

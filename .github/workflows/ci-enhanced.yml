@@ -44,6 +44,20 @@ jobs:
           brew install bats-core
           # 必须经 bats 运行器执行(bats 文件是 DSL,bash file.bats 无法运行)
           bats tests/unit/*.bats
+          # 反空转(TRAPS §一.16/§一.18):bats 在「一个用例都没跑」时照样 exit 0 ——
+          #   @test 名含非 ASCII 会**静默执行 0 例**;`--filter` 是正则,名字里的元字符会静默不匹配。
+          # 只断言「没红」等于没断言。故显式比对**执行数**:`bats -c` 只统计不执行,口径与上行一致
+          #   (不用 `grep -c '@test'` —— 它会把注释里的 @test 也算上)。
+          # 下界**随用例增减人工上调**;它唯一的作用是发现「静默不执行」,不追求精确。
+          N="$(bats -c tests/unit/*.bats)"
+          case "$N" in
+            ''|*[!0-9]*) echo "bats -c 未返回数字:[$N]" >&2; exit 1 ;;
+          esac
+          echo "bats 用例数:$N"
+          if [ "$N" -lt 96 ]; then
+            echo "bats 用例数 $N 低于下界 96 —— 有用例被静默跳过(非 ASCII 名 / --filter 元字符)?" >&2
+            exit 1
+          fi
 
       - name: 一键安装冒烟测试
         run: bash scripts/smoke-test.sh
@@ -125,7 +139,8 @@ jobs:
           # 里的 kill "$BPID" 杀不到它。本步骤很短(实测约 3.5s),job 收尾时它还在睡,于是 runner
           # 稳定报 `Terminate orphan process: pid (…) (daemon)`(实测 run 34647776445 / 34651085008
           # 各 1 个)。顺带它还会在基准测量期间抢 CPU/网络,污染结果。
-          # 同一约定见 tests/unit/daemon-cases.bats:32 与 tests/security-verification.sh。
+          # 同一约定见 tests/unit/daemon-cases.bats 的 setup(DSH_RT_NO_AUTO_UPDATE=1)
+          # 与 tests/security-verification.sh。
           DSH_RT_HOME="$HOME/.local/share/dsh-runtime" \
           DSH_RT_STATE="$HOME/.local/state/dsh-runtime" \
           DSH_HOME="$HOME/.dsh" \

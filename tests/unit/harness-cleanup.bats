@@ -116,7 +116,9 @@ daemon_launch_stmt() {
   # 短作业(job 收尾早于那 10s)就会在收尾时被 runner 抓成 orphan:ci-enhanced.yml 的性能基准
   # 步骤实测约 3.5s,run 34647776445 / 34651085008 各稳定报 1 个 orphan daemon。
   # 故凡在 workflow 里**后台**拉起守护的命令,必须在同一条命令里置 DSH_RT_NO_AUTO_UPDATE=1。
-  # 约定出处:tests/unit/daemon-cases.bats:32「测试环境绝不触发后台更新子进程」。
+  # 约定出处:tests/unit/daemon-cases.bats 的 setup(`export DSH_RT_NO_AUTO_UPDATE=1`,注释
+  # 「测试环境绝不触发后台更新子进程」)。不写行号:行号随编辑静默漂移,门禁见
+  # tests/unit/install-validation.bats 的「file references use symbol anchors」用例。
   local dir="${WORKFLOWS_DIR:-$ROOT/.github/workflows}"
   local f="" ln="" stmt="" bad=0
   for f in "$dir"/*.yml; do

@@ -164,3 +164,76 @@ daemon_stop_by_binary() {
   done
   return 0
 }
+
+# extract_fn <函数名> [源文件,默认 $DSH_DAEMON_SRC] [clean|raw,默认 clean]
+# 按「符号名 + 花括号配平」抽取一个函数定义,取代 `sed -n '/^static X/,/^}/p'` 行范围抽取。
+#
+# 为什么不能用行范围(审计 F10):
+#   行范围的终点是「第一行以 } 开头的行」。函数体内一旦出现列 0 的 },抽取就被**静默截断**;
+#   而起点正则若写得宽(如 `/^static void stop_dsh/`),还会**同时匹配** `stop_dsh_wait` ——
+#   于是「通过」是因为测到了**另一个函数**。两种情况下 ok/fail 都与真实结构无关。
+#   这与已整治的 `daemon.c:NNN` 行号引用是同一家族:位置描述随编辑漂移且无信号。
+#
+# **默认输出净代码(clean)**:剥掉 // 行注释、/* */ 块注释与 "…"/'…' 字面量之后的行。
+#   理由 —— 断言不得被注释或字符串满足(TRAPS §一.20/§一.24「探针污染」)。若默认给原文,
+#   每个调用方都得自己记得再剥一遍,而「忘了剥」正是已经复发过三次的那个 bug。
+#   需要看原文(例如失败信息里要打印源码)时显式传 `raw`。
+#
+# 实现要点:
+#   · 花括号只在**净代码**上计数(同上,否则字符串/注释里的 { } 会让配平跑偏);
+#   · 定义行判据 = 行首(允许缩进)以 `static` 开头,且含 `<名>( … ) {`
+#     —— 要求**开括号与 `{` 同行**。这同时满足三件事:
+#       排除调用点(调用形如 `x();`,右括号后不是 `{`);
+#       排除声明(以 `;` 结尾,同样没有 `{`);
+#       精确匹配名字(`stop_dsh` 因 `[ \t]*(` 紧邻而不会命中 `stop_dsh_wait`),
+#       且**单行函数**(`static void stop_dsh(void) { stop_dsh_wait(…); }`)也能抽到
+#       —— 早先「该行不含 `;`」的判据会把单行函数整个漏掉。
+#     已知限制(写清楚而非假装覆盖):函数签名**跨行**换行时匹配不到 —— 本仓库无此写法。
+#   · 未找到函数 → **无输出**。调用方必须先判空:抽取失败必须与「结构合规」可区分
+#     (TRAPS §一.16 的下界要求),再叠加一个**刻意宽松**的行数下界兜住截断。
+extract_fn() {
+  local fn="${1:-}" src="${2:-${DSH_DAEMON_SRC:-}}" mode="${3:-clean}"
+  if [ -z "$fn" ] || [ -z "$src" ] || [ ! -f "$src" ]; then
+    return 0
+  fi
+  awk -v fn="$fn" -v mode="$mode" '
+    BEGIN { SQ = sprintf("%c", 39) }   # 单引号:awk 程序在 bash 单引号里,不能直接写
+    function sanitize(line,   i, c, out) {
+      out = ""; i = 1
+      while (i <= length(line)) {
+        c = substr(line, i, 1)
+        if (blk) {                                             # 块注释中
+          if (c == "*" && substr(line, i + 1, 1) == "/") { blk = 0; i += 2; continue }
+          i++; continue
+        }
+        if (inq) {                                             # 字面量中
+          if (c == "\\") { i += 2; continue }
+          if (c == q) { inq = 0 }
+          i++; continue
+        }
+        if (c == "/" && substr(line, i + 1, 1) == "*") { blk = 1; i += 2; continue }
+        if (c == "/" && substr(line, i + 1, 1) == "/") { break }   # 行注释到行尾
+        if (c == "\"" || c == SQ) { inq = 1; q = c; i++; continue }
+        out = out c
+        i++
+      }
+      return out
+    }
+    {
+      clean = sanitize($0)
+      if (!started) {
+        if (clean ~ ("^[ \t]*static[ \t].*[ \t*]" fn "[ \t]*\\([^;]*\\)[ \t]*\\{")) {
+          started = 1
+        } else {
+          next
+        }
+      }
+      if (mode == "raw") print; else print clean
+      o = gsub(/\{/, "", clean)
+      c = gsub(/\}/, "", clean)
+      depth += o - c
+      if (o > 0) opened = 1
+      if (opened && depth <= 0) exit
+    }
+  ' "$src"
+}

@@ -130,8 +130,10 @@ teardown() {
           if (c ~ /[A-Za-z0-9_]/ && c != "h") return 0
           return 1
         }
-        # echo/printf 里的 curl 是给人看的提示文本,不是调用(benchmark.sh:26,44-46、
-        # profile-daemon.sh:13 都是这种,含 127.0.0.1 字面量,不过滤就会误报);
+        # echo/printf 里的 curl 是给人看的提示文本,不是调用(benchmark.sh 的「提示: 运行
+        # curl …」与「手动测试:」那几行、profile-daemon.sh 的「提示: 运行 curl …」都是
+        # 这种,含 127.0.0.1 字面量,不过滤就会误报);不写行号的理由见本文件末尾的
+        # 「file references use symbol anchors」用例。
         # 但 `echo "$(curl ...)"` 里的 curl 是真调用,不能一并放过。
         function is_prose(t) {
           return (t ~ /^(echo|printf)[ \t]/ && t !~ /\$\(curl/)
@@ -222,6 +224,75 @@ extract_manifest_fmt() {
   # 反空转:参数必须真的接到 pnpm 调用行上,不能只是定义完就没人用
   grep -q '\$NPM_EXTRA --prefer-offline' "$ROOT/scripts/install.sh" \
     || { echo "NPM_EXTRA/LOCK_ARG 未接到 pnpm 调用上(定义后无人使用)" >&2; return 1; }
+}
+
+# 切出 install.sh 的 sha-verify 块(标记包夹;不用行号 —— 行号必然漂移且无信号)。
+extract_sha_block() {
+  awk '
+    /^[ \t]*# >>> sha-verify/ { f = 1; next }
+    /^[ \t]*# <<< sha-verify/ { f = 0 }
+    f
+  ' "$1"
+}
+
+@test "install.sh aborts the install when the release SHA-256 does not match" {
+  # F2 的修复。原门禁(tests/security-verification.sh 1.3)用
+  #   grep -q "shasum -a 256 -c pkg.zip.sha256" scripts/install.sh
+  # 断言「install.sh 验证了 SHA256」,而该字符串**只**出现在解释性注释里(说明「为什么
+  # 不用 shasum -c」);真实实现是 EXPECTED_SHA/ACTUAL_SHA 裸比对。双向都坏:删掉实现只留
+  # 注释,断言照样 ok;有人清理掉那句「不该做什么」的注释,门禁反而变红。
+  # 故这里改为**行为验证**:把真实实现块切出来用夹具驱动 —— 哈希相符必须放行、不符必须中止。
+  # SHA_INSTALL_SRC 可指向另一份 install.sh,用于 fail-before 复核(与 WARMUP_INSTALL_SRC 同约定)。
+  local src="${SHA_INSTALL_SRC:-$ROOT/scripts/install.sh}"
+  local block="$BATS_TEST_TMPDIR/sha-verify.sh"
+  extract_sha_block "$src" > "$block"
+  # 反空转(面):抽取必须真的命中,否则下面的断言在测一个空文件。
+  [ -s "$block" ] || { echo "  未抽到 sha-verify 块(标记漂移?)" >&2; return 1; }
+  grep -q 'EXPECTED_SHA' "$block" || { echo "  块内没有 EXPECTED_SHA(实现被挪走?)" >&2; return 1; }
+  grep -q 'ACTUAL_SHA' "$block" || { echo "  块内没有 ACTUAL_SHA" >&2; return 1; }
+
+  local fix="$BATS_TEST_TMPDIR/sha-fix"
+  local real
+  real="$(printf 'release payload\n' | shasum -a 256 | awk '{print $1}')"
+  [ -n "$real" ] || { echo "  无法算出夹具哈希(shasum 不可用?)" >&2; return 1; }
+
+  # 每次重建夹具:失败分支会 rm -rf "$PKG_TMP",不能跨调用复用。
+  run_sha_block() {
+    mkdir -p "$fix/pkg"
+    printf 'release payload\n' > "$fix/pkg/pkg.zip"
+    printf '%s\n' "$1" > "$fix/pkg/pkg.zip.sha256"
+    cp "$block" "$fix/block.sh"
+    cat > "$fix/harness.sh" <<'H'
+set -uo pipefail
+PKG_TMP="$FIX/pkg"
+warn() { echo "warn: $*" >&2; }
+. "$FIX/block.sh"
+echo "REACHED_END"
+H
+    FIX="$fix" bash "$fix/harness.sh" 2>&1
+    echo "rc=$?"
+  }
+
+  local good bad empty
+  # 正控:哈希相符必须放行 —— 没有这一条,「不符时中止」可能只是因为块恒 exit。
+  good="$(run_sha_block "$real")"
+  printf '%s' "$good" | grep -q 'REACHED_END' \
+    || { echo "  哈希相符却未放行(实现写反了?):[$good]" >&2; return 1; }
+  printf '%s' "$good" | grep -q 'rc=0' \
+    || { echo "  哈希相符却非零退出:$(printf '%s' "$good" | tail -1)" >&2; return 1; }
+  # 负控:哈希不符必须中止(fail-closed),且不得走到块尾。
+  bad="$(run_sha_block "0000000000000000000000000000000000000000000000000000000000000000")"
+  if printf '%s' "$bad" | grep -q 'REACHED_END'; then
+    echo "  哈希不符却继续执行(fail-open!):[$bad]" >&2
+    return 1
+  fi
+  printf '%s' "$bad" | grep -q 'rc=1' \
+    || { echo "  哈希不符却未以非零退出:$(printf '%s' "$bad" | tail -1)" >&2; return 1; }
+  # 反空转(空清单):清单缺失/为空同样必须中止(EXPECTED_SHA 为空的 fail-closed 分支)。
+  empty="$(run_sha_block "")"
+  printf '%s' "$empty" | grep -q 'rc=1' \
+    || { echo "  空清单未中止(应 fail-closed):$(printf '%s' "$empty" | tail -1)" >&2; return 1; }
+  return 0
 }
 
 @test "release.yml and install.sh write byte-identical app manifests" {
@@ -325,44 +396,95 @@ detect_doc_counts() {
 }
 
 # —— 引用锚点防漂移 ——
-detect_line_refs() { grep -nE 'daemon\.c:[0-9]+' "$1" 2>/dev/null || true; }
+# 禁的是「位置描述」这一**形态**,而不是某一份文件:任何 `路径:行号` 都会随编辑静默漂移。
+# 2026-09-12 由 daemon.c 专用扩展为全仓库(扩展名清单见下;`:26,44-46` 这类范围写法一并命中)。
+detect_line_refs() {
+  grep -nE '[A-Za-z0-9_./-]+\.(sh|bats|c|h|yml|yaml|plist|json|rb|toml|md):[0-9]+' "$1" 2>/dev/null || true
+}
 
-@test "daemon.c references use symbol anchors, never line numbers" {
-  # 为什么禁行号:daemon.c 的行号引用会**系统性静默漂移**。2026-09-12 逐条核对
-  #   scripts/ 与 tests/ 里的全部引用,只有 4 处仍指向所称内容,其余全部指向无关代码
-  #   (例如某一处称「setsid 自成进程组」,该行实际是 `} else {`)。根因是行号描述的是
-  #   **位置**,而位置随任何一次编辑改变,改变之后**没有任何信号** —— 与本项目反复踩到的
-  #   「静默失效」同类。改用符号锚点(函数名)后,重命名会被编译/审查发现,而移动代码不会。
+@test "file references use symbol anchors, never line numbers" {
+  # 为什么禁行号:行号描述的是**位置**,而位置随任何一次编辑改变,改变之后**没有任何信号**
+  #   —— 与本项目反复踩到的「静默失效」同类。符号锚点(函数名 / 环境变量名 / 可 grep 的原文
+  #   片段)则不然:重命名会被编译或审查发现,移动代码则不影响。
+  # 来历:2026-09-12 先逐条核对 daemon.c 的行号引用,全部引用里只有 4 处仍指向所称内容,
+  #   其余全部指向无关代码(例如某一处称「setsid 自成进程组」,该行实际是 `} else {`)。
+  #   随后把同一规则推广到全仓库的 `路径:行号`(不限 daemon.c):扫描面内当时共 4 处,
+  #   逐条**按内容**核对无误(只核「行号 ≤ 某行」不够 —— 行号指错位置时内容照样对不上),
+  #   已全部改写为符号 / 原文锚点,故这里取**硬禁**而非白名单:白名单就是被禁模式本身
+  #   开的口子,每条还得各自维护与校验;而这 4 处都是「出处引用」,改写后信息量不减。
   local probe="$BATS_TEST_TMPDIR/lineref-probe.md" C=':'
   local f hits bad=0 scanned=0
 
-  # 反空转(正):合成违规样本必须命中。
+  # 反空转(正):合成违规样本必须命中,且要覆盖**多种扩展名与范围形态** —— 只塞一个
+  #   daemon.c 样本的话,正则退回「只认 daemon.c」也照样绿。
   #   注意用 ${C} 拼出冒号,**不能**把违规字面量直接写进本文件 —— 本文件也在扫描面内,
   #   写字面量会让门禁被自己的探针文本触发(「探针污染被测面」)。
   printf '%s\n' "# 见 daemon.c${C}339 的注释" > "$probe"
-  if [ -z "$(detect_line_refs "$probe")" ]; then
-    echo "门禁自检失败:检测器未命中合成违规样本(正则已失明)" >&2
+  printf '%s\n' "# 见 scripts/install.sh${C}150" >> "$probe"
+  printf '%s\n' "# 见 tests/unit/foo.bats${C}12-14" >> "$probe"
+  if [ "$(detect_line_refs "$probe" | wc -l | tr -d ' ')" -lt 3 ]; then
+    echo "门禁自检失败:检测器未命中合成违规样本(正则已失明,或仍只认 daemon.c)" >&2
     return 1
   fi
   # 反空转(反):改用符号锚点后不得误报,否则门禁会拦住正确写法。
   printf '%s\n' '# 见 spawn_dsh() 里的 setsid()' > "$probe"
+  printf '%s\n' '# 见 daemon-cases.bats 的 DSH_RT_NO_AUTO_UPDATE=1' >> "$probe"
   if [ -n "$(detect_line_refs "$probe")" ]; then
     echo "门禁自检失败:符号锚点写法被误报" >&2
     return 1
   fi
+  # 反空转(反·误报面):`主机:端口` 是这条广义正则最容易误伤的形状,而扫描面里
+  #   127.0.0.1:3080 / localhost:8080 这类字面量大量存在 —— 一旦误报,门禁只会被逼着
+  #   放宽到失明(本项目的老毛病),所以这里把它钉成显式反控。
+  printf '%s\n' 'curl -fsS --max-time 5 http://127.0.0.1:3080/health' > "$probe"
+  printf '%s\n' 'ENDPOINT="http://localhost:8080/"' >> "$probe"
+  printf '%s\n' 'DSH_RT_PORT=3080' >> "$probe"
+  if [ -n "$(detect_line_refs "$probe")" ]; then
+    echo "门禁自检失败:主机:端口 被误报为行号引用(正则过宽)" >&2
+    detect_line_refs "$probe" | sed 's/^/    /' >&2
+    return 1
+  fi
 
   for f in "$ROOT"/scripts/*.sh "$ROOT"/tests/*.sh "$ROOT"/tests/unit/*.bats \
-           "$ROOT"/tests/lib/*.sh "$ROOT"/.github/workflows/*.yml; do
+           "$ROOT"/tests/lib/*.sh "$ROOT"/src/*.c \
+           "$ROOT"/.github/workflows/*.yml; do
     [ -f "$f" ] || continue
     scanned=$((scanned + 1))
     hits="$(detect_line_refs "$f")"
     if [ -n "$hits" ]; then
-      echo "出现 daemon.c 行号引用(会静默漂移,请改用函数名锚点): $f" >&2
+      echo "出现「路径:行号」引用(会静默漂移,请改用符号 / 原文锚点): $f" >&2
       printf '%s\n' "$hits" | sed 's/^/    /' >&2
       bad=1
     fi
   done
   # 反空转(面):必须真的扫到文件。路径写错时 scanned=0 会让上面的循环空转通过。
-  [ "$scanned" -ge 10 ] || { echo "扫描面异常(只扫到 $scanned 个文件,glob 漂移?)" >&2; return 1; }
+  [ "$scanned" -ge 20 ] || { echo "扫描面异常(只扫到 $scanned 个文件,glob 漂移?)" >&2; return 1; }
   [ "$bad" -eq 0 ]
+}
+
+# —— F14:热路径上的多余系统调用 ——
+
+@test "handle_conn answers /health before probing dsh (no wasted loopback connect)" {
+  # 审计 F14。/health 是引导页轮询**最频繁**的端点,而 respond_health() 只用内存里的
+  #   dsh_ready() 与 read_pid(),**从不读** dsh_up() 的结果。原先 `int up = dsh_up();`
+  #   排在 /health 分支之前,于是每个 /health 都要多付一次回环 TCP connect
+  #   (socket+connect+close)——纯开销。
+  # 这条时序**没有行为症状**(功能照样正确,只是更慢),所以只能靠结构门禁钉住;
+  #   行为正确性由 daemon-cases.bats 的黑盒用例覆盖。
+  # 抽取用 extract_fn(符号锚点 + 花括号配平),不用 sed 行范围(审计 F10)。
+  # shellcheck source=/dev/null
+  source "$ROOT/tests/lib/daemon-helpers.sh"
+  local body n health_line up_line
+  body="$(extract_fn handle_conn "$ROOT/src/daemon.c")"
+  n="$(printf '%s\n' "$body" | wc -l | tr -d ' ')"
+  # 反空转:抽取必须命中且足够长 —— 否则下面的顺序比较会在空串上「通过」。
+  [ "$n" -gt 30 ] || { echo "handle_conn 抽取失败或过短(锚点漂移?),得到 $n 行" >&2; return 1; }
+
+  health_line="$(printf '%s\n' "$body" | grep -n 'respond_health(c); return;' | head -1 | cut -d: -f1)"
+  up_line="$(printf '%s\n' "$body" | grep -n 'int up = dsh_up();' | head -1 | cut -d: -f1)"
+  # 两个锚点都必须命中,否则「找不到」会让比较退化成空串比较。
+  [ -n "$health_line" ] || { echo "handle_conn 里找不到 /health 的提前返回" >&2; return 1; }
+  [ -n "$up_line" ] || { echo "handle_conn 里找不到 int up = dsh_up()" >&2; return 1; }
+  [ "$health_line" -lt "$up_line" ] \
+    || { echo "/health 分支(第 $health_line 行)未排在 dsh_up()(第 $up_line 行)之前 —— 每个 /health 会白付一次回环 connect" >&2; return 1; }
 }

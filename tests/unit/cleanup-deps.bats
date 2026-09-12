@@ -127,3 +127,38 @@ GONE=(
   [ "$status" -eq 0 ] || fail "缺 node_modules 时应静默跳过,实际退出码 $status"
   [[ "$output" == *"不存在"* ]] || fail "缺 node_modules 时未给出提示: $output"
 }
+
+@test "cleanup-deps dry-run labels the guess-based deletions and only those" {
+  # 审计 F6:第 3、4 段是按**名字**猜(含 `*.md`、`test/` 等),而 S1 的教训是
+  # 「看起来像文档 ≠ 是文档」。缓解办法是让 dry-run **逐行标注**风险,好让 review 有
+  # 明确着力点。这里双向断言:猜出来的必须带标签,确认安全的必须不带 ——
+  # 只测「带了标签」会漏掉「给所有条目都贴标签」(那就等于没标注)。
+  local F="$BATS_TEST_TMPDIR/label"
+  build_fixture "$F"
+  run bash "$ROOT/scripts/cleanup-deps.sh" --dry-run "$F"
+  [ "$status" -eq 0 ] || fail "dry-run 退出码 $status: $output"
+
+  # 反空转:标签文案必须真实存在于输出里,否则下面两条会因「找不到」而双双通过。
+  printf '%s' "$output" | grep -q '按名字猜' \
+    || fail "dry-run 未标注任何『按名字猜』的风险条目(标签丢了?)"
+
+  local line
+  # 猜出来的(文件后缀 / 目录名)→ **每一行**都必须带标签。
+  for p in "pkg/notes.md" "pkg/test" "pkg/examples" "pkg/coverage"; do
+    line="$(printf '%s\n' "$output" | grep -F "$p")"
+    [ -n "$line" ] || fail "dry-run 漏掉应删项: $p"
+    if printf '%s\n' "$line" | grep -v '按名字猜' | grep -q .; then
+      fail "按名字猜的条目未标注风险: $(printf '%s\n' "$line" | grep -v '按名字猜')"
+    fi
+  done
+  # 确认安全的(平台白名单 / 精确包路径)→ 必须**存在**不带标签的行。
+  # 注意不能用 `head -1` 抽单行:同一路径可能被多段同时选中(如 typescript/doc/d.md
+  # 既被 `*.md` 规则命中、又被白名单文档目录命中),那时标签按段而异。
+  for p in "node-pty/prebuilds/win32-x64" "@img/sharp-wasm32" "typescript/doc"; do
+    line="$(printf '%s\n' "$output" | grep -F "$p")"
+    [ -n "$line" ] || fail "dry-run 漏掉应删项: $p"
+    if ! printf '%s\n' "$line" | grep -qv '按名字猜'; then
+      fail "确认安全的条目被误标为『按名字猜』(标签失去区分力): $line"
+    fi
+  done
+}

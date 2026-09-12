@@ -1,5 +1,13 @@
 # dsh-pwa 自动更新功能实现
 
+> **体例说明(2026-09-12 补):** 本文是**活文档** —— 正文描述自动更新功能**当前**的行为,
+> 并纳入 `install-validation.bats` 的文档防漂移门禁。
+>
+> **例外:** 标注「实现期快照」的小节(如「代码变更统计」)记录的是 2026-09-09 实现**当时**的
+> 状态,其数字**刻意保留原样**、不随代码变化而更新。请勿据此判断现状 ——
+> 现状请看代码本身与 CI 门禁。这与 `docs/AUDIT_HISTORY.md` 的处理方式一致,区别是
+> AUDIT_HISTORY.md 整篇是快照(故整篇排除在门禁外),而本文只有个别小节是快照。
+
 **实现日期:** 2026-09-09  
 **功能目标:** 确保每次启动 dsh 时永远使用 `@deepseek-ai/dsh@latest`
 
@@ -122,6 +130,14 @@ curl -fsS http://127.0.0.1:3080/health   # 触发 socket activation 激活 daemo
 ```bash
 launchctl bootout "gui/$(id -u)/com.dshpwa.daemon"
 launchctl bootout "gui/$(id -u)/com.dshpwa.updater"
+
+# bootout 会向守护发 SIGTERM，守护收到后**先停 dsh 再退出**（F5），不会留下孤儿 dsh。
+# 但这一步只在「守护确实还注册着」时生效 —— 若之前手工 bootout 过、或守护已被强杀，
+# dsh 可能仍在跑。下面这条兜底**必须在 rm -rf 之前**，否则会留下一个还在跑、
+# 但 node_modules 已被删掉的 dsh。
+pkill -f "$HOME/.local/share/dsh-runtime/app" 2>/dev/null || true
+pgrep -fl "dsh-runtime" || true   # 确认无残留（应无输出）
+
 rm -f ~/Library/LaunchAgents/com.dshpwa.daemon.plist
 rm -f ~/Library/LaunchAgents/com.dshpwa.updater.plist
 rm -rf ~/.local/share/dsh-runtime ~/.local/state/dsh-runtime
@@ -208,6 +224,9 @@ export DSH_RT_NO_AUTO_UPDATE=1
 
 ## 代码变更统计
 
+> **实现期快照(2026-09-09)。** 下面的 diffstat 是功能落地**那一刻**的变更量,与今天的代码
+> 无关;保留它只为记录当时的改动规模。数字刻意不更新 —— 更新它反而会把它伪装成「现状」。
+
 ```
  launchd/com.dshpwa.updater.plist |  37 +++++++++++
  scripts/update-dsh.sh            |  66 +++++++++++++++++++
@@ -270,5 +289,6 @@ export DSH_RT_NO_AUTO_UPDATE=1
 ---
 
 **实现人员:** Kiro  
-**审核状态:** 待测试  
-**下一步:** 编译验证 + smoke test
+**状态:** 已上线并迭代多轮(原先的「审核状态: 待测试」「下一步: 编译验证 + smoke test」
+已过期,故移除 —— 阶段性标注留在活文档里只会变成误导)  
+**遗留项:** 见上方「未来增强」一节

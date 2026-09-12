@@ -133,7 +133,7 @@ All notable changes to this project will be documented in this file.
 - Supply-chain: High → Low (SHA-256 verification, version pinning)
 - CSRF: High → Low (Origin/Referer validation)
 - Filesystem: Medium → Low (0600/0700 permissions)
-- Port allocation: Medium → Low (TOCTOU eliminated)
+- Port allocation: Medium → Low (窗口显著收窄;**非互斥** —— 残余窗口见 M3)
 
 **Residual Risk:**
 - Install script fetched from `main` branch (recommend branch protection + signed commits)

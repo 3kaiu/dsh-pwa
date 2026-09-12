@@ -9,7 +9,14 @@
   launchd 重新接管 socket 等待下次连接(ThrottleInterval=1 保证再次点击 1s 内拉起)。
   dsh 未运行时任意路径返回引导页;dsh 运行中双向透传;dsh 内部端口启动时自动分配写入 RT_STATE/dsh.json。
    由 scripts/install.sh 自动生成到 ~/Library/LaunchAgents/。
-   占位符:__DAEMON_BIN__/__RT_HOME__/__RT_STATE__/__LOG_DIR__/__DSH_RT_PORT__
+   占位符:__DAEMON_BIN__/__HOME__/__RT_HOME__/__RT_STATE__/__LOG_DIR__/__DSH_RT_PORT__/__NODE_OPTIONS_ENTRY__
+
+   NODE_OPTIONS 不能写死:--use-system-ca 是 Node 22.15.0 才引入的选项,而 install.sh 的
+   MIN_NODE=22 只比 major。NODE_OPTIONS 里出现当前 node 不认识的选项时,node **直接拒绝
+   启动**(实测 rc=9,一行代码都不执行)→ 守护在跑、dsh 永远起不来,且没有任何用户可见的
+   错误。故由 install.sh 做能力探测后再决定是否注入(__NODE_OPTIONS_ENTRY__);不支持时
+   整行留空(不是空字符串 —— 那仍然等于设了该变量)。
+   同理见 scripts/update-dsh.sh 里同形式的探测。
 -->
 <dict>
   <key>Label</key><string>com.dshpwa.daemon</string>
@@ -32,7 +39,7 @@
   <key>EnvironmentVariables</key>
   <dict>
     <key>HOME</key><string>__HOME__</string>
-    <key>NODE_OPTIONS</key><string>--use-system-ca</string>
+    __NODE_OPTIONS_ENTRY__
     <key>DSH_RT_HOME</key><string>__RT_HOME__</string>
     <key>DSH_RT_STATE</key><string>__RT_STATE__</string>
     <key>DSH_RT_PORT</key><string>__DSH_RT_PORT__</string>

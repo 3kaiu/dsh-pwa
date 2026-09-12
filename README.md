@@ -13,8 +13,21 @@ macOS 上一键安装 [DeepSeek Harness](https://www.npmjs.com/package/@deepseek
 
 ## Requirements
 
-- **macOS**（10.15 或更高版本）
-- 已登录的图形会话（Aqua），安装脚本需在 Terminal 中执行
+| 项 | 下限 | 依据 / 验证状态 |
+|---|---|---|
+| **macOS** | 10.15（Catalina） | 依赖 launchd socket activation（`launch_activate_socket`）。**该下限未经 CI 验证**：CI 只跑 `macos-latest`，更低版本从未被测过 |
+| **Node.js** | 22 | 由安装脚本的 `MIN_NODE=22` 强制（**只比较 major**）。不满足时不复用系统 node，改用包内自带的 node |
+| **图形会话** | 已登录的 Aqua 会话 | 安装脚本需在 Terminal 中执行；非 Aqua 会话下 `launchctl bootstrap` 必然失败 |
+
+**Node 能力门槛**（都按版本开关，不是硬要求 —— 低于门槛只会少一项优化，不会不可用）：
+
+- `--use-system-ca` 需要 **Node ≥ 22.15**。install.sh 在生成 LaunchAgent 前**探测**该选项，
+  不支持则整行留空，因此 Node 22.0–22.14 也能正常使用（只是不走系统证书链）。
+- `NODE_COMPILE_CACHE` 需要 **Node ≥ 22.1**。更旧的 node 会忽略这个环境变量（无害），
+  只影响二次启动速度。
+
+> 想确认某个版本可用：跑 `bash tests/security-verification.sh` 与 `bash scripts/smoke-test.sh`
+> —— 两者都不依赖 CI 的 macOS 版本，可在目标机器上直接验证。
 
 > Linux / Windows 明确不在支持范围内 —— 零常驻依赖 macOS 独有的 launchd socket activation 机制。
 
@@ -109,6 +122,16 @@ launchctl print "gui/$(id -u)/com.dshpwa.daemon"
 ```bash
 launchctl bootout "gui/$(id -u)/com.dshpwa.daemon"
 launchctl bootout "gui/$(id -u)/com.dshpwa.updater"
+
+# bootout 会向守护发 SIGTERM，守护收到后**先停 dsh 再退出**，不会留下孤儿 dsh。
+# 但这一步只在「守护确实还注册着」时生效：若之前手工 bootout 过、或守护已被强杀，
+# dsh 可能仍在跑。故用下面这条兜底 —— **必须在 rm -rf 之前**，否则会留下一个
+# 还在跑、但 node_modules 已被删掉的 dsh。
+pkill -f "$HOME/.local/share/dsh-runtime/app" 2>/dev/null || true
+
+# 确认无残留（应无输出）
+pgrep -fl "dsh-runtime" || true
+
 rm -f ~/Library/LaunchAgents/com.dshpwa.*.plist
 rm -rf ~/.local/share/dsh-runtime ~/.local/state/dsh-runtime
 
@@ -136,6 +159,9 @@ bats -c tests/unit/*.bats
 ```
 
 开发工具链与详细指引见 [docs/TOOLS_INTEGRATION.md](docs/TOOLS_INTEGRATION.md)。
+
+本地若出现一个**未被跟踪**的 `.workbuddy-ai/` 目录，那是开发时的本地笔记（踩坑清单与每日记录），
+已列入 `.gitignore`。它不参与构建与测试，克隆后不存在是正常的。
 
 ## Contributing
 
