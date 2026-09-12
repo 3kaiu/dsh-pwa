@@ -43,6 +43,12 @@ node ~/.workbuddy-ai/skills/ci-gate-hardening/scripts/check_run_blocks.mjs .gith
     单进程跑到第 41 例被杀，日志只留 40 个 `ok`。**判据：用改动前源码跑同一文件**
     （`DSH_DAEMON_SRC=/tmp/old_daemon.c`，见 §四）—— 停在**同一处**即环境限制，与本次改动无关。
     剩余用例用 `bats --filter "<用例名>" <文件>` 单独跑补齐。**exit 137 不是测试失败。**
+    补充：被杀的位置**不固定**（实测 40 / 34 两次不同）—— 故「停在同一处」不总是成立；
+    更可靠的判据是 **`not ok` 计数为 0**，再用 `--filter` 补齐尾部用例。
+15. **探针文本不得污染被测面**：写「反空转正控」时如果把违规字面量直接写进门禁文件，
+    而门禁**又扫描该文件自身**，就会自己触发自己（`grep` 命中探针而非被测对象）。
+    修法：用变量拼出字面量（`C=':'; printf 'daemon.c%s339' "$C"`），使违规串不以字面形式存在。
+    同类：注释里写 `daemon.c:NNN` 也会被行号门禁命中 —— 注释同样在扫描面内。
 
 # 二、回环 curl（curl 8.7.1）
 - 无 `--max-time`：守护「已 bind 未 listen」时 macOS **丢 SYN**（不回 RST）→ 挂到作业级 timeout，
@@ -69,6 +75,13 @@ node ~/.workbuddy-ai/skills/ci-gate-hardening/scripts/check_run_blocks.mjs .gith
       而不是「都失败了」。
 - **审计报告是快照不是现状**：`docs/` 的行号/结论会漂。用前必须验证
   `git log -S '<片段>' -- <文件>` 或 `git blame`。（曾把已修好的 S1(P0) 照抄成待办继续传播。）
+- **代码里的「行号引用」必然漂移，且漂移后无信号 —— 一律改用符号锚点**。2026-09-12 逐条核对
+  `scripts/` 与 `tests/` 里 13 处 `daemon.c:NNN`：只有 4 处仍指向所称内容，其余全部指向**无关代码**
+  （一处称「setsid 自成进程组」，该行实际是 `} else {`；一处称「更新检查子进程」，该行实际是
+  `int up = dsh_up();`）。根因：行号描述**位置**，位置随任何编辑改变。改用**函数名**锚点后，
+  重命名会被编译/审查发现，而移动代码不会。已固化为门禁（`daemon.c references use symbol anchors`）。
+  推论：**只核验「行号 ≤ 某行」是不够的** —— 当时正是据此判断「引用不会漂移」，而它们其实早就漂了；
+  必须核验**内容**对得上。
 - **「复刻验证」要连上下文复刻**（cwd、相对文件名、目录里还有什么）。只复刻命令 = 假验证。
 - **`gh release create` 成功 ≠ 资产可下载**：同看 `gh api .../releases` 与 `.../releases/tags/<tag>`；
   `releases/tag/<tag>` 返回 200 只是 tag 页面。已在 `release.yml` 补「发布后下载资产三方比对哈希」。

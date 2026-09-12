@@ -30,6 +30,8 @@ All notable changes to this project will be documented in this file.
 - **本轮审计修复(自动更新链路)** — update-dsh.sh 从 `run.json` 解析 node 绝对路径(修复 launchd 环境无 PATH 导致更新静默失败)、PATH 前置 node 目录(npm/pnpm shebang `env node` 不再恒失败)、更新彻底失败时回滚恢复更新前依赖树、dsh 运行中(守护 `/health` 报 dsh:true)跳过本轮更新避免杀掉在用会话
 - **token 相关修复** — 守护重启 adopt 运行中 dsh 时补扫日志 token(修复 token 死循环导致的引导页 401);更新子进程退出误减活跃连接计数导致 WS 独占时误停 dsh 的竞态
 - **停止竞态修复** — `/stop` 与并发 `/wake` 的状态文件误删竞态(停止串行化,见 Changed);锁竞态(install.lock 抢占的 TOCTOU claim 防护)
+- **审计未闭合项复核与修复** — 逐条回到代码核对(审计报告是快照,不是现状),修掉 5 处:E5 `pick_port_fd` 函数头注释按实现改写(端口预留只缩小窗口、不构成互斥);C3 `install.sh` 的 `A && B || C` 补显式括号,把左结合语义写死;D2/D3 取 node LTS 版本依赖 `python3`(macOS 12.3+ 不再自带)且失败时**静默**落到硬编码兜底,改为两条失败路径都显式告警;D5 `release.yml` 用 `github.ref_name` 同时作 VERSION 与 release tag,而 `workflow_dispatch` 下它是**分支名**(会建出名为 `main` 的 release),改为显式 `inputs.tag` + 形状校验。A3(流水线请求只校验第一个)复核后确认影响有界,按审计给出的另一选项写入 README 的「已知限制(威胁模型)」
+- **`daemon.c` 引用改为符号锚点** — 复核发现 `scripts/` 与 `tests/` 里 13 处 `daemon.c:NNN` 行号引用**系统性漂移**:只有 4 处仍指向所称内容,其余指向无关代码。根因是行号描述**位置**,而位置随任何一次编辑改变且改变后**没有任何信号**。全部改为符号锚点(`read_run` / `update_locked` / `spawn_dsh` / `stop_dsh` / `trigger_background_update` / `maybe_scan_token` 等),并新增门禁禁止行号引用回归(带正反自检与扫描面反空转)
 
 ### Security
 
