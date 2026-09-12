@@ -21,9 +21,12 @@
     「换成合法值后字段必须出现」；「没有残留」要配「它确实起过」的反空转断言。
 12. **把待测代码块当子进程跑，赋值必须 export / 用 `env` 前缀**。`( VAR=x; bash block.sh )` 里 VAR
     不会传下去 → 块内为空、写文件全失败，而「文件必须不存在」的断言**恰好因此通过**：全绿却什么都没测。
-13. **沙箱 safe-delete 阈值（50/次命令）会让「全量 bats」误报**：单条命令内删除超阈值后 `rm -rf` 被拦，
+13. **沙箱 safe-delete 阈值会让 bats 误报**：单条命令内删除超阈值后 `rm -rf` 被拦，
     `harness-cleanup.bats` 的 `security-verification.sh leaves no daemon behind` 报 exit=2。
-    **分文件跑即正常**（每次调用重置计数）。失败信息里有 `safe-delete` 就是沙箱、不是产品缺陷。
+    **勘误（2026-09-12）：计数不是「每次调用重置」，而是跨会话累积** —— 实测「逐文件跑」的循环
+    （6 个独立 bats 进程，harness-cleanup 排第 3）**照样**踩中，故旧结论「分文件跑即正常」不成立。
+    正确判据：**把报错的那个文件单独在一条新命令里跑**（harness-cleanup 3/3、security 33/33 rc=0 即
+    证明是环境而非产品）。凡见到 exit=2 / `safe-delete` 字样，先按此复验再下结论。
 
 # 二、回环 curl（curl 8.7.1）
 - 无 `--max-time`：守护「已 bind 未 listen」时 macOS **丢 SYN**（不回 RST）→ 挂到作业级 timeout，
