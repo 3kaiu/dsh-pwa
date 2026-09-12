@@ -96,3 +96,15 @@ node ~/.workbuddy-ai/skills/ci-gate-hardening/scripts/check_run_blocks.mjs .gith
 - 沙箱还注入 `NODE_OPTIONS=--require=.../node-language-shim.cjs`；install.sh 现在「追加而非覆盖」
   NODE_OPTIONS，于是该 shim 被带进 pnpm → `ERR_PNPM_CODEBUDDY_BROKER_DENY`。本地跑 smoke 要
   `env -u NODE_OPTIONS` + PATH 收敛到用户 fnm node 与系统目录。
+
+# 七、Homebrew 打包（阶段 4，就绪未发布）
+- 位置：`packaging/homebrew/dsh-pwa.rb`（formula 单一真源）+ `scripts/bump-homebrew-formula.sh`；
+  tap `3kaiu/homebrew-tap` **尚未创建**，故主 README 标注「尚未发布」而非写成可用方式。
+- **Formula 刻意不自动安装运行时**：`install.sh` 会 `launchctl bootout/bootstrap`，而非 Aqua 会话
+  bootstrap 必失败、bootout 却可能成功 → 自动执行会把用户本来可用的 LaunchAgent **注销且无法恢复**。
+  故只落载荷 + 暴露 `dsh-pwa-install` 由用户显式执行。
+- 两条实现约束：载荷**不能** symlink 进 `bin/`（`$0` 会变，install.sh 推导的 ROOT 就指错）；
+  必须用 `bash` 调用（包内 install.sh 权限位是 **0644**，不可直接 exec）。
+- `brew style` 要在 **tap 布局**下跑：非 tap 目录会多报 `Sorbet/*Sigil` 与 `FrozenStringLiteralComment`，
+  用别的 tap 的 formula 做**对照**才能确认那是配置产物。`brew audit` 在 Homebrew 6 需要**已信任的 tap**
+  （`brew trust`）→ 会改动本机信任状态，不做。

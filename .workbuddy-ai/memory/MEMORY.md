@@ -36,10 +36,6 @@ macOS PWA wrapper 包装 DeepSeek Harness（dsh）。**零常驻**：launchd soc
 **A5 依赖树锚点** 首次安装带 `--frozen-lockfile`（增量 `update` 不带）；缺锁显式告警；指定
 `DSH_VERSION` 时跳过冻结。`release.yml` 生成 lock 用的 package.json 必须与 `install.sh` **逐字一致**。
 
-**打包（阶段 4，就绪未发布）** Formula 与 bump 脚本已在 `packaging/homebrew/`，tap `3kaiu/homebrew-tap`
-未创建。Formula **刻意不自动装运行时**：非 Aqua 会话 `launchctl bootstrap` 必失败而 bootout 可能成功 →
-会注销用户可用 LaunchAgent。
-
 ## 测试接缝
 - `DSH_DAEMON_SRC` 指向另一份 `daemon.c`：`git show HEAD:src/daemon.c > /tmp/old.c` 复验旧实现。
 - `WRAPPER_UPDATE_SRC`、`SECURITY_SRC`、`WARMUP_INSTALL_SRC` 指向改动前副本。
