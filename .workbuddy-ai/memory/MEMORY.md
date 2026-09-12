@@ -1,160 +1,59 @@
 # dsh-pwa 项目长期记忆
 
-## 项目定位
-macOS PWA wrapper，包装 DeepSeek Harness（dsh）。核心是**零常驻**架构：launchd socket activation，仅在 TCP 连接到达时拉起 daemon，空闲即退出，socket 由 launchd 持有。
+> 踩坑全集（门禁假绿 / curl / macOS 工具 / 验证方法论 / CI 孤儿 / install.sh）在
+> **`.workbuddy-ai/memory/TRAPS.md`** —— 动手前先读它。本文件只放定位、约定、架构。
 
-- 仓库：`https://github.com/3kaiu/dsh-pwa`，主分支 `main`
-- 核心源码：`src/daemon.c`（C 守护进程）；脚本在 `scripts/`；测试在 `tests/`
+## 项目
+macOS PWA wrapper 包装 DeepSeek Harness（dsh）。**零常驻**：launchd socket activation，TCP 连接到达才
+拉起 daemon，空闲即退，socket 由 launchd 持有。
+仓库 `github.com/3kaiu/dsh-pwa`(main)；`src/daemon.c`；`scripts/`；`tests/`。
+提交用 Conventional Commits + 中文 subject。
 
-## 提交约定
-Conventional Commits，中文 subject。历史风格举例：
-- `fix: 审计批次二 — ...`
-- `feat: P0-P3 全面优化 + 测试体系接入`
-- `test: 自动更新验收自动化 + ...`
-- `perf(daemon): 去过度工程化 — ...`
-- `chore: remove ...`
-
-## 提交前验证 gauntlet（改完必跑）
+## 提交前 gauntlet（改完必跑）
 ```bash
 clang -O2 -Wall -Wextra -Werror -o /tmp/dsh_verify src/daemon.c   # 必须零告警
-shellcheck -S warning scripts/*.sh tests/*.sh tests/lib/*.sh      # 与 CI 同范围
+shellcheck -S warning scripts/*.sh tests/*.sh tests/lib/*.sh
 for f in scripts/*.sh tests/*.sh tests/lib/*.sh; do bash -n "$f"; done
-bats tests/unit/                                                   # 当前 48 项
-# workflow：PyYAML 真实解析 + 23 个 run block 语法检查
-# 注意本机 `ruby` 被 rbenv 指向未安装的 3.1.0 而不可用；用**系统** python3（带 PyYAML），
-# 托管版 python 没有 PyYAML。
+bats tests/unit/            # 当前 67 项；本沙箱须**分文件**跑（TRAPS 13）
+# 只有**系统** python3 带 PyYAML（托管版没有）；本机 ruby 被 rbenv 指向未安装版本
 /opt/homebrew/opt/python@3.13/libexec/bin/python3 -c "import yaml,glob;[yaml.safe_load(open(p)) for p in glob.glob('.github/workflows/*.yml')]"
 node ~/.workbuddy-ai/skills/ci-gate-hardening/scripts/check_run_blocks.mjs .github/workflows
 ```
-再加一轮运行时 curl 回归（`/health`、`/stop`、`/wake`、Origin/Host 校验、cookie 校验）。
+再跑一轮运行时 curl 回归（`/health` `/stop` `/wake`、Origin/Host、cookie）。
 
-**约定**：
-- 脚本/测试/workflow 里所有 curl 都必须带 `--max-time N`；回环请求还要绕过代理
-  （`--noproxy '*'`，或脚本只压本机时顶部 `unset http_proxy …`）。
-- 每个 workflow job 都必须显式声明 `timeout-minutes`（不声明＝GitHub 默认 **360min**）。
-- 以上两条都已固化为门禁，见 `install-validation.bats` 的
-  `every curl in CI-executed scripts and workflows carries a timeout` 与
-  `every workflow job declares timeout-minutes`。
-- **测试/基准脚本退出后不得留下守护进程**：trap 必须注册在**首次启动守护之前**，且按 pid
-  与**二进制路径**各收一遍；凡在 workflow 里后台拉起守护，必须置 `DSH_RT_NO_AUTO_UPDATE=1`。
-  已固化为门禁，见 `tests/unit/harness-cleanup.bats`（3 例，理由见陷阱 23）。
+## 硬约定（都已固化为门禁）
+- curl 一律带 `--max-time`；回环加 `--noproxy '*'`。
+- 每个 workflow job 显式 `timeout-minutes`（缺省 360min）。
+- 脚本退出不得留守护：trap 在**首次启动守护之前**注册，按 pid 与**二进制路径**各收一遍；workflow 里
+  后台起守护须置 `DSH_RT_NO_AUTO_UPDATE=1`。
+- 「尽力而为」的步骤必须给可观测判据（marker / 断言 / 非零退出），否则绿 ≠ 可用。
 
-## 踩过的坑（通用 shell / CI 陷阱）
-1. **`file -b` 对 universal/fat 二进制逐架构输出一行** → `grep -c arm64` 恒为 2，`= 1` 永不成立。判断架构要用子串匹配：`[[ "$(file -b "$BIN")" == *"$(uname -m)"* ]]`。
-2. **`clang --analyze` 永远 exit 0**，静态分析默认不是门禁。必须补 `grep -Eq 'warning:|error:'` 才成为真实 gate。
-3. **bats 1.14 + bash 3.2：测试名含非 ASCII 时会静默执行 0 个测试**（假绿）。已在 `install-validation.bats` 加 ASCII 守护。新增 `@test` 名务必全 ASCII。
-4. **本仓库不跟踪 `pnpm-lock.yaml`** → 任何 lock-diff 类 CI 步骤都是空转。改为校验 lock 非空才是真门禁。
-5. **shellcheck SC2034**：`for i in $(seq ...)` 中 `i` 未使用时改写作 `_`。
-6. **回环 curl 必须带 `--max-time` + 绕过代理**（实测 curl 8.7.1）。
-   - 无超时：守护「已 bind 未 listen」时 macOS **丢弃 SYN**（不回 RST），curl 挂到作业级
-     `timeout-minutes`（30min），真实原因被藏成「卡住」。
-   - 不绕代理：curl **默认不豁免回环**，会把 `127.0.0.1` 交给 `http_proxy`
-     （`curl -v` 打印 `* Uses proxy env variable http_proxy` 即铁证）。此时**服务已死返回代理的
-     `502` 且 `rc=0`**——只看退出码的门禁会误报成功；比对精确码则会报出守护永不可能返回的 502。
-   - 超时或连不上时 `%{http_code}` 是 **`000`（不是空串）**，故失败信息可以保持准确。
-7. **`set -e` 下 `X=$(curl …)` 失败会终止整个脚本**（后续断言不跑、fixture 不清理）。
-   必须写 `X=$(curl … || true)`，`|| true` 放在 `$( )` **内部**，再由断言报错。
-8. **`BATS_TEST_TIMEOUT` 不可依赖**：bats 的超时逻辑要调 `/bin/ps`，该 helper 不可用
-   （沙箱/受限环境）时**静默空转**，测试照样跑满。凡是委托外部 helper 的门禁，都要验证它真的生效。
-9. **BWK(macOS) awk 的 `[^-A-Za-z0-9_]` 会漏掉 `-`**：`-A` 被解析成范围，`-` 落进否定类。
-   曾让 `install-validation.bats` 的 curl 门禁对**所有 `curl -flag` 行静默失明**，却仍报 0 违规。
-   改为 `substr` 取首字符逐个判断。教训：**门禁要对它声称覆盖的每种写法都植入违规验证**，
-   只测一两种形状会得到「通过」的假结论（前两次探针恰好用了坏字符类能匹配的形状）。
-   同理，按主机名（`127.0.0.1`/`localhost`）过滤会漏掉写成变量的 URL（`curl -fsS "$ENDPOINT"`）。
-10. **workflow job 不声明 `timeout-minutes` ⇒ 默认 360min**：一步卡住白烧 6 小时 runner。
-    本仓库既有约定是显式声明，已固化为门禁。判定时**只认 4 空格缩进的 job 级声明**
-    （step 级是 8 空格，不能算数），且只在 `jobs:` 之后计数（否则 `on:` 下的
-    `push:`/`pull_request:` 会被当成 job）。
-11. **BSD grep 的 `\|` 不是「或」而是字面量**（技能里记过，我仍踩了两次）：`grep '^a:\|^b:'`
-    在 macOS 上静默无输出。**一律用 `grep -E`**。**BSD `sed` 同理**：`sed -n '/A\|B/p'`
-    在 macOS 上按字面量 `A|B` 匹配 → **静默无输出**（本轮又踩：用它筛「EXPECTED_SHA|
-    ACTUAL_SHA|shasum」，结果空输出，一度让我以为包内 install.sh 没打上修复）。
-    `sed` 里要「或」得用 `sed -E -n '/A|B/p'`。**静默无输出 = 先怀疑分隔符语法，别先怀疑被测对象。**
-12. **不要用管道判定结果**：`gh run watch --exit-status | grep | head -N` 拿到的是 `head`
-    的退出码（恒 0），run 还在 `in_progress` 也会「通过」。要 `cmd > log 2>&1; echo $?`。
-13. **bash 3.2 里「双引号串内嵌 `$( )`、`$( )` 内再用转义双引号」会解析错乱**。
-    `echo "x: ${A}MB ($(awk "BEGIN {printf \"%.1f\", $A*100/$B}")%)"` 在 macOS
-    `/bin/bash`(3.2.57) 下：内层 `\"` 破坏外层引号 → `echo` 收到 **2 个参数**（同一行被打印
-    两遍），`awk` 被调用 **2 次**且程序被截断 → 两次 `syntax error`，`$( )` 结果为空。
-    fish / bash 5 不这样。**修法：先算进变量，不做嵌套**——
-    `PCT="$(awk "BEGIN {printf \"%.1f\", $A*100/$B}")"; echo "  x: ${A}MB (${PCT}%)"`。
-    实测：`cleanup-deps.sh:66` 中招（CI 打印 `节省空间: 62MB (%)   节省空间: 62MB (%)`），
-    `install.sh:59` 的单引号 awk 写法安全。**shellcheck -S warning 不报此问题**，bats 也不覆盖。
-14. **「失败只 warn 不阻断」＝ 空转门禁（error swallowing）**。`install.sh` 第 4c 步暖机
-    失败只 `warn "暖机超时…不影响使用"`，且**成功与否没有任何测试断言**——于是 CI 全绿
-    而该特性 4/4 次全部失败（见 2026-09-12 日志）。凡是新增「尽力而为」步骤，必须同时给出
-    可观测的成功判据（marker 文件 / 断言 / 非零退出），否则绿 ≠ 可用。
-15. **`$RT_HOME/.install.lock` 是「安装互斥」与「守护的更新期判定」共用的同一把锁**。
-    守护 `update_locked()`（daemon.c:255）读该锁，持锁者 pid 存活即判「更新进行中」并
-    **拒绝 spawn dsh**（daemon.c:296）。install.sh 整个运行期都持这把锁，所以**任何在
-    install.sh 内部启动守护去拉起 dsh 的步骤都会 100% 失败**——暖机（4c）正是这样踩死的：
-    不是环境问题、不是慢，是构造性死结。修法是给该守护实例一个**独立的无锁临时 RT_HOME**
-    （守护从 RT_HOME 只读三处：`run.json`(119)、`.install.lock`(257)、
-    `scripts/update-dsh.sh`(539)，故复制 run.json + daemon 即可，并置
-    `DSH_RT_NO_AUTO_UPDATE=1`）。**`RT_STATE` 必须保持真实路径**，因为
-    `NODE_COMPILE_CACHE` 是按 RT_STATE 算的（daemon.c:348），指错就白暖。
-16. **诊断「超时」类缺陷前先想：日志被谁删了**。暖机旧实现无条件 `rm -f /tmp/dsh-warmup.log`，
-    使 CI 里 4 次「超时」彻底无从诊断；本次只在失败分支加了一句 `cp … $LOG_DIR/warmup.log`，
-    根因（陷阱 15）当场自现。**失败路径保留现场，比任何日志级别调整都值钱。**
+## 架构要点
 
-17. **绝不要在 agent 沙箱里跑 `install.sh`**（两个独立原因，2026-09-12 实测）：
-    (a) 它用 `command -v node`（install.sh:179）取 node 并写进 `run.json` —— 沙箱 PATH 里
-        WorkBuddy 内部 node 排在用户 fnm node 之前，于是**把用户的 PWA 绑到 WorkBuddy 的
-        内部 node 上**。要修就得带 `PATH=<用户的 node bin>:$PATH` 重跑 install.sh。
-    (b) 第 5 步 `launchctl bootout` + `bootstrap`：**任何不在用户 Aqua 会话里的进程**
-        bootstrap 必返回 `5: Input/output error`，而 bootout 却可能成功 —— 于是**把用户
-        本来可用的 LaunchAgent 注销掉且无法恢复**。自证方法：拿一个**已注册**的 job 再
-        bootstrap 一次，同样 rc=5 即说明是上下文问题而非 plist 问题（`plutil -lint` 也会 OK）。
-        判据：`TERM_SESSION_ID`/`XPC_SERVICE_NAME` 未设置即非 Aqua 会话；**禁用沙箱也一样**，
-        别指望 `dangerouslyDisableSandbox` 绕过。用户必须在自己 Terminal 里执行。
-18. **审计报告是快照，不是现状；当待办用之前必须逐条验证**。`docs/` 下的审计文档写的是
-    落笔那一刻的代码，行号与片段都会漂。本轮实例：`docs/DEEP_AUDIT_2026-09-11.md` 的
-    **S1(P0)** 称 `install.sh` 的 SHA-256 校验恒失败，但该问题早在 **近 5 小时前**的
-    `e55263d` 就修好了，我却在 `f4caaf7` 入库时照抄成「S1(P0) 未修」，把一条已失效的
-    P0 继续当待办传播。**验证手法：`git log -S '<关键代码片段>' -- <文件>` 直接定位
-    修复提交；或对结论里的行号 `git blame`。** 一条命令的成本，换掉一次误报。
-19. **「复刻验证」必须连上下文一起复刻**（cwd、文件相对名、目录里还有哪些文件）。
-    本轮复刻 S1 时我第一版写 `shasum -a 256 "$W/dsh-pwa.zip"` —— 绝对路径被写进清单，
-    且源文件仍在原处，于是**旧的有 bug 实现居然 rc=0**，差点据此得出「审计报告是错的」。
-    第二次严格按 `release.yml:73-74`（`cd` 到打包目录 + 相对名 `dsh-pwa.zip`）才复现出
-    `dsh-pwa.zip: No such file or directory` / rc=1。**只复刻命令、不复刻目录状态 = 假验证。**
-20. **`gh release create` 成功 ≠ 资产可下载**。实测（2026-09-12）：v0.3.1 的 Release
-    workflow 结论 success、日志打印了 release URL，但事后 `gh api .../releases` 为 **0**、
-    `releases/download/v0.3.1/dsh-pwa.zip` **404**（`releases/tag/v0.3.1` 仍是 200 ——
-    那只是 tag 页面，**不能用来判断 release 是否存在**）。仓库 CI 当时**没有任何一步**会去
-    下载自己发的资产。已给 `release.yml` 补「发布后三方比对哈希」的门禁。判据要同时看
-    `gh api repos/<o>/<r>/releases` 与 `api .../releases/tags/<tag>`，别只看网页 200。
-21. **探针模式必须锚定到被测对象，否则会命中「另一个合法用途」**。本轮查「包内 install.sh
-    是否还有旧的 `shasum -c`」时我用了 `grep 'shasum -a 256 -c'` → 报「仍有」，但命中的是
-    `install.sh:218` **校验 node 压缩包**的那行（`shasum -a 256 -c -`），与发行包校验无关。
-    **判据要收紧到对象**：`grep 'shasum -a 256 -c .*pkg\.zip'`（结果 0 行 = 真已移除）。
-    同一轮里两个探针都出了假结论，靠 `sed -n '44,62p'` **直接看原始内容**才定案 ——
-    **门禁/探针报异常时，先打印原始内容核对，再下结论。**
+**daemon 安全模型（勿回退）**
+- CSRF：Origin / Host **精确匹配**（防跨站与 DNS rebinding）。
+- Cookie：精确匹配 `dsh-auth=` 名，不可 `strncmp(ck,"dsh-auth",8)`（会放行 `dsh-auth-evil`）。
+- 请求头：循环 recv 至 `\r\n\r\n`；未见空行一律 400，不完整头不得进入判定 / 透传。
+- 上游与客户端 socket 都要设 `SO_SNDTIMEO`/`SO_RCVTIMEO`；`write_all` 遇 EAGAIN 必须 `poll` 有界等待，
+  **不可裸 continue**（否则 100% CPU 自旋）。否则「零常驻」承诺失效。
+- token 嵌 JSON 先过字符集校验；缓冲撞上限须判为截断并**拒绝缓存**。
+- 引导页缓冲 8192，且截断必须可观测（E4）。
 
-22. **探针不能被「记录探针本身的文本」满足**。查 CI 孤儿时我 `grep "Terminate orphan process"`
-    命中的是**我自己刚写进 workflow 的注释** —— GitHub Actions 会把整个 `run:` block（含注释）
-    回显进日志，于是误判成「修复后仍有 1 个孤儿」。收紧成 runner 的真实格式
-    `Terminate orphan process: pid \([0-9]+\)` 后本轮 = **0 条**。
-    **凡是把诊断文字写进日志/脚本，同一轮再 grep 它，都会假阳性。**
-23. **CI 孤儿 `daemon` 有两个独立来源，且必须按 job 分组归因**（2026-09-12，3 → 1 → 0）：
-    - **归因**：`Terminate orphan process: pid (N) (daemon)` 要**逐 job** 统计。4 次 run 各 3 个，
-      但分布是「安全套件 2 + 性能基准 1」；Release workflow（只跑 smoke）**恒 0** ——
-      「某 job 恒 0」正是排除共享组件的最强证据。我最初笼统说「3 个全来自安全套件」，**是错的**。
-    - **来源一**：`tests/security-verification.sh` 的 EXIT trap 挂在第 7 节（330 行），而首次
-      启动守护在 97 行，且只 `rm -rf`、从不停守护 → 「启动成功但随后失败」的路径不受保护。
-    - **来源二**：`daemon.c:1057` **每次守护启动**都 `fork()` + `setsid()` 一个更新检查子进程，
-      `sleep(10)` 后才 `exec update-dsh.sh`。**那 10s 内它是同名的 `daemon` 进程且自成会话**，
-      所以 `kill $BPID` 杀不到它；性能基准步骤只跑约 3.5s，job 收尾时它还在睡。修法＝置
-      `DSH_RT_NO_AUTO_UPDATE=1`（既有约定见 `tests/unit/daemon-cases.bats:32`）。
-      A/B 实证：不置变量时单次启动 **2 个同名进程**、杀父后子进程存活；置变量后 **1 个**、
-      连 `last_update_check` 时间戳都不创建。
-    - **顺带**：`$!` 偏差**只出现在命令替换写法** `P="$(bin & echo $!)"`；`cmd & p=$!` 直接写法
-      实测 3/3 命中真实进程。**修之前先分清文件里用的是哪一种形状**，别无脑加兜底。
-    - **门禁**：`tests/unit/harness-cleanup.bats` 三例（trap 前移不变量 / 安全套件不留守护 /
-      workflow 后台拉起守护必须置 NO_AUTO_UPDATE），三例均验过 fail-before。
+**包装器自我版本（阶段 3，勿回退设计）**
+包装器此前没有自己的版本号（`DSH_VERSION` 是 dsh 的，自动更新也只更新 dsh）。分工：
+`install.sh` 写 `$RT_HOME/.wrapper-version`；`update-dsh.sh` 按 12h 节流写 `$RT_STATE/wrapper.latest`；
+`daemon.c` **只做比较**（它是 C、没有 TLS，网络不能在它里面做），`/health` 暴露
+`wrapper_version` / `wrapper_latest` / `wrapper_outdated`。
+- **「落后」与「未知」必须分开**：任一文件缺失都不报该字段；远端取不到一律静默。拿不到 ≠ 落后。
+- 取 tag 用 `releases/latest` 的 302 + `%{url_effective}`，并要求形如 `v<数字>`：**无 release 时该 URL
+  落到 `.../releases`，末段是字面量 "releases"**，不挡住就会把每个用户都标成落后。
+- 版本来源不写死常量：包内 `VERSION` > `git describe` > `DSH_RT_RELEASE_TAG` > `unknown`。
 
-## daemon 安全模型（勿回退）
-- CSRF：Origin / Host 头**精确匹配**，防跨站与 DNS rebinding。
-- Cookie：必须精确匹配 `dsh-auth=` 名，不可用 `strncmp(ck, "dsh-auth", 8)`（会放行 `dsh-auth-evil`）。
-- 请求头：必须循环 recv 至 `\r\n\r\n`，一次性 recv 遇分片会误判 403。
-- token 嵌 JSON：先过 `token_json_safe()` 字符集校验。
+**A5 依赖树锚点**
+首次安装带 `--frozen-lockfile`（增量 `update` 不带）；缺锁显式告警；`DSH_VERSION` 指定具体版本时跳过
+冻结。`release.yml` 生成 lock 用的 package.json 必须与 `install.sh` **逐字一致**（已有门禁）。
+
+## 测试接缝（写 fail-before 用例时用）
+- `DSH_DAEMON_SRC` 指向另一份 `daemon.c`：`git show HEAD:src/daemon.c > /tmp/old.c` 复验旧实现。
+- `WRAPPER_UPDATE_SRC`、`SECURITY_SRC`、`WARMUP_INSTALL_SRC` 指向改动前的副本。
+- `dsh-probe.sh` 与 update-dsh.sh 的版本检查都有**本地桩服务器**驱动，不依赖真网络。
