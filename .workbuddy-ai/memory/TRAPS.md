@@ -65,8 +65,21 @@ node ~/.workbuddy-ai/skills/ci-gate-hardening/scripts/check_run_blocks.mjs .gith
     截断只用于**人看的描述文本**（如 `displayTitle`），绝不能用在 key 上。
     同族（TRAPS §一 第 6 条）：**绝不让「展示/汇总阶段」参与判定** —— 那里是截断，这里是丢弃退出码。
     旁证：`gh run list | cut` 的输出里 ID 和耗时之间是制表符，`cut` 一刀切下去毫无提示。
+18. **`bats --filter` 是正则，测试名含正则元字符会静默不匹配。** 实测：`concurrency cap
+    refuses the N+1th connection with 503` 中的 `+` 被当成「一个或多个 `1`」，导致该用例
+    **完全不执行**；`stop skips … process (PID reuse guard)` 中的 `()` 被当成捕获组，同样漏跑。
+    `rc=0` + `not ok=0` + 只跑了部分用例时，极易被读成「全部通过」。
+    修法：(a) 转义所有元字符：`sed -E 's/[].[^$*+?(){}]/\\&/g'` 后再传给 `--filter`；
+    (b) **必须断言运行总数** —— `grep -oE '^1\.\.[0-9]+'` 的 `N` 必须与预期一致，
+    不能只看「没红」。这是 §一 第 16 条「只设上界的门禁会被空提取满足」的又一家族。
+19. **求「哪些用例没跑」要用集合差，不能靠「上次停在第 N 个」。** 沙箱的杀死点**不固定**
+    （实测 `daemon-cases.bats` 三次分别停在 34 / 30 / 35），于是「从第 31 个开始补齐」
+    会让 31–34 重复跑（34+16=50 ≠ 46）。
+    修法：先从全量列表与已跑列表各取用例名，用 `comm -23` 求差集，再对**差集**跑 filter。
+    这样杀死点漂移就只会影响「前段跑多少」，不会导致漏跑或重复跑。
 
 # 二、回环 curl（curl 8.7.1）
+
 - 无 `--max-time`：守护「已 bind 未 listen」时 macOS **丢 SYN**（不回 RST）→ 挂到作业级 timeout，
   真相被藏成「卡住」。
 - 不 `--noproxy '*'`：curl 默认把 127.0.0.1 交给 `http_proxy` → **服务已死也返回代理 502 且 rc=0**，
@@ -81,8 +94,12 @@ node ~/.workbuddy-ai/skills/ci-gate-hardening/scripts/check_run_blocks.mjs .gith
   **先算进变量再拼**。shellcheck / bats 都不覆盖。
 - 单个路径分量不得超 NAME_MAX=255（拼长路径做边界测试时要拆段）。
 - SC2034：`for i in $(seq …)` 中 `i` 未用 → 改写 `_`。
+- **`cat -A` 是 GNU 专有，macOS BSD `cat` 拒绝 `-A`**。要显示行尾字符（如确认 `\r\n`
+  而非 `\n`），改用 `sed -n 'l'`（每行末尾打印 `$` 并以 `\` 转义不可见字符）或 `od -c` /
+  `hexdump -C`。不要在 cross-platform 脚本里依赖 `cat -A`。
 
 # 四、验证方法论
+
 - **「dry-run」必须与真实路径共用同一段「选择」逻辑**，否则它只是**另一套实现**，
   它的正确性不构成真实路径的保证。2026-09-12 做 `cleanup-deps.sh` 的删除面门禁时，
   把「选谁」（`find` 谓词）与「怎么处置」（唯一的 `del()` 出口）分开 —— 于是 dry-run 打印的
@@ -110,8 +127,22 @@ node ~/.workbuddy-ai/skills/ci-gate-hardening/scripts/check_run_blocks.mjs .gith
 - **`gh release create` 成功 ≠ 资产可下载**：同看 `gh api .../releases` 与 `.../releases/tags/<tag>`；
   `releases/tag/<tag>` 返回 200 只是 tag 页面。已在 `release.yml` 补「发布后下载资产三方比对哈希」。
 - **失败路径保留现场** 比调日志级别值钱（暖机旧实现无条件 `rm -f` 日志 → 4 次超时无从诊断）。
+- **配置类门禁要从被测对象本身推导需求，而不是把指令名抄一遍。** CSP 门禁若直接写死
+  `script-src 'unsafe-inline'` 等指令名，引导页模板加了新资源类型时，门禁**不会变红**
+  —— 它根本不知道模板变了。修法：从引导页模板文本里 grep 出 `<script>` / `fetch(` /
+  `icon.svg` 等资源需求，再核对真实响应头里的 CSP 是否包含对应指令。这样模板改、需求推、
+  门禁判**串联联动**，而非各自为政。
+- **指令「存在」≠「够用」。** CSP 里有 `script-src` 且含 `'unsafe-inline'`，却**没有 `'self'` ——
+  当模板从「内联脚本」改为「外链 `<script src>`」时，页面照样白屏，而只查「指令是否存在」的门禁
+  全绿。门禁必须细到**源列表**（directive + source-list），不能只查指令名。
+- **新增的「快速拒绝」路径本身可能成为新的挂死面。** E6d 的 503 限流写在 `accept` 之后、
+  `fork` 之前:父进程里的 accepted socket 是**阻塞**的（超时只在子进程 `handle_conn` 里设），
+  若直接写 `respond(c, 503, …)` 而不先设 `SO_SNDTIMEO`，一个「只连不读」的客户端能把主循环
+  **永久挂住**。于是「加限额」这个修洞动作，**引入了与 A2 同类的挂死面**。
+  修法：**拒绝路径必须先设发送超时**再写；或把超时设到 accept 后的 fd 上（fork 前后都继承）。
 
 # 五、CI 孤儿 daemon（两个来源，须按 job 分组归因）
+
 - 来源一：`security-verification.sh` 的 EXIT trap 挂在第 7 节，而首次启动守护在前，且只 `rm -rf`
   从不停守护 → 「启动成功但随后失败」的路径不受保护。修法：`cleanup_all` 前移 + `daemon_stop_by_binary`。
 - 来源二：`daemon.c` 每次守护启动都 `fork()`+`setsid()` 一个更新检查子进程，`sleep(10)` 后才 exec；
