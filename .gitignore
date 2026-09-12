@@ -1,2 +1,29 @@
+# macOS
 .DS_Store
+
+# Logs
 *.log
+
+# Node.js / pnpm
+node_modules/
+.pnpm-store/
+
+# Build artifacts
+dist/
+build/
+
+# Test coverage
+coverage/
+
+# Editor swap files
+*.swp
+*.swo
+*~
+
+# Environment variables
+.env
+.env.local
+
+# Temporary files
+*.tmp
+/tmp/
