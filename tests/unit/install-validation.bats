@@ -305,3 +305,21 @@ detect_doc_counts() {
   done
   [ "$bad" -eq 0 ]
 }
+
+# —— 结构防回退 ——
+@test "main() stays decomposed (structural bound, not a correctness claim)" {
+  # 阶段 4 收尾。main() 原为 237 行:启动装配(pipes / launchd socket / 预热 / 后台更新)
+  # 与每 tick 结算(收割 / 在场租约 / token 扫描 / 就绪探测 / 唤醒重试 / poll 分派)全挤在一起,
+  # 任一段都无法单独阅读。已拆为 setup_pipes / open_listener / reap_children / settle_presence /
+  # maybe_scan_token / maybe_mark_ready / maybe_retry_wake / serve_once 八个具名函数,
+  # 拆后 main 只剩「装配 + 每 tick 六步」的骨架。
+  # 本门禁只防止它重新长回去,不对行为做任何断言 —— 行为由 daemon-cases.bats 的黑盒用例覆盖。
+  # 抽取方式:main 是文件**最后一个**函数,其收尾花括号在第 0 列,故 awk 范围抽取可靠。
+  local n
+  n="$(awk '/^int main\(void\) \{/,/^\}/' "$ROOT/src/daemon.c" | wc -l | tr -d ' ')"
+  # 反空转:范围抽取必须真的命中。锚点漂移时 n=0,若不先挡住,n=0 会「通过」任何上界,
+  #   门禁即恒绿 —— 正是本项目反复踩到的失明型假绿(见 TRAPS §一)。
+  [ "$n" -gt 5 ] || { echo "main() 抽取失败(锚点漂移?),得到 $n 行" >&2; return 1; }
+  [ "$n" -le 60 ] \
+    || { echo "main() 又长回 $n 行(上界 60):请把新增阶段拆成具名函数,而不是堆回 main" >&2; return 1; }
+}

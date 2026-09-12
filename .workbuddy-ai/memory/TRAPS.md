@@ -1,5 +1,17 @@
 # dsh-pwa 踩坑全集（由 MEMORY.md 指向；动手前先读）
 
+# 零、提交前 gauntlet（改完必跑）
+```bash
+clang -O2 -Wall -Wextra -Werror -o /tmp/dsh_verify src/daemon.c   # 必须零告警
+shellcheck -S warning scripts/*.sh tests/*.sh tests/lib/*.sh
+for f in scripts/*.sh tests/*.sh tests/lib/*.sh; do bash -n "$f"; done
+bats tests/unit/   # 数量以 `bats -c tests/unit/*.bats` 为准，不手写；沙箱须分文件跑（见 §一.13）
+# PyYAML 只在**系统** python3；本机 ruby 被 rbenv 指向未安装版本
+/opt/homebrew/opt/python@3.13/libexec/bin/python3 -c "import yaml,glob;[yaml.safe_load(open(p)) for p in glob.glob('.github/workflows/*.yml')]"
+node ~/.workbuddy-ai/skills/ci-gate-hardening/scripts/check_run_blocks.mjs .github/workflows
+```
+再跑一轮运行时 curl 回归（`/health` `/stop` `/wake`、Origin/Host 校验、cookie 校验）。
+
 # 一、门禁假绿（最常见，先怀疑这里）
 1. BSD `grep`/`sed` 的 `\|` 是字面量不是「或」→ macOS 上**静默无输出**。一律 `grep -E` / `sed -E`。
    **静默无输出 = 先怀疑分隔符语法，别先怀疑被测对象。**
@@ -27,6 +39,10 @@
     （6 个独立 bats 进程，harness-cleanup 排第 3）**照样**踩中，故旧结论「分文件跑即正常」不成立。
     正确判据：**把报错的那个文件单独在一条新命令里跑**（harness-cleanup 3/3、security 33/33 rc=0 即
     证明是环境而非产品）。凡见到 exit=2 / `safe-delete` 字样，先按此复验再下结论。
+14. **长套件在沙箱被 SIGKILL（exit 137），日志停在某个 `ok` 之后**：`daemon-cases.bats`（42 例）
+    单进程跑到第 41 例被杀，日志只留 40 个 `ok`。**判据：用改动前源码跑同一文件**
+    （`DSH_DAEMON_SRC=/tmp/old_daemon.c`，见 §四）—— 停在**同一处**即环境限制，与本次改动无关。
+    剩余用例用 `bats --filter "<用例名>" <文件>` 单独跑补齐。**exit 137 不是测试失败。**
 
 # 二、回环 curl（curl 8.7.1）
 - 无 `--max-time`：守护「已 bind 未 listen」时 macOS **丢 SYN**（不回 RST）→ 挂到作业级 timeout，
@@ -45,6 +61,12 @@
 - SC2034：`for i in $(seq …)` 中 `i` 未用 → 改写 `_`。
 
 # 四、验证方法论
+- **控制组必须「旧实现 + 同一环境」**，而且**控制组自身要先被证明有效**。2026-09-12 两次栽在这：
+  (a) 查 exit 137 时把改动前源码存成 `/tmp/daemon.c.bak`（**非 `.c` 结尾**），clang 报
+      `ld: unknown file type` → 42 例全部「编译失败」。只看「有没有 FAIL」会得出**反向结论**。
+      **控制组跑出异常结果时，先确认它真的执行了被测路径**（此处：文件名后缀决定 clang 当源码还是当目标文件）。
+  (b) 换成 `/tmp/old_daemon.c` 后才得到有效对照。判据要**同位置**（同在第 40 个 ok 处停），
+      而不是「都失败了」。
 - **审计报告是快照不是现状**：`docs/` 的行号/结论会漂。用前必须验证
   `git log -S '<片段>' -- <文件>` 或 `git blame`。（曾把已修好的 S1(P0) 照抄成待办继续传播。）
 - **「复刻验证」要连上下文复刻**（cwd、相对文件名、目录里还有什么）。只复刻命令 = 假验证。

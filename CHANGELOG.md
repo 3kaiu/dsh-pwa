@@ -9,6 +9,7 @@ All notable changes to this project will be documented in this file.
 - **零常驻:launchd socket activation 改造** — daemon 不再 RunAtLoad/KeepAlive 常驻;launchd 持有监听 socket,首个 TCP 连接自动拉起 daemon(launch_activate_socket),空闲停止 dsh 后 daemon `exit(0)` 自退;后台更新检查改为 daemon 激活时触发并按 `RT_STATE/last_update_check` 时间戳 12h 节流;install.sh 改为 bootout + bootstrap(不再 kickstart);smoke-test 新增 socket-activation 端到端段(激活→自退→再激活)
 - **懒启动成为默认** — 登录不再预热 dsh(登录只驻留 ~1MB 守护),首次点 PWA 图标才拉起;`DSH_RT_PREWARM=1` 显式开启预热(旧 `DSH_RT_NO_PREWARM=1` 继续有效);后台更新检查与预热解耦,守护每次启动都会评估(12h 节流)
 - **dsh 停止串行化** — `/wake`/`/stop` 改为连接子进程投递命令字节、主进程单线程串行执行启停,消除旧实现中 stop 与并发 wake 的状态文件误删竞态;`/stop` 响应不再阻塞最长 6s
+- **`daemon.c` 内部分解 `main()`(不做多文件拆分)** — `main()` 由 237 行收敛为 43 行骨架:启动装配与每 tick 结算拆为 `setup_pipes` / `open_listener` / `reap_children` / `settle_presence` / `maybe_scan_token` / `maybe_mark_ready` / `maybe_retry_wake` / `serve_once`,主循环骨架化为「收割 → 结算 → 扫描 → 就绪 → 重试 → 分派」六步。**刻意只重排原 1154 行之后**,前 1153 行逐字节不变(以 `cmp` 验证),故所有按路径的编译点、`sed` 行范围断言与 `daemon.c:NNN` 注释引用继续有效。多翻译单元拆分经评估**放弃**:它需同步改约 25 处测试断言与 `release.yml`→`.daemon.md5` 的发行指纹契约,收益仅为可读性,决策依据与证据表记入 [docs/AUDIT_HISTORY.md](docs/AUDIT_HISTORY.md)
 
 ### Added
 
@@ -21,6 +22,7 @@ All notable changes to this project will be documented in this file.
 - **bats 单元测试体系** — `tests/unit/install-validation.bats`(端口校验/编译/体积/语法/CI 门禁自检等安装侧用例)与 `tests/unit/daemon-cases.bats`(守护黑盒用例,不依赖真实 dsh,复用 `tests/lib/daemon-helpers.sh` 探测助手);安全验证套件 `tests/security-verification.sh` 扩充断言(含真实编译+启动+curl 的运行时 CSRF/Host 验证);测试数量一律以运行器输出为准(见 README「开发」段),文档不手写数量
 - 自动更新人工验收清单(`tests/auto-update-checklist.md`)
 - **活文档防漂移门禁** — 文档不再手写测试数量(手写值必然漂移,且没人负责更新):数量一律以运行器输出为准(README「开发」段给出 `bats -c tests/unit/*.bats`,只统计不执行);新增 bats 门禁扫描 README / CHANGELOG / docs 下的设计文档,出现「数字+量词」即失败,并带正反双向自检(合成违规样本必须命中、合法内容不得误报)。带日期的历史审计快照不纳入 —— 改动它们等于篡改记录
+- **`main()` 结构门禁** — 新增 bats 用例守住 `main()` 的上界(60 行)与反空转:范围抽取必须真的命中,锚点漂移时 `n=0` 要报错,否则 `n=0` 会「通过」任何上界而使门禁恒绿。已用负控验证 —— 72 行的 `main` 与无锚点文件都必须 FAIL,现状 43 行 PASS
 
 ### Fixed
 

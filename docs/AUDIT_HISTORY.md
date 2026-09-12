@@ -472,10 +472,41 @@ CI 打印 `节省空间: 62MB (%)   节省空间: 62MB (%)`。根因是 **bash 3
 | 深审 D2 | 依赖 `python3`,缺失时静默降级 | P2 |
 | 深审 D3 | 硬编码回退 LTS 版本,会陈旧且无告警 | P3 |
 | 深审 D5 | `workflow_dispatch` 会用分支名建 release | P3 |
-| 深审 §七 第 4 批 | `daemon.c` 单文件拆分(1,200 行,`main()` 约 230 行) | P3,技术债 |
+| 深审 §七 第 4 批 | `daemon.c` 单文件拆分(1,200 行,`main()` 约 230 行) | ✅ **已闭环** —— 见下「`daemon.c` 拆分决策」 |
 | 深审 §七 第 4 批 | `docs/` 审计文档合并 | ✅ **本文即该条目的产物** |
 | 对抗 R5 / 深审 | 管道执行、ad-hoc 签名、透传无鉴权 | 已知限制,非本项目可修 |
 | 深审 §一之二 | release 资产**事后被删除**只能靠定时巡检发现 | 暂不加,避免常态噪声 |
+
+### `daemon.c` 拆分决策(2026-09-12 闭环)
+
+**结论:不做多翻译单元(multi-TU)拆分;改为在单文件内分解 `main()`,并加结构门禁。**
+
+评估时文件为 1,391 行、11 个 banner 分区,`main()` 237 行。放弃多文件拆分的依据是**改动面**,
+而非风格偏好:
+
+| 约束 | 位置 | 拆分后要动什么 |
+|---|---|---|
+| 按路径编译 `src/daemon.c` | `install-validation.bats` 3 处、`security-verification.sh`、`tests/lib/daemon-helpers.sh`、`ci-enhanced.yml`、`release.yml` | 每个调用点都要改成多 TU 编译 |
+| 按**行范围**抽取函数体的静态断言 | `security-verification.sh` 的 `sed -n '/^static int http_probe/,/^}/p'`、`sed -n '/^static void stop_dsh/,/^}/p'` | 函数一旦换文件即**静默失配**(`grep -q` 恒假 → 断言空转) |
+| 纯 `grep` 源码断言 | `security-verification.sh` 内约 20 处 | 需逐一改路径 |
+| 发行包指纹契约 | `release.yml` 由 `src/daemon.c` 生成 `.daemon.md5`;`install.sh` 据此判「源码未变,免编译」 | 需改成对多文件取指纹,并同步 `install.sh` 的判定语义 |
+| 行号注释引用 | `scripts/install.sh`、`dsh-probe.sh`、`smoke-test.sh`、`ci-enhanced.yml`、`warmup-orphan.bats`、`harness-cleanup.bats` | 全部漂移 |
+
+即:该条目的收益是**可读性**,成本是触及**发行/打包契约**与约 25 条测试断言 —— 对一个被自身
+标为 P3 的条目不成比例。
+
+**实际落地的部分(低风险、可验证):**
+
+- `main()` 237 → **43 行**。新增 8 个具名函数:`setup_pipes` / `open_listener` / `reap_children` /
+  `settle_presence` / `maybe_scan_token` / `maybe_mark_ready` / `maybe_retry_wake` / `serve_once`;
+  主循环骨架化为「收割 → 结算 → 扫描 → 就绪 → 重试 → 分派」六步。
+- **刻意只重排原 1154 行之后**:前 1153 行逐字节不变(以 `cmp` 验证),故上表所有 `daemon.c:NNN`
+  行号引用与两条 `sed` 行范围断言**全部继续有效**,无需改动任何测试或脚本。
+- 新增门禁 `main() stays decomposed`(上界 60 行,配反空转:锚点漂移时 `n=0` 必须报错,
+  否则门禁恒绿)。已用负控验证:72 行的 `main` → FAIL、无锚点 → FAIL、现状 43 行 → PASS。
+
+**未做的部分(需仓库所有者决定):** 若将来确实要多文件拆分,建议一并做**单一**合并构建
+(保留 `src/daemon.c` 为可编译的单 TU 生成物),否则上表约 25 条断言与发行指纹契约都要同步改。
 
 ---
 

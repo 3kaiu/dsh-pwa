@@ -1151,21 +1151,25 @@ static void handle_conn(int c) {
   }
 }
 
-int main(void) {
-  signal(SIGPIPE, SIG_IGN);
-  build_paths();
-  build_boot();
-  read_run();
-  dsh_port = read_state_port();
-  if (dsh_port > 0 && !dsh_up()) dsh_port = 0;
-  else if (dsh_port > 0) {
-    // 守护重启收养运行中的 dsh(spawn_pid=0):日志里的 token 行仍在(O_TRUNC 只发生在下次
-    // spawn),开启扫描窗口并立即扫一次;否则 token 永不捕获 → /health 无 token → 引导页
-    // 等 token 失败后裸 reload 吃 401,同样进不去
-    last_spawn_time = time(NULL);
-    scan_token();
-  }
+// ---------- 启动装配与主循环各阶段(由 main 逐 tick 调用) ----------
+// 为什么拆:main() 原本是 237 行的单一函数,把「启动装配」「每 tick 结算」「poll 事件分派」
+// 全挤在一个函数体里,任一段都无法单独阅读。此处按职责切开,**纯搬移、不改行为**:
+// 所有跨阶段状态本就是文件级 static(dsh_port/ready_port/spawn_pid/last_use_m/…),拆出后无需传参;
+// 只有 main 的局部量——活跃连接计数 active 与监听 fd ls——显式传入。
+// 约束(勿忘):本文件被 install.sh / release.yml / tests 按**路径** src/daemon.c 编译,且
+// tests/security-verification.sh 用 `sed -n '/^static …/,/^}/p'` 按行范围抽取若干函数体做静态断言。
+// 故本次只重排 main 及其之后的代码,**不动任何被抽取的函数**(http_probe / stop_dsh 等),
+// 且不移动 1154 行之前的任何一行 —— 脚本与测试里所有 `daemon.c:NNN` 行号引用因此仍然有效。
 
+// socket-activated 模式标志:由 open_listener 置位。置位后主循环在「残留清理」「dsh 已停」
+// 「空闲且未运行 dsh」三个出口都 exit(0) 把 socket 交还 launchd;
+// 前台模式(自建 socket,无 launchd)则继续循环不退出。
+static int activated = 0;
+
+// 启动装配 1:建立两条控制管道(连接子进程 → 主进程)。
+// 两端都 NONBLOCK + CLOEXEC:CLOEXEC 保证 exec 出的 dsh 不继承这些 fd;
+// NONBLOCK 保证子进程写管道绝不阻塞(管道满即丢弃,由主进程按自身状态兜底)。
+static void setup_pipes(void) {
   // 唤醒请求管道(连接子进程写 → 主进程读)。两端均 CLOEXEC:exec 出的 dsh 不继承
   if (pipe(wake_pipe) == 0) {
     fcntl(wake_pipe[0], F_SETFL, O_NONBLOCK);
@@ -1181,10 +1185,12 @@ int main(void) {
     fcntl(hint_pipe[0], F_SETFD, FD_CLOEXEC);
     fcntl(hint_pipe[1], F_SETFD, FD_CLOEXEC);
   }
+}
 
-  // 监听 socket:优先 launchd socket activation(零常驻——launchd 持有 socket,连接到达才拉起本守护);
-  // 失败(手动前台运行/冒烟测试,job 无 sockets)则回退自建 socket/bind/listen
-  static int activated = 0;
+// 启动装配 2:取得监听 socket 并返回其 fd(失败返回 -1,由 main 以退出码 1 收场)。
+// 优先 launchd socket activation(零常驻——launchd 持有 socket,连接到达才拉起本守护);
+// 失败(手动前台运行/冒烟测试,job 无 sockets)则回退自建 socket/bind/listen。
+static int open_listener(void) {
   int ls = -1;
   int *lfd = NULL;
   size_t lcnt = 0;
@@ -1196,23 +1202,228 @@ int main(void) {
     free(lfd);
     activated = 1;
     fprintf(stderr, "dsh-daemon socket-activated: launchd 接管 http://127.0.0.1:%d/ 的监听(空闲停机后本守护 exit(0),launchd 重新接管)\n", PORT);
+    return ls;
   }
-  if (ls < 0) {
-    int s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s < 0) { perror("socket"); return 1; }
-    ls = s;
-    fcntl(ls, F_SETFD, FD_CLOEXEC); // 主进程 spawn dsh 时不泄漏监听 fd
-    int one = 1;
-    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    struct sockaddr_in a;
-    memset(&a, 0, sizeof a);
-    a.sin_family = AF_INET;
-    a.sin_port = htons(PORT);
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (bind(ls, (struct sockaddr *)&a, sizeof a) < 0) { perror("bind"); return 1; }
-    if (listen(ls, 32) < 0) { perror("listen"); return 1; }
-    fprintf(stderr, "dsh-daemon 前台模式: http://127.0.0.1:%d/ (PWA 端口;dsh 内部端口自动分配)\n", PORT);
+  int s = socket(AF_INET, SOCK_STREAM, 0);
+  if (s < 0) { perror("socket"); return -1; }
+  ls = s;
+  fcntl(ls, F_SETFD, FD_CLOEXEC); // 主进程 spawn dsh 时不泄漏监听 fd
+  int one = 1;
+  setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+  struct sockaddr_in a;
+  memset(&a, 0, sizeof a);
+  a.sin_family = AF_INET;
+  a.sin_port = htons(PORT);
+  a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (bind(ls, (struct sockaddr *)&a, sizeof a) < 0) { perror("bind"); return -1; }
+  if (listen(ls, 32) < 0) { perror("listen"); return -1; }
+  fprintf(stderr, "dsh-daemon 前台模式: http://127.0.0.1:%d/ (PWA 端口;dsh 内部端口自动分配)\n", PORT);
+  return ls;
+}
+
+// 每 tick 1:收割已退出的子进程,并维护活跃连接计数 *active。
+// dsh 本体与后台更新子进程都**不是连接**,必须从计数中剔除——否则它们退出会误减 active,
+// WS 长连接独占(active=1)时被误归 0 → 30s 内误停 dsh 且守护自退,透传子进程被孤儿化。
+static void reap_children(int *active) {
+  int reaped, reaped_st;
+  while ((reaped = waitpid(-1, &reaped_st, WNOHANG)) > 0) {
+    // dsh 本体退出(崩溃/被停)不是连接;清 spawn_pid 允许再次唤醒,清就绪缓存
+    if (is_spawn(reaped)) {
+      // 排障日志:dsh 退出方式(正常退出码 / 信号)对崩溃自愈与停机诊断有用。
+      // 主动停机路径由 stop_dsh 先收尸(spawn_pid 已清零),故这里只覆盖崩溃/被外部杀等被动退出
+      if (WIFEXITED(reaped_st))
+        fprintf(stderr, "daemon: dsh 已退出(pid %d,退出码 %d),清理状态\n", reaped, WEXITSTATUS(reaped_st));
+      else if (WIFSIGNALED(reaped_st))
+        fprintf(stderr, "daemon: dsh 已退出(pid %d,信号 %d),清理状态\n", reaped, WTERMSIG(reaped_st));
+      else
+        fprintf(stderr, "daemon: dsh 已退出(pid %d),清理状态\n", reaped);
+      spawn_pid = 0;
+      ready_port = 0;
+      reset_token(); // 进程已死,launch token 随之作废
+      refresh_port();  // 仅在 dsh 退出时重读
+      continue;
+    }
+    // 后台更新子进程退出也不是连接(否则 active 被误减,WS 独占时误停 dsh + 守护自退)
+    if (update_pid > 0 && reaped == update_pid) {
+      update_pid = 0;
+      continue;
+    }
+    (*active)--;
+    if (*active < 0) *active = 0;
   }
+}
+
+// 每 tick 2:在场租约结算——dsh 开着且无任何连接(active==0)才可能停机。
+//   - 快停:/goodbye 信标或长连接(WS)结束 hint 之后 GOODBYE_GRACE 无新连接 → 页面真关了
+//   - 慢停:自最后在场证据超 IDLE_STOP(短轮询/心跳靠每次 accept 续租,WS 靠 active>0 续租)
+//   reload/断线重连 1~2s 内必有新 accept 把 last_use_m 推过 fast_hint_m,快停自动解除。
+// 零常驻:socket-activated 模式下各停机出口都 exit(0) 交还 socket(前台模式继续循环)。
+static void settle_presence(double now, int active) {
+  if (dsh_port > 0 && active == 0) {
+    if (spawn_pid == 0 && !dsh_up()) {
+      // 残留状态(dsh 崩溃/被外部杀,文件没清):清掉,下次访问自动拉起,health 不再报 stale 端口
+      unlink(DSH_JSON);
+      unlink(PID_FILE);
+      dsh_port = 0;
+      ready_port = 0;
+      fast_hint_m = 0;
+      // 零常驻:socket-activated 模式下残留清理完即自退,launchd 重新接管 socket
+      if (activated) {
+        fprintf(stderr, "daemon: 残留状态已清理,自退(launchd 将接管 socket)\n");
+        exit(0);
+      }
+    } else if (spawn_pid > 0 ? kill(spawn_pid, 0) == 0 : dsh_up()) {
+      // 存活判定:dsh 是主进程直接子进程,spawn_pid>0 即由 waitpid 保证进程活着,
+      // 用 kill(pid,0) 免一次 socket+connect+close;spawn_pid==0(外部起的/残留)才 TCP 探测。
+      // (守护自报的 dsh_up 探测)否则空闲期每秒 2 次 TCP connect 纯属冗余系统调用。
+      if (fast_hint_m > last_use_m && now - fast_hint_m > GOODBYE_GRACE) {
+        fprintf(stderr, "daemon: 页面已关闭(超 %ds 无返回),停止 dsh\n", GOODBYE_GRACE);
+        stop_dsh();
+        dsh_port = 0;
+        ready_port = 0;
+        fast_hint_m = 0;
+        // 零常驻:dsh 已停,socket-activated 模式下自退交还 socket(前台模式继续循环)
+        if (activated) {
+          fprintf(stderr, "daemon: dsh 已停,自退(launchd 将接管 socket)\n");
+          exit(0);
+        }
+      } else if (now - last_use_m > IDLE_STOP) {
+        fprintf(stderr, "daemon: 空闲 %ds 无在场证据,停止 dsh\n", IDLE_STOP);
+        stop_dsh();
+        dsh_port = 0;
+        ready_port = 0;
+        fast_hint_m = 0;
+        if (activated) {
+          fprintf(stderr, "daemon: dsh 已停,自退(launchd 将接管 socket)\n");
+          exit(0);
+        }
+      }
+    }
+  } else if (activated && dsh_port <= 0 && spawn_pid == 0 && active == 0 &&
+             now - last_use_m > IDLE_STOP) {
+    // 零常驻兜底:激活后从未拉起 dsh(如仅探测 /health、runtime 未安装、更新期拒绝 spawn)
+    // 且已无任何连接,空闲超 IDLE_STOP 即自退交还 socket。缺此分支时,任何不触发 /wake
+    // 的连接都会让守护永久驻留(违背零常驻设计)。launchd 会在下次连接时重新拉起。
+    fprintf(stderr, "daemon: 空闲且未运行 dsh,自退(launchd 将接管 socket)\n");
+    exit(0);
+  }
+}
+
+// 每 tick 3:dsh 0.1.5+ 启动 token 扫描。dsh 在跑(本进程 spawn 或重启收养)且未捕获时增量扫日志。
+// 期限取 spawn+120s 与 就绪+120s 的较大者:前者覆盖「未就绪就打印 token」的旧式输出,
+// 后者覆盖慢启动(否则慢机上 token 会被永久错过)。到期仍无 token 才判定为旧版无 token
+// 机制而放弃,避免整场空扫。
+static void maybe_scan_token(void) {
+  time_t scan_limit = last_spawn_time + 120;
+  if (token_scan_deadline > scan_limit) scan_limit = token_scan_deadline;
+  if (!dsh_token[0] && dsh_port > 0 && time(NULL) < scan_limit) scan_token();
+}
+
+// 每 tick 4:就绪推进放主进程——dsh 每次启动只在这里探测成功一次,ready_port 经 fork 传给所有
+// 连接子进程(否则每个连接子进程都会各自探一次,透传期每个请求白白多一次完整 GET /)。
+static void maybe_mark_ready(void) {
+  if (dsh_port > 0 && ready_port != dsh_port && dsh_up() && http_probe(dsh_port)) {
+    // HTTP 探通即报就绪,不再等 token(旧版这里强制等 2s 宽限,冷启动白 +2s):
+    // dsh 0.1.5+ 打印 token 可能略晚于 HTTP 监听,该窗口内 /health 报 dsh:true 但省略
+    // token 字段,由引导页 JS 负责等 token 出来再握手(连续 ~3s 仍无 token 才按旧版直接 reload)。
+    ready_port = dsh_port;
+    // 就绪后重新起算 token 扫描期限:token 只在就绪之后才打印,期限锚定就绪时刻,
+    // 才不会把整个扫描窗口耗在「等 dsh 启动」上(实测余量仅数秒)。
+    token_scan_deadline = time(NULL) + 120;
+  }
+}
+
+// 每 tick 5:更新期被丢弃的唤醒自愈——锁释放后由主循环自行重试,不依赖客户端再发请求(1s 节流)。
+// 这里位于 poll() 之前,故即使完全无连接也会按 poll_ms(空闲 1s)推进,不会永久卡住。
+// spawn_dsh() 在锁仍被持有时只读一次 pid 文件即返回,且不计入崩溃失败计数,故反复调用安全。
+static void maybe_retry_wake(void) {
+  if (wake_pending && mono_now() - wake_retry_m >= 1.0) {
+    wake_retry_m = mono_now();
+    if (!NODE_BIN[0] || !DSH_BIN[0] || dsh_up() || spawn_pid != 0) {
+      wake_pending = 0; // runtime 不可用 / 已拉起 / 正在启动:唤醒无从兑现或已兑现,作废
+    } else {
+      spawn_dsh();
+    }
+  }
+}
+
+// 每 tick 6:一次 poll + 事件分派。超时(返回 0)即无事可做——poll_ms 决定各阶段的推进粒度。
+// 三个关注源:监听 socket(新连接)、wake 管道(连接子进程投递的启停命令)、hint 管道(关闭信标)。
+static void serve_once(int ls, int *active) {
+  struct pollfd pf[3];
+  pf[0].fd = ls; pf[0].events = POLLIN; pf[0].revents = 0;
+  pf[1].fd = wake_pipe[0]; pf[1].events = POLLIN; pf[1].revents = 0;
+  pf[2].fd = hint_pipe[0]; pf[2].events = POLLIN; pf[2].revents = 0;
+  // 冷启动延迟优化:dsh 启动中(spawn_pid>0)或已跑但未确认就绪时,poll 超时降到 150ms,
+  // 就绪探测/token 扫描以 150ms 粒度推进(/health 最多晚 150ms 翻转,而非旧版 0~1s);
+  // 空闲稳定期(无 spawn 且 dsh 未跑)保持 1000ms,避免无谓唤醒。
+  int poll_ms = ((spawn_pid > 0 || dsh_port > 0) && !dsh_ready()) ? 150 : 1000;
+  if (poll(pf, 3, poll_ms) > 0) {
+    if (wake_pipe[0] >= 0 && (pf[1].revents & POLLIN)) {
+      char wb;
+      int want_wake = 0;
+      while (read(wake_pipe[0], &wb, 1) > 0) {
+        if (wb == CMD_WAKE) want_wake = 1; // 多个唤醒请求至多 spawn 一次
+        else if (wb == CMD_STOP) {
+          // 停止也由主进程串行执行:与同批的 CMD_WAKE 按 FIFO 顺序结算,
+          // 停止期间不会有并发 spawn 写入新状态文件再被误删(竞态根源)。
+          stop_dsh();
+          dsh_port = 0;
+          ready_port = 0;
+          fast_hint_m = 0;
+          wake_pending = 0; // 显式停止:作废待重试的唤醒,避免 stop 之后又被自行拉起
+        }
+      }
+      if (want_wake && spawn_pid == 0 && !dsh_up() && NODE_BIN[0] && DSH_BIN[0]) spawn_dsh();
+    }
+    if (hint_pipe[0] >= 0 && (pf[2].revents & POLLIN)) {
+      char hb;
+      while (read(hint_pipe[0], &hb, 1) > 0) {} // 吸干 hint,记一次即可
+      note_hint();
+    }
+    if (pf[0].revents & POLLIN) {
+      int c = accept(ls, NULL, NULL);
+      if (c < 0 && (errno == EMFILE || errno == ENFILE)) {
+        // fd 耗尽:poll 对监听 socket 仍恒就绪(listen 队列非空),不歇一会会
+        // accept→EMFILE 空转烧 CPU。100ms 让上层连接子进程退出释放 fd。
+        usleep(100000);
+      }
+      if (c >= 0) {
+        tap_use(); // 父进程 accept 即在场证据(含 /health 轮询、/ping 心跳、透传请求)
+        pid_t pid = fork();
+        if (pid == 0) {
+          close(ls);
+          handle_conn(c);
+          close(c);
+          _exit(0);
+        }
+        close(c);
+        if (pid > 0) (*active)++; // fork 失败(pid<0):连接已关、无子进程,不得计入——
+        // 否则 active 永不归零,空闲停机判定失效,dsh 永不自动停、守护永不自退(零常驻被破坏)
+      }
+    }
+  }
+}
+
+int main(void) {
+  signal(SIGPIPE, SIG_IGN);
+  build_paths();
+  build_boot();
+  read_run();
+  dsh_port = read_state_port();
+  if (dsh_port > 0 && !dsh_up()) dsh_port = 0;
+  else if (dsh_port > 0) {
+    // 守护重启收养运行中的 dsh(spawn_pid=0):日志里的 token 行仍在(O_TRUNC 只发生在下次
+    // spawn),开启扫描窗口并立即扫一次;否则 token 永不捕获 → /health 无 token → 引导页
+    // 等 token 失败后裸 reload 吃 401,同样进不去
+    last_spawn_time = time(NULL);
+    scan_token();
+  }
+
+  setup_pipes();
+  int ls = open_listener();
+  if (ls < 0) return 1; // 取不到监听 socket(端口被占/权限不足):以非零退出,由 launchd 记录
+
   // 懒启动(默认):登录只驻留 1MB 级守护,dsh 等第一次点 PWA 才拉起——
   // 登录即预热经实测多为"拉起后 60s 无人用又杀掉",白烧 CPU。如仍想要预热:DSH_RT_PREWARM=1
   // (旧 DSH_RT_NO_PREWARM=1 继续有效,显式关闭预热)。
@@ -1221,171 +1432,19 @@ int main(void) {
   }
   // 后台更新检查与预热解耦:每次守护启动都延迟触发(内部自带 NO_AUTO_UPDATE 开关与 10s 延迟,不阻塞启动)
   trigger_background_update();
+
   int active = 0;
   last_use_m = mono_now(); // 守护刚启动:给 IDLE_STOP 完整窗口,不因残留状态被秒杀
+  // 主循环 = 每 tick 六步,顺序即语义(收割 → 结算 → 扫描 → 就绪 → 重试 → 分派):
+  // 先结算完上一 tick 遗留的活跃连接数与在场租约,再推进探测,最后才 poll 等新事件。
   for (;;) {
     double now = mono_now();
-    // 优化: 仅在 dsh 状态变化时重读 dsh.json (减少 60% 系统调用)
-    int reaped, reaped_st;
-    while ((reaped = waitpid(-1, &reaped_st, WNOHANG)) > 0) {
-      // dsh 本体退出(崩溃/被停)不是连接;清 spawn_pid 允许再次唤醒,清就绪缓存
-      if (is_spawn(reaped)) {
-        // 排障日志:dsh 退出方式(正常退出码 / 信号)对崩溃自愈与停机诊断有用。
-        // 主动停机路径由 stop_dsh 先收尸(spawn_pid 已清零),故这里只覆盖崩溃/被外部杀等被动退出
-        if (WIFEXITED(reaped_st))
-          fprintf(stderr, "daemon: dsh 已退出(pid %d,退出码 %d),清理状态\n", reaped, WEXITSTATUS(reaped_st));
-        else if (WIFSIGNALED(reaped_st))
-          fprintf(stderr, "daemon: dsh 已退出(pid %d,信号 %d),清理状态\n", reaped, WTERMSIG(reaped_st));
-        else
-          fprintf(stderr, "daemon: dsh 已退出(pid %d),清理状态\n", reaped);
-        spawn_pid = 0;
-        ready_port = 0;
-        reset_token(); // 进程已死,launch token 随之作废
-        refresh_port();  // 仅在 dsh 退出时重读
-        continue;
-      }
-      // 后台更新子进程退出也不是连接(否则 active 被误减,WS 独占时误停 dsh + 守护自退)
-      if (update_pid > 0 && reaped == update_pid) {
-        update_pid = 0;
-        continue;
-      }
-      active--;
-      if (active < 0) active = 0;
-    }
-    // 在场租约结算:dsh 开着且无任何连接(active==0)才可能停机
-    //   - 快停:/goodbye 信标或长连接(WS)结束 hint 之后 GOODBYE_GRACE 无新连接 → 页面真关了
-    //   - 慢停:自最后在场证据超 IDLE_STOP(短轮询/心跳靠每次 accept 续租,WS 靠 active>0 续租)
-    //   reload/断线重连 1~2s 内必有新 accept 把 last_use_m 推过 fast_hint_m,快停自动解除
-    if (dsh_port > 0 && active == 0) {
-      if (spawn_pid == 0 && !dsh_up()) {
-        // 残留状态(dsh 崩溃/被外部杀,文件没清):清掉,下次访问自动拉起,health 不再报 stale 端口
-        unlink(DSH_JSON);
-        unlink(PID_FILE);
-        dsh_port = 0;
-        ready_port = 0;
-        fast_hint_m = 0;
-        // 零常驻:socket-activated 模式下残留清理完即自退,launchd 重新接管 socket
-        if (activated) {
-          fprintf(stderr, "daemon: 残留状态已清理,自退(launchd 将接管 socket)\n");
-          exit(0);
-        }
-      } else if (spawn_pid > 0 ? kill(spawn_pid, 0) == 0 : dsh_up()) {
-        // 存活判定:dsh 是主进程直接子进程,spawn_pid>0 即由 waitpid 保证进程活着,
-        // 用 kill(pid,0) 免一次 socket+connect+close;spawn_pid==0(外部起的/残留)才 TCP 探测。
-        // (守护自报的 dsh_up 探测)否则空闲期每秒 2 次 TCP connect 纯属冗余系统调用。
-        if (fast_hint_m > last_use_m && now - fast_hint_m > GOODBYE_GRACE) {
-          fprintf(stderr, "daemon: 页面已关闭(超 %ds 无返回),停止 dsh\n", GOODBYE_GRACE);
-          stop_dsh();
-          dsh_port = 0;
-          ready_port = 0;
-          fast_hint_m = 0;
-          // 零常驻:dsh 已停,socket-activated 模式下自退交还 socket(前台模式继续循环)
-          if (activated) {
-            fprintf(stderr, "daemon: dsh 已停,自退(launchd 将接管 socket)\n");
-            exit(0);
-          }
-        } else if (now - last_use_m > IDLE_STOP) {
-          fprintf(stderr, "daemon: 空闲 %ds 无在场证据,停止 dsh\n", IDLE_STOP);
-          stop_dsh();
-          dsh_port = 0;
-          ready_port = 0;
-          fast_hint_m = 0;
-          if (activated) {
-            fprintf(stderr, "daemon: dsh 已停,自退(launchd 将接管 socket)\n");
-            exit(0);
-          }
-        }
-      }
-    } else if (activated && dsh_port <= 0 && spawn_pid == 0 && active == 0 &&
-               now - last_use_m > IDLE_STOP) {
-      // 零常驻兜底:激活后从未拉起 dsh(如仅探测 /health、runtime 未安装、更新期拒绝 spawn)
-      // 且已无任何连接,空闲超 IDLE_STOP 即自退交还 socket。缺此分支时,任何不触发 /wake
-      // 的连接都会让守护永久驻留(违背零常驻设计)。launchd 会在下次连接时重新拉起。
-      fprintf(stderr, "daemon: 空闲且未运行 dsh,自退(launchd 将接管 socket)\n");
-      exit(0);
-    }
-    // dsh 0.1.5+ 启动 token 扫描:dsh 在跑(本进程 spawn 或重启收养)且未捕获时增量扫日志。
-    // 期限取 spawn+120s 与 就绪+120s 的较大者:前者覆盖「未就绪就打印 token」的旧式输出,
-    // 后者覆盖慢启动(否则慢机上 token 会被永久错过)。到期仍无 token 才判定为旧版无 token
-    // 机制而放弃,避免整场空扫。
-    time_t scan_limit = last_spawn_time + 120;
-    if (token_scan_deadline > scan_limit) scan_limit = token_scan_deadline;
-    if (!dsh_token[0] && dsh_port > 0 && time(NULL) < scan_limit) scan_token();
-    // 就绪推进放主进程:dsh 每次启动只在这里探测成功一次,ready_port 经 fork 传给所有连接子进程
-    // (否则每个连接子进程都会各自探一次,透传期每个请求白白多一次完整 GET /)
-    if (dsh_port > 0 && ready_port != dsh_port && dsh_up() && http_probe(dsh_port)) {
-      // HTTP 探通即报就绪,不再等 token(旧版这里强制等 2s 宽限,冷启动白 +2s):
-      // dsh 0.1.5+ 打印 token 可能略晚于 HTTP 监听,该窗口内 /health 报 dsh:true 但省略
-      // token 字段,由引导页 JS 负责等 token 出来再握手(连续 ~3s 仍无 token 才按旧版直接 reload)。
-      ready_port = dsh_port;
-      // 就绪后重新起算 token 扫描期限:token 只在就绪之后才打印,期限锚定就绪时刻,
-      // 才不会把整个扫描窗口耗在「等 dsh 启动」上(实测余量仅数秒)。
-      token_scan_deadline = time(NULL) + 120;
-    }
-    // 更新期被丢弃的唤醒自愈:锁释放后由主循环自行重试,不依赖客户端再发请求(1s 节流)。
-    // 这里位于 poll() 之前,故即使完全无连接也会按 poll_ms(空闲 1s)推进,不会永久卡住。
-    // spawn_dsh() 在锁仍被持有时只读一次 pid 文件即返回,且不计入崩溃失败计数,故反复调用安全。
-    if (wake_pending && mono_now() - wake_retry_m >= 1.0) {
-      wake_retry_m = mono_now();
-      if (!NODE_BIN[0] || !DSH_BIN[0] || dsh_up() || spawn_pid != 0) {
-        wake_pending = 0; // runtime 不可用 / 已拉起 / 正在启动:唤醒无从兑现或已兑现,作废
-      } else {
-        spawn_dsh();
-      }
-    }
-    struct pollfd pf[3];
-    pf[0].fd = ls; pf[0].events = POLLIN; pf[0].revents = 0;
-    pf[1].fd = wake_pipe[0]; pf[1].events = POLLIN; pf[1].revents = 0;
-    pf[2].fd = hint_pipe[0]; pf[2].events = POLLIN; pf[2].revents = 0;
-    // 冷启动延迟优化:dsh 启动中(spawn_pid>0)或已跑但未确认就绪时,poll 超时降到 150ms,
-    // 就绪探测/token 扫描以 150ms 粒度推进(/health 最多晚 150ms 翻转,而非旧版 0~1s);
-    // 空闲稳定期(无 spawn 且 dsh 未跑)保持 1000ms,避免无谓唤醒。
-    int poll_ms = ((spawn_pid > 0 || dsh_port > 0) && !dsh_ready()) ? 150 : 1000;
-    if (poll(pf, 3, poll_ms) > 0) {
-      if (wake_pipe[0] >= 0 && (pf[1].revents & POLLIN)) {
-        char wb;
-        int want_wake = 0;
-        while (read(wake_pipe[0], &wb, 1) > 0) {
-          if (wb == CMD_WAKE) want_wake = 1; // 多个唤醒请求至多 spawn 一次
-          else if (wb == CMD_STOP) {
-            // 停止也由主进程串行执行:与同批的 CMD_WAKE 按 FIFO 顺序结算,
-            // 停止期间不会有并发 spawn 写入新状态文件再被误删(竞态根源)。
-            stop_dsh();
-            dsh_port = 0;
-            ready_port = 0;
-            fast_hint_m = 0;
-            wake_pending = 0; // 显式停止:作废待重试的唤醒,避免 stop 之后又被自行拉起
-          }
-        }
-        if (want_wake && spawn_pid == 0 && !dsh_up() && NODE_BIN[0] && DSH_BIN[0]) spawn_dsh();
-      }
-      if (hint_pipe[0] >= 0 && (pf[2].revents & POLLIN)) {
-        char hb;
-        while (read(hint_pipe[0], &hb, 1) > 0) {} // 吸干 hint,记一次即可
-        note_hint();
-      }
-      if (pf[0].revents & POLLIN) {
-        int c = accept(ls, NULL, NULL);
-        if (c < 0 && (errno == EMFILE || errno == ENFILE)) {
-          // fd 耗尽:poll 对监听 socket 仍恒就绪(listen 队列非空),不歇一会会
-          // accept→EMFILE 空转烧 CPU。100ms 让上层连接子进程退出释放 fd。
-          usleep(100000);
-        }
-        if (c >= 0) {
-          tap_use(); // 父进程 accept 即在场证据(含 /health 轮询、/ping 心跳、透传请求)
-          pid_t pid = fork();
-          if (pid == 0) {
-            close(ls);
-            handle_conn(c);
-            close(c);
-            _exit(0);
-          }
-          close(c);
-          if (pid > 0) active++; // fork 失败(pid<0):连接已关、无子进程,不得计入——
-          // 否则 active 永不归零,空闲停机判定失效,dsh 永不自动停、守护永不自退(零常驻被破坏)
-        }
-      }
-    }
+    reap_children(&active);        // 收割子进程,维护活跃连接计数
+    settle_presence(now, active);  // 在场租约结算(可能 exit(0) 自退)
+    maybe_scan_token();            // 增量扫描 dsh 启动 token
+    maybe_mark_ready();            // HTTP 就绪探测(单一写者)
+    maybe_retry_wake();            // 更新期被丢弃的唤醒自愈
+    serve_once(ls, &active);       // 一次 poll + 事件分派
   }
   return 0;
 }
