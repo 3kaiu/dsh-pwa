@@ -56,6 +56,15 @@ node ~/.workbuddy-ai/skills/ci-gate-hardening/scripts/check_run_blocks.mjs .gith
     「结构合规」可区分。**凡「必须小于 N」的断言，都要问一句：这个量是怎么来的？它可能为 0 吗？**
     同族：`bats -c` 与 `grep -c '@test'` 的差异（后者会把注释/`case` 模式里的 `@test` 数进来）
     —— **计数必须来自产出它的那个工具**，不能来自文本模式。
+17. **为「看得舒服」截断输出，会把标识符本身弄坏**。2026-09-12 我用 `gh run list | cut -c1-120`
+    看运行列表，run ID 被砍掉末 3 位（真值 `34688971543` → 显示 `34688971`），
+    随后拿这个**残缺 ID** 去 `gh run watch` → `HTTP 404: Not Found`，**1 秒即返回**。
+    差点把「1 秒 exit=1」读成「CI 失败」。**判据**：`gh run watch` 在排队/运行中的 run 上
+    不可能 1 秒结束 —— **耗时与语义不符时，先怀疑自己拿错了对象**。
+    修法：**取标识符一律走 `--json <字段>` + `-q`，不做字符截断**；
+    截断只用于**人看的描述文本**（如 `displayTitle`），绝不能用在 key 上。
+    同族（TRAPS §一 第 6 条）：**绝不让「展示/汇总阶段」参与判定** —— 那里是截断，这里是丢弃退出码。
+    旁证：`gh run list | cut` 的输出里 ID 和耗时之间是制表符，`cut` 一刀切下去毫无提示。
 
 # 二、回环 curl（curl 8.7.1）
 - 无 `--max-time`：守护「已 bind 未 listen」时 macOS **丢 SYN**（不回 RST）→ 挂到作业级 timeout，
