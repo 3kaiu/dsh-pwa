@@ -2,6 +2,17 @@
 
 macOS 上一键安装 [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh)(官方 npm 包 `@deepseek-ai/dsh`)并把它变成桌面 PWA:零常驻架构(launchd socket activation)——登录后没有任何用户态进程,点 PWA 图标时 launchd 自动拉起守护进程与 dsh,关闭页面后 dsh 与守护进程全部退出;Safari「添加到程序坞」即得全屏 Web App。
 
+## 平台支持
+
+**仅支持 macOS。** 这不是「暂时没适配」,而是架构前提 —— 零常驻承诺直接建立在 macOS 独有机制上:
+
+- **launchd socket activation** — 零常驻的核心:launchd 持有监听 socket,首个连接才拉起守护进程,空闲即自退
+- **LaunchAgent + Aqua 会话** — 安装需 `launchctl bootstrap` 注册守护与更新器,必须在**已登录的图形会话内**执行(在 SSH/CI 等非 Aqua 上下文中会返回 `5: Input/output error`)
+- **Universal binary** — 守护进程预编译为 arm64 + x86_64,免本地编译
+
+**Linux / Windows 明确不在范围内**(无适配计划):两者没有等价于 launchd socket activation 的机制,
+要做到「空闲即自退」就得常驻一个监督进程,零常驻的卖点随之消失。需要跨平台时,请把 dsh 本身作为独立服务运行。
+
 ## 安装
 
 ### 推荐方式（两步安装）
