@@ -235,3 +235,69 @@ extract_manifest_fmt() {
     return 1
   fi
 }
+
+# —— 文档防漂移 ——
+# 扫描范围刻意分成两类(写清楚,而不是假装全覆盖):
+#  · 活文档(描述**当前**行为,数字会漂移):README.md、CHANGELOG.md、
+#    docs/TOOLS_INTEGRATION.md、docs/AUTO_UPDATE_IMPLEMENTATION.md
+#  · 历史快照(数字描述**当时**状态,改动等于篡改记录):docs/ADVERSARIAL_AUDIT_*.md 的
+#    「29 项测试」、docs/DEEP_AUDIT_2026-09-11.md 的「6 个测试文件」、
+#    docs/SMOKE_REVIEW_2026-09-12.md、docs/P0_P3_FIXES_IMPLEMENTATION.md(修复实施记录)。
+#    将来若要合并这些快照(roadmap 项),合并稿应带明确日期并同样不写数字。
+# 背景:README 曾手写「33 项断言 / 9+30=39 项」,而实测是 security 33、unit 68 ——
+#   数字一旦手写就没人负责更新。数量必须以**运行器输出**为准:
+#   `bats -c tests/unit/*.bats` 只统计不执行,且与 bats 实际执行口径一致;
+#   静态 `grep -c '@test'` 会把注释里的 @test 也算进去(实测 16 vs 13),不可用。
+detect_doc_counts() {
+  # $1 = 待扫描文件;输出「数字+量词」的违规行(带行号)。
+  # 规则是**一刀切**的:活文档里不出现「数字+项/个/条/款」,不要求同行出现测试关键词。
+  #   原因:两段式(先筛数字+量词、再筛 bats/测试 等关键词)有盲区 —— 把数量单独写成一行
+  #   (如「共 39 项测试」)就漏了,而「漏掉的漂移」正是本门禁要消灭的东西。
+  #   实测四个活文档当前 0 处命中,故一刀切零误报;代价只是将来写数量时改用命令引用。
+  # 用 -E 的多字节字面量交替而非方括号类 [项个条款]:后者在 C locale 下退化成逐字节匹配,
+  #   会命中任何含相同字节的汉字(假阳性);交替是逐字节序列,与 locale 无关。
+  # 已知盲区(刻意保留,写清楚而不是假装覆盖):只认阿拉伯数字,中文数字(如「三十九项」)
+  #   不匹配。把 [一二三…十] 纳入会让「一个」「两个」这类日常表述大量误报,得不偿失;
+  #   而测试数量在实践中总是写阿拉伯数字,故本门禁对**实际**漂移路径有效。
+  grep -nE '[0-9]+ *(项|个|条|款)' "$1" 2>/dev/null || true
+}
+
+@test "living docs state no hand-written counts (drift guard)" {
+  # 合成样本落在 bats 自己的临时目录里(BATS_TEST_TMPDIR 由 bats 回收),
+  #   避免像本项目反复踩到的那样在 /tmp 留下孤儿文件。
+  local probe="$BATS_TEST_TMPDIR/doc-probe.md"
+  local f hits bad=0
+
+  # 反空转(正):检测器必须命中合成违规样本。否则正则写错(本项目已多次踩到「门禁自身
+  #   失明却恒绿」——如 BSD grep 的 \| 被当字面量、bracket 类漏掉 -)会让本门禁永远通过。
+  printf '%s\n' 'bats tests/unit/   # 单元测试:安装校验(9 项)+ 守护黑盒用例(30 项),共 39 项' > "$probe"
+  if [ -z "$(detect_doc_counts "$probe")" ]; then
+    echo "门禁自检失败:检测器未命中合成违规样本(正则已失明)" >&2
+    return 1
+  fi
+  # 反空转(正·盲区):数量单独成行时同样必须命中 —— 这条专门守住上面注释里说的两段式盲区。
+  printf '%s\n' '当前单元测试共 39 项。' > "$probe"
+  if [ -z "$(detect_doc_counts "$probe")" ]; then
+    echo "门禁自检失败:单独成行的数量未被命中(两段式盲区复现)" >&2
+    return 1
+  fi
+  # 反空转(反):合法内容不得误报 —— 否则门禁会被「绕过式重写」而不是被遵守。
+  printf '%s\n' 'bash scripts/smoke-test.sh   # 端到端冒烟(无数字)' > "$probe"
+  if [ -n "$(detect_doc_counts "$probe")" ]; then
+    echo "门禁自检失败:合法行被误报" >&2
+    return 1
+  fi
+
+  for f in "$ROOT/README.md" "$ROOT/CHANGELOG.md" "$ROOT/docs/TOOLS_INTEGRATION.md" \
+           "$ROOT/docs/AUTO_UPDATE_IMPLEMENTATION.md"; do
+    [ -f "$f" ] || { echo "活文档缺失(锚点漂移?): $f" >&2; return 1; }
+    hits="$(detect_doc_counts "$f")"
+    if [ -n "$hits" ]; then
+      echo "活文档出现手写数量(必然漂移,请改为引用运行器输出):" >&2
+      echo "  $f" >&2
+      printf '%s\n' "$hits" | sed 's/^/    /' >&2
+      bad=1
+    fi
+  done
+  [ "$bad" -eq 0 ]
+}

@@ -114,19 +114,20 @@ bash scripts/benchmark.sh
 brew install bats-core
 ```
 
-**测试文件:** `tests/unit/install-validation.bats` + `tests/unit/daemon-cases.bats`
+**测试文件:** `tests/unit/*.bats`(安装校验 / 守护黑盒 / 包装器自版本 / 更新探测 / 守护清理)
 
 ```bash
 bats tests/unit/
+bats -c tests/unit/*.bats     # 只统计数量,不执行
 ```
 
 **功能:**
-- install-validation.bats: 端口验证、编译成功性、二进制体积、脚本语法等安装侧用例
+- install-validation.bats: 端口验证、编译成功性、二进制体积、脚本语法,以及 CI 门禁自检(curl 超时/代理、workflow `timeout-minutes`、文档防漂移)
 - daemon-cases.bats: 守护进程黑盒用例(就绪门控/透传/启停等),不依赖真实 dsh,复用 `tests/lib/daemon-helpers.sh` 探测助手
+- wrapper-version.bats / dsh-probe.bats: 包装器自版本上报、更新后启动探测脚本(各自在隔离的临时 RT_HOME 内运行)
+- harness-cleanup.bats / warmup-orphan.bats: 测试与基准退出后不得留下守护进程、暖机孤儿清理
 
-**当前覆盖(截至 2026-09-11):**
-- 2 个测试文件,共 24 个测试用例(install-validation 8 + daemon-cases 16)
-- 覆盖边界情况 (端口范围, 二进制大小, 守护运行时行为)
+**覆盖:** 测试数量以运行器输出为准(`bats -c tests/unit/*.bats`),文档不手写数量 —— 手写值必然漂移,已由 `install-validation.bats` 的门禁守护。用例覆盖边界情况(端口范围、二进制大小、守护运行时行为)。
 
 ---
 

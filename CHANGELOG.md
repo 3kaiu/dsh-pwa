@@ -16,8 +16,9 @@ All notable changes to this project will be documented in this file.
 - **Host 头校验(防 DNS rebinding)** — 所有请求(引导页/控制端点/透传)统一在最前面校验 Host 精确等于 `127.0.0.1:PORT`/`localhost:PORT`,否则 403;防止 evil.com 解析到 127.0.0.1 后以"同源"身份读 `/health` 窃取 dsh token
 - **dsh 0.1.5+ 启动 token 捕获与端点** — daemon 主进程增量扫描 dsh 日志捕获 launch token,经 `/health` 交给引导页完成 `/?token=` 握手种下持久会话 cookie;新增 `POST /ping`(在场心跳续租)与 `POST /goodbye`(页面关闭信标,GOODBYE_GRACE 后快停);token 握手请求(`GET /?token=…`)放行透传,解决引导页无限 reload 死循环;守护重启 adopt 运行中的 dsh 时补扫 token
 - **NODE_COMPILE_CACHE** — dsh 子进程启用 Node 原生编译缓存(落盘 `RT_STATE/node-cache`,0700),二次启动跳过 JS 编译阶段明显提速;旧版 node 忽略该变量无害
-- **bats 单元测试体系** — `tests/unit/install-validation.bats`(端口校验/编译/体积/语法等 8 用例)与 `tests/unit/daemon-cases.bats`(守护黑盒用例,不依赖真实 dsh,复用 `tests/lib/daemon-helpers.sh` 探测助手);安全验证套件 `tests/security-verification.sh` 扩充至 33 项断言(含真实编译+启动+curl 的运行时 CSRF/Host 验证)
+- **bats 单元测试体系** — `tests/unit/install-validation.bats`(端口校验/编译/体积/语法/CI 门禁自检等安装侧用例)与 `tests/unit/daemon-cases.bats`(守护黑盒用例,不依赖真实 dsh,复用 `tests/lib/daemon-helpers.sh` 探测助手);安全验证套件 `tests/security-verification.sh` 扩充断言(含真实编译+启动+curl 的运行时 CSRF/Host 验证);测试数量一律以运行器输出为准(见 README「开发」段),文档不手写数量
 - 自动更新人工验收清单(`tests/auto-update-checklist.md`)
+- **活文档防漂移门禁** — 文档不再手写测试数量(手写值必然漂移,且没人负责更新):数量一律以运行器输出为准(README「开发」段给出 `bats -c tests/unit/*.bats`,只统计不执行);新增 bats 门禁扫描 README / CHANGELOG / docs 下的设计文档,出现「数字+量词」即失败,并带正反双向自检(合成违规样本必须命中、合法内容不得误报)。带日期的历史审计快照不纳入 —— 改动它们等于篡改记录
 
 ### Fixed
 
@@ -89,7 +90,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- 自动化安全验证套件(`tests/security-verification.sh`,33 项断言)
+- 自动化安全验证套件(`tests/security-verification.sh`)
 - README 中的版本固定说明与安全特性章节
 
 ### Changed

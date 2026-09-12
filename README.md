@@ -104,9 +104,12 @@ launchctl print "gui/$(id -u)/com.dshpwa.daemon"      # launchd 注册状态
 
 ```bash
 bash scripts/smoke-test.sh              # 隔离目录真实安装 → 幂等重跑 → 端口占用检测 → 守护(引导页/自动唤醒/就绪门控/token 握手/透传) → 并发双唤醒幂等 → 空闲自停 → socket activation 端到端(激活→自退→再激活)
-bash tests/security-verification.sh     # 验证所有安全控制是否按预期工作(33 项断言)
-bats tests/unit/                        # 单元测试:安装校验(9 项)+ 守护黑盒用例(30 项,不依赖真实 dsh),共 39 项
+bash tests/security-verification.sh     # 验证所有安全控制是否按预期工作
+bats tests/unit/                        # 单元测试:守护黑盒 / 安装校验 / 包装器版本 / 探测脚本(不依赖真实 dsh)
+bats -c tests/unit/*.bats               # 只统计不执行:打印当前单元测试数量
 ```
+
+> 测试数量一律以运行器输出为准(如 `bats -c tests/unit/*.bats`),文档不手写数量 —— 手写值必然漂移,已由 `tests/unit/install-validation.bats` 的门禁守护。
 
 ## 参考文档
 
