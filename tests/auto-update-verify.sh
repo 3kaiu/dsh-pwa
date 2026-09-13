@@ -29,6 +29,29 @@ info() { echo "  ${D}$*${RST}"; }
 skip() { echo "  ${D}SKIP:${RST} $*"; ((SKIP_COUNT++)) || true; }
 h1()   { echo; echo "${B}$*${RST}"; }
 
+# —— 前置条件与能力探测 ——
+# 本套件的断言分两类,末尾的下界必须对这两类区别对待,否则下界会变成
+# 「本机碰巧装了什么」的函数(2026-09-13 被 CI 抓到的真事故,run 34700660293)。
+#
+# (1) **必需能力:真实 node。** 用例 2–9 都靠 make_env 组装环境,而 update-dsh.sh 解析版本
+#     依赖真实 node。缺 node 时那 8 个节各自 SKIP,PASS 掉到 6 —— 那种「通过」不代表自动
+#     更新链路被验证过,是假绿。故写成**显式前置条件**直接失败,而不是让 8 个节静默 SKIP
+#     之后再被末尾下界报成「有用例被静默跳过」(指错方向:实际是环境不满足,不是断言被吞)。
+#     前置条件一旦成立,下界里 node 那一项就是**常量**,环境无关。
+#     (make_env 内仍保留 `无 node → return 1` 的兜底,作为纵深防御。)
+if ! command -v node >/dev/null 2>&1; then
+  echo "${R}${B}✗ 本套件需要真实 node${RST}(update-dsh.sh 解析版本依赖它)" >&2
+  echo "  缺 node 时用例 2–9 全部无法执行,跑出来的「通过」不代表自动更新链路被验证过。" >&2
+  exit 1
+fi
+
+# (2) **可选能力:shellcheck。** 第 10 节的 lint 是加在「功能已被完整验证」之上的补充项,
+#     缺它不影响本套件的结论,故允许 SKIP —— 但必须**显式声明为不在本环境的断言集内**,
+#     由末尾的下界据此扣除。探一次、两处共用(断言分支 + 下界计算),避免两处各写一遍
+#     `command -v` 而在将来漂移,那会让下界与实际执行的断言集对不上。
+HAVE_SHELLCHECK=0
+command -v shellcheck >/dev/null 2>&1 && HAVE_SHELLCHECK=1
+
 UPDATER="$ROOT/scripts/update-dsh.sh"
 cd "$ROOT"
 
@@ -464,14 +487,15 @@ if [ -x "$UPDATER" ]; then
 else
   fail "update-dsh.sh 缺少可执行位"
 fi
-if command -v shellcheck >/dev/null 2>&1; then
+if [ "$HAVE_SHELLCHECK" -eq 1 ]; then
   if shellcheck -S warning "$UPDATER" "$0"; then
     ok "shellcheck -S warning 零告警(update-dsh.sh + 本套件)"
   else
     fail "shellcheck -S warning 存在告警"
   fi
 else
-  skip "shellcheck 未安装,跳过 shellcheck 检查"
+  # 能力相关项:显式声明「不在本环境的断言集内」,末尾据此从下界里扣掉(见 PASS_MIN 处)。
+  skip "shellcheck 未安装,跳过 shellcheck 检查(该断言不计入下界)"
 fi
 
 h1 "未自动化项(SKIP —— 破坏性/需真实环境,保留人工验收)"
@@ -492,7 +516,21 @@ echo
 # `set -e` 掐断,或某个 if 分支整段没进,PASS 会**静默变小**而仍然 exit 0。
 # 故给 PASS 设下界(下界随用例增减人工上调);SKIP 数不设下界 —— SKIP 是本套件的
 # 正常形态(破坏性/需真实环境的用例刻意保留人工验收),锁死它只会让合理调整变红。
-PASS_MIN=28
+#
+# 下界必须**环境无关**(2026-09-13 被 CI 抓到的真事故,run 34700660293):
+#   原先写死 `PASS_MIN=28`,而 28 里含一条**能力相关**的断言(第 10 节 shellcheck)。
+#   本机装了 shellcheck ⇒ 28 通过;CI runner 没装 ⇒ 那条变 SKIP ⇒ 27 通过 ⇒
+#   **必然误红**。教训:下界是「本机装了哪些开发工具」的函数,就是一颗定时炸弹 ——
+#   它只在开发机上绿,一到干净环境就炸,而且报的是「有用例被静默跳过」这种**指错方向**的话。
+# 修法(两层,缺一不可):
+#   ① **必需能力写成前置条件**(见文件头的 node 检查)—— node 一旦被前置条件保证,
+#      用例 2–9 就**必然**执行,那 27 项才是真正的常量。若不这么做,缺 node 时 PASS 掉到 6,
+#      下界同样误红(实测),只是没人碰过这个分支而已。
+#   ② **可选能力按探测结果加回** —— 加的是 `$HAVE_SHELLCHECK`(显式探测),不是拿 `$PASS`
+#      反推。若按实际 PASS 自适应,下界就变成「实际发生了什么」的复述,静默跳过再也测不出来,
+#      正是要防的假绿。
+# 另:下界只保证「该跑的跑了」,不保证「跑的对」—— 断言本身的有效性由各节的正反控负责。
+PASS_MIN=$((27 + HAVE_SHELLCHECK))
 if [ "$FAIL" != "0" ]; then
   echo "${R}${B}✗ 发现问题${RST} (${G}$PASS 通过${RST}, ${R}$FAIL 失败${RST}, $SKIP_COUNT 项 SKIP)"
   exit 1
