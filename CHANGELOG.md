@@ -10,6 +10,7 @@ All notable changes to this project will be documented in this file.
 - **懒启动成为默认** — 登录不再预热 dsh(登录只驻留 ~1MB 守护),首次点 PWA 图标才拉起;`DSH_RT_PREWARM=1` 显式开启预热(旧 `DSH_RT_NO_PREWARM=1` 继续有效);后台更新检查与预热解耦,守护每次启动都会评估(12h 节流)
 - **dsh 停止串行化** — `/wake`/`/stop` 改为连接子进程投递命令字节、主进程单线程串行执行启停,消除旧实现中 stop 与并发 wake 的状态文件误删竞态;`/stop` 响应不再阻塞最长 6s
 - **`daemon.c` 内部分解 `main()`(不做多文件拆分)** — `main()` 由 237 行收敛为 43 行骨架:启动装配与每 tick 结算拆为 `setup_pipes` / `open_listener` / `reap_children` / `settle_presence` / `maybe_scan_token` / `maybe_mark_ready` / `maybe_retry_wake` / `serve_once`,主循环骨架化为「收割 → 结算 → 扫描 → 就绪 → 重试 → 分派」六步。**刻意只重排原 1154 行之后**,前 1153 行逐字节不变(以 `cmp` 验证),故所有按路径的编译点、`sed` 行范围断言与 `daemon.c:NNN` 注释引用继续有效。多翻译单元拆分经评估**放弃**:它需同步改约 25 处测试断言与 `release.yml`→`.daemon.md5` 的发行指纹契约,收益仅为可读性,决策依据与证据表记入 [docs/AUDIT_HISTORY.md](docs/AUDIT_HISTORY.md)
+- **README 精简** — 185 → 134 行(4,832 → 4,204 字符),内容不删只并:「推荐/快速安装」两节合为单一代码块、Requirements 的三条「依据」压成一段、Troubleshooting / Uninstallation / Development 的命令说明改行内注释、`Contributing` 并入 `Development`、删去仅复述首段链接的 Acknowledgements。**顺带补一处漂移**:README 给出的提交前编译命令漏了 `-Wunused-macros` —— 该开关由审计 F11 引入并写进本地 gauntlet,而 CI 用的是不带它的 `-Wall -Wextra -Werror`,故 README 那一段(描述**提交前**门禁)应与本地 gauntlet 对齐而非与 CI 对齐。CHANGELOG 对 README「开发」段与卸载一节的引用均已保留
 
 ### Added
 
