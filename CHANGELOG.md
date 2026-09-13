@@ -13,6 +13,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **第七轮深度审计报告** — 新增 [docs/DEEP_AUDIT_2026-09-12.md](docs/DEEP_AUDIT_2026-09-12.md):覆盖代码质量与规范性、架构设计合理性、安全漏洞、性能瓶颈、依赖版本风险、错误处理与边界条件六个维度,每条结论给出可复现命令与实测输出,代码引用一律用**符号锚点**而非行号。报告含逐项处置收口与双向控制方法,并显式列出仍未由 CI 覆盖的盲区(macOS 版本下限;需真实安装后文件系统状态的自动更新用例)
 - **docs/ 审计文档合并** — 把分散的审计/修复记录(对抗审计三轮、P0-P3 批次、全方位深度审计、冒烟复核)合并为单一 [docs/AUDIT_HISTORY.md](docs/AUDIT_HISTORY.md):按轮次归并去重、统一体例;**已修项一律标注修复提交号**(提交号是不可变证据,不会过期),未修项只记「记录时未修」而不承诺现状,并显式标注「这是快照,不是现状」。原文从工作树删除但可由 git 历史完整取回。docs/ 由 8 份收敛为 3 份(3,001 → 1,095 行)
 - **自动更新体系** — 新增 `scripts/update-dsh.sh`(npm view 解析 dist-tag 真实版本 → 与本地实际版本比较 → pnpm 增量更新,失败回滚保持当前版本,绝不回退 npm);updater LaunchAgent(`com.dshpwa.updater`)每天凌晨 2:30 定时触发;daemon 激活时后台触发(12h 节流,延迟 10s 不阻塞启动);与 install.sh 共用 `.install.lock`(mkdir 原子锁 + pid 存活检测 + TOCTOU claim 防护);更新前活跃度探测(dsh 运行中跳过本轮,等用户不在场);update.log 超 2MB 自动轮转(保留 update.log.1);release 打包补齐 updater 组件(update-dsh.sh + updater plist);node 路径优先从 `RT_HOME/run.json` 解析(launchd 环境无用户 PATH),PATH 前置 node 所在目录
 - **Host 头校验(防 DNS rebinding)** — 所有请求(引导页/控制端点/透传)统一在最前面校验 Host 精确等于 `127.0.0.1:PORT`/`localhost:PORT`,否则 403;防止 evil.com 解析到 127.0.0.1 后以"同源"身份读 `/health` 窃取 dsh token
@@ -26,6 +27,24 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **深度审计 F1–F16 处置** — 报告见 [docs/DEEP_AUDIT_2026-09-12.md](docs/DEEP_AUDIT_2026-09-12.md)。用户可见的修复:
+  - **F1(唯一会让整条产品路径失效的问题)** — LaunchAgent plist 把「引导页内联的启动选项」原样写进 node 环境,其中 `--use-system-ca` 需要 Node ≥ 22.15,而安装脚本的最低版本检查**只比较 major**(22.0–22.14 全部通过),于是这些用户的 node **直接拒绝启动**(实测 rc=9,一行代码都没执行)⇒ PWA 永久白屏。改为**按能力探测**后再决定是否注入(与 `update-dsh.sh` 同一套探测),不支持时整行留空;并在子进程以 9 退出时把 `NODE_OPTIONS` 从后续启动中摘掉。
+  - **F5 卸载/重启不再留孤儿 dsh** — 守护原先没有 `SIGTERM` 处理,而 plist 声明了 `AbandonProcessGroup=true`(launchd 不清理进程组)、dsh 又由 `setsid()` 自成会话 ⇒ 退出时 dsh 必然成为孤儿,而它的 `node_modules` 随后被删,留下一个「还在跑但依赖已没了」的进程。现捕获 `SIGTERM`/`SIGINT`,先有界地优雅停止 dsh 再 `exit(0)`;README 卸载一节补 `pkill -f` 兜底(必须在 `rm -rf` 之前)。
+  - **F3 安装不再静默落一个坏路径** — 路径解析的兜底依赖 `python3`,而 macOS 12.3+ 不再自带;解析失败原先静默退化,现改为显式告警。
+  - **F15 plist 路径校验改为白名单** — 原先只黑 `|` 与 `&`(理由是 sed 语义),而 `<` `>` `"` 换行同样会产出非法 plist,launchd **静默不加载**。改为白名单(允许的可见 ASCII + 全部非 ASCII 字节,故含中文的路径不被误拒),控制字符单独挡。
+  - **F6 `cleanup-deps.sh` 删除面显式分级** — 把「确认安全」与「按名字猜」两类分开,后者在 `--dry-run` 里逐行打上风险标签,让 review 有明确着力点。
+  - **F14 热路径少一次回环连接** — `/health` 是引导页轮询最频繁的端点,而它只用内存状态、从不读「dsh 是否在监听」的结果;原先每次都要白付一次 TCP connect,现已挪到提前返回之后。
+  - **F11 / F16 规范与死代码** — 响应体媒体类型宏重构补完(原先只定义未使用,而 `-Wall -Wextra` **不报未使用宏**);`cleanup-deps.sh` 的 `du` 兜底移进命令替换内部(否则 `set -e` + `pipefail` 会让「下一行的兜底」永远不执行)。
+  - **F8 / F12 文档与实现对齐** — CHANGELOG 的「TOCTOU 已消除」改为「窗口收窄,非互斥」(与同文件另一处的「残余窗口」表述本就矛盾);`docs/TOOLS_INTEGRATION.md` 的体积阈值与统计、README 的 macOS 版本下限、`docs/AUTO_UPDATE_IMPLEMENTATION.md` 的过期页脚逐一对齐,并把「该下限未经 CI 验证」显式写明。
+- **门禁可信度整批加固** — 本轮审计最集中的一类问题是**门禁自身空转**:断言永不可能失败、断言匹配的是解释性注释而非实现、抽取失败被当成结构合规。逐项改为锚定实现,并配**双向控制**(每条新门禁都必须先在旧代码上变红):
+  - **F2** `install.sh` 的 SHA 校验断言原先把「解释为什么不用 `shasum -c`」的**注释**当成了实现;删掉实现只留注释,断言照样通过。改为切出真实实现块并用夹具驱动(哈希相符必须放行、不符必须中止、空清单必须 fail-closed)。
+  - **F7** 安全套件里若干断言的 `else` 分支是 `info` 而非 `fail` —— 即**永不可能失败**。
+  - **F4** 新增 LaunchAgent plist 门禁:渲染两份分支并用 `plutil -lint` 校验,补上「关键产物零门禁」这个 F1 的根因。
+  - **F9** 两套 shell 套件补断言数下界(原先只断言「没有红」,而「一条都没跑到」也满足它);CI 校验 bats 的实际执行数。
+  - **F10** 用 `extract_fn`(符号锚点 + 花括号配平,默认剥离注释)取代 `sed` 行范围抽取 —— 后者在函数体内出现列 0 的 `}` 时会**静默截断**,而 `grep -q` 恒假。
+  - **F13** `release.yml` 补 `-Werror`,与 `ci-enhanced.yml` 对齐(`workflow_dispatch` 是一条绕过路径)。
+  - **行号引用门禁由 `daemon.c` 专用推广到全仓库「路径:行号」** — 原先只认一种文件,而其余文件里的同类引用漂移方式完全相同却免疫。扫描面内的引用逐条**按内容**核对(只核「行号 ≤ 某行」不够)后改写为符号/原文锚点,并补**误报反控**(`主机:端口` 是广义正则最容易误伤的形状,一旦误报,门禁只会被逼着放宽到失明)。
+  - **断言数下界改为环境无关** — 下界原先是「在本机数出来的」,而其中含一条依赖 `shellcheck` 的能力相关断言;CI runner 没装 shellcheck ⇒ 计数少一 ⇒ **必然误红**,且报的是「有用例被静默跳过」这种指错方向的话。现把必需能力(真实 node)写成显式前置条件、可选能力按探测结果加回下界,并补「吞掉一条断言仍必须变红」的反空转控制。
 - **P0-P3 修复批次** — dsh 版本策略回退为跟随 `@latest`(`DSH_VERSION` 可覆盖);探测超时梯度调优(快速启动提速 ~50%,探测逻辑抽到 `tests/lib/daemon-helpers.sh`);dsh 崩溃自愈演进为非阻塞 `cooldown_until` 冷却(连续 3 次快速崩溃后 60s 冷却期内拒绝拉起,主循环照常服务引导页,不再 `sleep(60)` 卡住全部请求);release.yml 增加 pnpm-lock.yaml diff 检查
 - **本轮审计修复(自动更新链路)** — update-dsh.sh 从 `run.json` 解析 node 绝对路径(修复 launchd 环境无 PATH 导致更新静默失败)、PATH 前置 node 目录(npm/pnpm shebang `env node` 不再恒失败)、更新彻底失败时回滚恢复更新前依赖树、dsh 运行中(守护 `/health` 报 dsh:true)跳过本轮更新避免杀掉在用会话
 - **token 相关修复** — 守护重启 adopt 运行中 dsh 时补扫日志 token(修复 token 死循环导致的引导页 401);更新子进程退出误减活跃连接计数导致 WS 独占时误停 dsh 的竞态
