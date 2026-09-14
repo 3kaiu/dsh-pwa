@@ -54,7 +54,42 @@ plutil -p ~/Applications/deepseek.app/Contents/Info.plist | grep -A12 Manifest
 
 ## 已经装过的人怎么修
 
-图标在添加那一刻定格,**改 manifest 不会自动更新**。必须删掉重新添加:
+**顺序不能反:先升级包装器,再重加。** 只重加不升级,等于把同一份旧图标再烘一遍 —— 看起来像
+「改了没用」。
+
+### 第 0 步(最容易漏):确认包装器本身已是最新
+
+旧版守护会**自己应答** `/manifest.webmanifest` 与图标路径(那时它就是「自造 PWA 身份」的),
+于是装出来的 Web App 用的是**包装器那份**名称与图标。典型特征:名字 `DSH` + 深色底终端 `>_`
+图标,而不是官方的鲸鱼。**这不是图标缓存问题,是二进制问题:**
+
+```bash
+# 非 0 = 这份已装二进制仍在自造 PWA 身份(旧版)
+strings ~/.local/share/dsh-runtime/daemon | grep -c '/icon.svg'
+```
+
+包装器**不会自我更新**:`update-dsh.sh` 只更新 dsh(见 `launchd/com.dshpwa.updater.plist` 注释
+「职责单一:仅更新 dsh」);包装器自身的版本机制只把 `wrapper.latest` 写下来、由守护在 `/health`
+里比较并暴露 `wrapper_outdated` —— **只报告,不升级**。升级 = 重跑 `install.sh`。
+
+**但「重跑 `install.sh`」要先有新发行版才有效。** `curl | bash` 装的是
+`releases/latest/download/dsh-pwa.zip`,包里是**预编译 `daemon`**(install.sh 的「发行包预编译优先」
+分支),而撤掉自造身份那次只改了源码 —— 在发新 release 之前,重跑只会装回**同一份旧 daemon**。
+两条可行路径:
+
+- **发版**:推一个 tag → `release.yml` 重新编译 `daemon` 并打包。这也是让 `wrapper_outdated`
+  真正有意义的前提:已发布的 v0.3.3 那份二进制里**根本没有** `wrapper_version` 字段。
+- **源码安装(发版前的临时办法)**:仓库根没有预编译 `daemon`,`DAEMON_SRC` 会命中
+  `src/daemon.c` → 本地 clang 编译 HEAD。
+  ```bash
+  git clone https://github.com/3kaiu/dsh-pwa && cd dsh-pwa && bash scripts/install.sh
+  # 验证:应为 0
+  strings ~/.local/share/dsh-runtime/daemon | grep -c '/icon.svg'
+  ```
+
+### 第 1 步:删掉重新添加
+
+图标在添加那一刻定格,**改 manifest 不会自动更新**,必须删掉重新添加:
 
 ```bash
 # 1) 从程序坞右键「选项 → 从程序坞移除」,然后删除 Web App
@@ -75,6 +110,12 @@ killall Dock
 
 ## 已知缺口
 
+- **旧版用户收不到任何升级提醒。** 上一版二进制里根本没有 `wrapper_version` 字段
+  (`strings ~/.local/share/dsh-runtime/daemon | grep -c wrapper_version` = 0),所以「你该升级了」
+  这条信息只能靠 README 与发版说明传达,而读到 README 的人本来就不是需要被提醒的人。
+  要让提示真正到达用户,得让引导页把 `/health` 的 `wrapper_outdated` 显示出来 —— **刻意未做**,
+  因为引导页是「dsh 没起来时」的兜底,加一块升级提示会与它「尽快把用户送进 dsh」的职责相冲突。
+  记录在此,不假装覆盖。
 - **端到端门禁用的是桩上游,不是真实 dsh。** 有一条用例断言「守护**逐字转发**上游给的
   manifest 与 favicon」,足以证明守护不再插自己的内容(带反向断言:自造图标的视框一旦出现即失败)。
   但**上游内容的正确性**属于 dsh 自己的发布契约,不在本项目管辖内。
@@ -90,8 +131,10 @@ killall Dock
 
 ## 仍未验证的部分
 
-- Web App 的显示名。实测装出来的名字是 `deepseek`(小写),与官方 manifest 的 `short_name`
-  (`DSH`)对不上;推测是添加时该机器上的 manifest 处于某个未提交的中间态,但**未经确认**。
+- Web App 的显示名。本机装出来叫 `deepseek`(小写),与官方 manifest 的 `short_name`(`DSH`)
+  对不上;而另一台跑旧版包装器的机器上装出来叫 `DSH` —— 恰好等于**包装器那份** manifest 的
+  `short_name`。两点合起来支持「显示名与图标一样在添加那一刻定格、取自当时的 manifest」,
+  但本机的 `deepseek` 究竟取自哪一份(`name` 的首词?页面 `<title>`?)仍**未经确认**。
 - 官方 manifest 用 SVG 作 `icons`,而 Safari 对 SVG manifest 图标的接受度本次**未测出结论**。
   这一点已不再是本项目的取舍 —— 官方发什么就用什么,真出问题也是 dsh 侧的发布契约。
   记录在此只为说明:前面「已经装过的人怎么修」那节的重加步骤里,若重加后图标仍不对,

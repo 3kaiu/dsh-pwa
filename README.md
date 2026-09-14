@@ -90,8 +90,26 @@ tail -50 ~/.local/state/dsh-runtime/logs/update.log   # 自动更新成功/失�
 launchctl print "gui/$(id -u)/com.dshpwa.daemon"      # launchd 注册状态
 ```
 
-程序坞图标/名称不对？图标在「添加到程序坞」那一刻就烘进 app 包了，之后改 manifest 不会重绘：
-删掉 `~/Applications/deepseek.app` 再重新添加，必要时 `killall Dock`。
+程序坞图标/名称不对？**先确认包装器本身已是最新**，再看图标：
+
+```bash
+strings ~/.local/share/dsh-runtime/daemon | grep -c '/icon.svg'   # 非 0 = 旧版包装器仍在自造 PWA 身份
+```
+
+包装器**不会自我更新** —— 自动更新只覆盖 dsh，升级包装器要重跑 `install.sh`。旧版守护会自己
+应答 `/manifest.webmanifest` 与图标路径，于是你装出来的 Web App 是它那份名称与图标。**顺序不能反**：
+先升级、再重加，否则重加只会再烘进同一份旧图标。
+
+⚠️ `curl | bash` 装的是 `releases/latest` 里的**预编译 daemon**：**修复若还没发版，重跑不会有任何
+变化**（上游只改了源码时尤其容易误判）。发版前的临时办法是源码安装 —— 仓库根没有预编译 `daemon`，
+会本地编译 `src/daemon.c`：
+
+```bash
+git clone https://github.com/3kaiu/dsh-pwa && cd dsh-pwa && bash scripts/install.sh
+```
+
+包装器已是最新而图标仍不对，是因为图标在「添加到程序坞」那一刻就烘进 app 包了，之后改 manifest
+不会重绘：删掉 `~/Applications/deepseek.app` 再重新添加，必要时 `killall Dock`。
 成因、排查顺序与复现命令见 [docs/PWA_ICON_NOTES.md](docs/PWA_ICON_NOTES.md)。
 
 ## Uninstallation
