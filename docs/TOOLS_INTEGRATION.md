@@ -173,8 +173,8 @@ cat > .git/hooks/pre-commit <<'EOF'
 #!/bin/bash
 # 1. Shellcheck (如果已安装)
 command -v shellcheck >/dev/null && shellcheck scripts/*.sh tests/*.sh || true
-# 2. C 编译检查 (零警告)
-clang -O2 -Wall -Wextra -Werror -arch arm64 -arch x86_64 -o /tmp/daemon-precommit src/daemon.c || exit 1
+# 2. C 编译检查 (零警告;含 -Wunused-macros —— `-Wall -Wextra` 不报未使用宏,见审计 F11)
+clang -O2 -Wall -Wextra -Werror -Wunused-macros -arch arm64 -arch x86_64 -o /tmp/daemon-precommit src/daemon.c || exit 1
 # 3. 二进制体积检查 (>150KB 警告;阈值与 CI/单测保持一致,见 scripts/analyze-binary.sh)
 SIZE=$(stat -f%z /tmp/daemon-precommit)
 [ "$SIZE" -gt 153600 ] && echo "⚠️ 二进制超过 150KB: ${SIZE}B"
@@ -195,8 +195,8 @@ chmod +x .git/hooks/pre-commit
 # Bash 脚本检查
 shellcheck scripts/*.sh tests/*.sh
 
-# C 代码编译检查
-clang -O2 -Wall -Wextra -Werror \
+# C 代码编译检查(含 -Wunused-macros:与提交前门禁同口径)
+clang -O2 -Wall -Wextra -Werror -Wunused-macros \
   -arch arm64 -arch x86_64 \
   -o /tmp/daemon src/daemon.c
 ```
