@@ -90,7 +90,14 @@ tail -50 ~/.local/state/dsh-runtime/logs/update.log   # 自动更新成功/失�
 launchctl print "gui/$(id -u)/com.dshpwa.daemon"      # launchd 注册状态
 ```
 
-程序坞图标/名称不对？**先确认包装器本身已是最新**，再看图标：
+程序坞图标/名称不对？先跑诊断脚本 —— 只读、一次采齐判定所需的事实，`/health` 的 token 已脱敏，
+输出可直接贴出来问：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/3kaiu/dsh-pwa/main/scripts/pwa-doctor.sh | bash
+```
+
+它给出的结论里最要紧的一条是**包装器是不是旧版**（判据是二进制里的字符串，不是文件大小）：
 
 ```bash
 strings ~/.local/share/dsh-runtime/daemon | grep -c '/icon.svg'   # 非 0 = 旧版包装器仍在自造 PWA 身份

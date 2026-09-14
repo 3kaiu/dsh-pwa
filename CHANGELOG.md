@@ -16,6 +16,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`scripts/pwa-doctor.sh`** — PWA 身份诊断采集脚本:一条命令采齐判定「程序坞里的名称/图标为什么不对」所需的**全部事实** —— 已装守护是哪一版(按**二进制字符串**而非文件大小)、包装器版本文件、`/health`、经守护取到的 manifest 与三条图标路径的 http/type/size/sha256、官方产物对照、以及 app 包里**烘死**的 manifest 与 `icns`/`plist` 时间戳 —— 并直接给出三类结论(**旧版守护** / **新版但发非官方 manifest** / **已透传**)与对应修法。**只读**,`/health` 的 token 已脱敏,输出可直接贴出。存在的理由:这类症状的证据横跨三层,让报告者手工拼命令必然缺层,而**缺一层就会把「旧版包装器」误判成「图标缓存」**。配套门禁 `tests/unit/pwa-doctor.bats`:用桩服务器喂两种 manifest 断言**结论随之翻转**,并断言 token 不泄漏;已用变异体(去掉脱敏 / 打坏识别分支)复验两处都会变红
 - **`docs/PWA_ICON_NOTES.md`** — PWA 身份的记录:为什么以 dsh 官方 manifest 为准、图标在「添加到程序坞」那一刻定格(含 `sips` / `plutil` 的复现命令与时间戳错位证据)、程序坞图标不对时的**分层排查顺序**、用户侧修法的**前置条件**(先确认包装器本身已是最新:旧版守护会自己应答 PWA 身份路径,而 `curl | bash` 装的是 `releases/latest` 里的**预编译 daemon** ⇒ **修复未发版时重跑 `install.sh` 不会带来任何变化**;判据 `strings ~/.local/share/dsh-runtime/daemon | grep -c '/icon.svg'` 应为 0)、以及**刻意未做**的事(未就绪窗口内让守护另发一份官方 manifest —— 那会把官方内容复制一份进来)与仍未验证项(装出来的显示名:本机为 `deepseek`,而跑旧版包装器的机器为 `DSH`,推测与图标一样在添加那一刻定格,但未经确认)
 - **PWA 身份门禁** — `daemon-cases.bats` 新增四组用例:源码层面不得再出现自造的 manifest / 图标符号与对应路由分支(带反空转 —— 先证明抽取面读得到确实存在的符号,否则「不存在」恒真)、行为层面四条 PWA 资产路径在无上游时必须落到引导页而非被守护自己应答、引导页引用的 manifest 与图标必须是**官方路径**、以及**端到端逐字转发**(桩上游发一份形状与官方一致的 manifest,断言守护原样转发,并反向断言自造图标的视框不得出现)。同时把 CSP 覆盖门禁的 img-src 推导从「按文件名认 `icon.svg`」改为「按属性认 `rel="icon"` / `apple-touch-icon`」—— 按文件名推导时,模板把图标换成 `favicon.svg` 的那一刻门禁不会响,而那正是该门禁存在的意义。四组用例均以变异体复验过会变红
 - **第七轮深度审计报告** — 新增 [docs/DEEP_AUDIT_2026-09-12.md](docs/DEEP_AUDIT_2026-09-12.md):覆盖代码质量与规范性、架构设计合理性、安全漏洞、性能瓶颈、依赖版本风险、错误处理与边界条件六个维度,每条结论给出可复现命令与实测输出,代码引用一律用**符号锚点**而非行号。报告含逐项处置收口与双向控制方法,并显式列出仍未由 CI 覆盖的盲区(macOS 版本下限;需真实安装后文件系统状态的自动更新用例)
@@ -32,6 +33,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **bats 否定型断言的假红陷阱** — `cmd && fail "…"` 在断言**成立**(`cmd` 失败)时整体退出码为 1,而 bats 用 `set -e` 并检查用例退出码,于是**只要它是用例的最后一条语句,用例就会因为「断言成立」而变红**。写 `pwa-doctor.bats` 时即踩到,用一组一次性实验确认了 bats 的实际语义后,新门禁统一改用 `if …; then fail "…"; fi`(退出码恒为 0,任何位置都成立);`cleanup-deps.bats` 里三处同形状当时安全但**依赖「后面还有语句」**,一并改为同一写法
 - **程序坞图标/名称不再由包装器接管** — 包装器曾自造一份 manifest 与一套图标,与 dsh 官方资产并存。实测发现:图标在「添加到程序坞」**那一刻**被 Safari 烘进 app 包,且此后**不再重绘** —— 证据是 `ApplicationIcon.icns` 的 mtime 停在添加时刻,而同一 app 包 `Info.plist` 里的 `Manifest` 会被后续启动刷新,两者实测可差数天。于是「官方图标」与「包装器图标」谁生效,取决于 Safari 的取用时机,而用户只能靠删掉重加来更正:一次**不可逆**的取用。现改为一律透传官方 manifest 与 `/favicon.svg`,包装器不再定义 PWA 身份。分层排查顺序(官方资产是否正常 → 守护是否真在透传 → app 包里烘的是哪一份)与用户侧修法见 [docs/PWA_ICON_NOTES.md](docs/PWA_ICON_NOTES.md)
 - **深度审计 F1–F16 处置** — 报告见 [docs/DEEP_AUDIT_2026-09-12.md](docs/DEEP_AUDIT_2026-09-12.md)。用户可见的修复:
   - **F1(唯一会让整条产品路径失效的问题)** — LaunchAgent plist 把「引导页内联的启动选项」原样写进 node 环境,其中 `--use-system-ca` 需要 Node ≥ 22.15,而安装脚本的最低版本检查**只比较 major**(22.0–22.14 全部通过),于是这些用户的 node **直接拒绝启动**(实测 rc=9,一行代码都没执行)⇒ PWA 永久白屏。改为**按能力探测**后再决定是否注入(与 `update-dsh.sh` 同一套探测),不支持时整行留空;并在子进程以 9 退出时把 `NODE_OPTIONS` 从后续启动中摘掉。

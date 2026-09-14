@@ -87,7 +87,11 @@ GONE=(
     printf '%s' "$output" | grep -qF "$p" || fail "dry-run 漏掉了应删项: $p"
   done
   for p in "${KEPT[@]}"; do
-    printf '%s' "$output" | grep -qF "$p" && fail "dry-run 选中了不该删的: $p"
+    # 用 `if …; then fail; fi` 而不是 `… && fail`:后者在断言**通过**时整体退出码为 1,
+    # 只要它成为用例的最后一条语句就会假红。此处虽后面还有语句、暂时安全,但不该留这种位置依赖。
+    if printf '%s' "$output" | grep -qF "$p"; then
+      fail "dry-run 选中了不该删的: $p"
+    fi
   done
   # dry-run 不得触碰文件系统
   [ -e "$F/node_modules/pkg/a.js.map" ] || fail "dry-run 竟然删了文件"
@@ -100,7 +104,9 @@ GONE=(
   [ "$status" -eq 0 ] || fail "退出码 $status: $output"
 
   for p in "${GONE[@]}"; do
-    [ -e "$F/node_modules/$p" ] && fail "应删未删: $p"
+    if [ -e "$F/node_modules/$p" ]; then
+      fail "应删未删: $p"
+    fi
   done
   for p in "${KEPT[@]}"; do
     [ -e "$F/node_modules/$p" ] || fail "误删(必须存活): $p"
@@ -115,7 +121,9 @@ GONE=(
   printf 'x' > "$F/node_modules/pkg/index.js"
   run bash "$ROOT/scripts/cleanup-deps.sh" --dry-run "$F"
   [ "$status" -eq 0 ]
-  printf '%s' "$output" | grep -q '将删除' && fail "空树上 dry-run 报告了删除项"
+  if printf '%s' "$output" | grep -q '将删除'; then
+    fail "空树上 dry-run 报告了删除项"
+  fi
   [ -e "$F/node_modules/pkg/index.js" ] || fail "空树上的 dry-run 动了文件"
   true
 }
