@@ -30,7 +30,11 @@ teardown() {
 }
 
 @test "daemon.c compiles with zero warnings" {
-  run clang -O2 -Wall -Wextra -Werror \
+  # -Wunused-macros 不可省:`-Wall -Wextra` **不报未使用宏**,半截重构会留下「编译全绿的死代码」
+  # (审计 F11)。它此前只写在本地 gauntlet 与文档里,即 CI 对这类缺陷**完全不设防** ——
+  # 而本用例的名字恰恰是「零告警」。已用负控验证:给 daemon.c 追加一个未使用的宏,本用例必须 FAIL
+  # (不带该开关时同一变异体 PASS,正是 F11 的盲区)。
+  run clang -O2 -Wall -Wextra -Werror -Wunused-macros \
     -arch arm64 -arch x86_64 \
     -o /tmp/daemon-test "$ROOT/src/daemon.c"
   ST="$status"
@@ -53,7 +57,9 @@ teardown() {
 
 @test "daemon binary size within limit (<150KB)" {
   # 阈值与 tests/security-verification.sh 的 150000 字节保持一致;
-  # universal 双架构 + 内嵌引导页的当前体积约 117KB(旧 90KB 断言已过期)
+  # universal 双架构 + 内嵌引导页的当前体积约 121KB(未内嵌任何额外资产)。
+  # 前车之鉴:内嵌字符串的二进制开销约为其 base64 长度的 2.8 倍(实测 120200 → 136664,
+  # base64 5876),故加内嵌资产前先按这个倍率估,别按源码字符数算。
   clang -O2 -arch arm64 -arch x86_64 \
     -o /tmp/daemon-size-test "$ROOT/src/daemon.c"
   SIZE=$(stat -f%z /tmp/daemon-size-test 2>/dev/null || stat -c%s /tmp/daemon-size-test)
@@ -364,7 +370,7 @@ detect_doc_counts() {
   fi
 
   for f in "$ROOT/README.md" "$ROOT/CHANGELOG.md" "$ROOT/docs/TOOLS_INTEGRATION.md" \
-           "$ROOT/docs/AUTO_UPDATE_IMPLEMENTATION.md"; do
+           "$ROOT/docs/AUTO_UPDATE_IMPLEMENTATION.md" "$ROOT/docs/PWA_ICON_NOTES.md"; do
     [ -f "$f" ] || { echo "活文档缺失(锚点漂移?): $f" >&2; return 1; }
     hits="$(detect_doc_counts "$f")"
     if [ -n "$hits" ]; then

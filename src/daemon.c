@@ -11,8 +11,8 @@
 //   POST /stop                 → 停止 dsh(进程组 SIGTERM → 超时 SIGKILL)
 //   POST /ping                 → 在场心跳(引导页每 10s 一次,续租 IDLE_STOP)
 //   POST /goodbye              → 页面关闭信标(pagehide sendBeacon),GOODBYE_GRACE 后快停
-//   GET  /manifest.webmanifest → PWA 安装描述(id/scope/start_url 均指向本守护端口,绝不指向 dsh 内部端口)
-//   GET  /icon.svg              → 引导阶段应用图标(就绪后透传 dsh 自带资源)
+//   (PWA 身份**不在此列**:/manifest.webmanifest、/favicon.svg 等一律透传 dsh 官方资产,
+//    守护不自造一份 —— 理由见 handle_conn() 里「PWA 身份」段的注释)
 // 生命周期(懒启动默认):
 //   登录只驻留守护(~1MB);点 PWA 图标 → GET / 自动拉起 dsh → 引导页就绪后 reload 进 dsh。
 //   dsh 的 WebSocket 长连接穿过守护透传(存活即 active>0,天然续租);关闭页面 → 连接归零,
@@ -631,11 +631,18 @@ static void refresh_port(void) { dsh_port = read_state_port(); }
 // ---------- 引导页(任意路径在 dsh 未运行时都会得到它) ----------
 // 模板拆成占位符前后两段:中间由 build_boot() 填入 HTML 转义后的 LOG_DIR。
 // (旧实现把 __LOG_DIR__ 嵌在单一 TPL 里手写扫描 "__" 前缀,逻辑复杂且对未知 "__" 处理含糊)
+// 引导页声明的 manifest / icon 都指向**官方路径**,与 dsh 自己的 index.html 一致 —— 包装器
+// 不定义 PWA 身份(见 handle_conn() 的「PWA 身份」段),只保证「无论 dsh 是否就绪,页面都在」。
+// 故这里引用官方资产,而不是自带一份:两份图标一旦不同步,用户实际看到哪一份取决于 Safari
+// 的取用时机,而图标在「添加到程序坞」那一刻就烘进 app 包,事后无法自行更正。
+// 注意:本模板区域会被「CSP 覆盖引导页真实需求」门禁**文本抽取**后推导需求,故区域内的
+// 说明性注释同样参与推导 —— 想解释什么,写在这个注释块里(区域外),别写进字符串之间,
+// 否则注释本身就能满足门禁,真删掉那条 <link> 也照样绿(「探针污染被测面」)。
 static const char TPL_HEAD[] =
   "<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
   "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
   "<link rel=\"manifest\" href=\"/manifest.webmanifest\">"
-  "<link rel=\"icon\" href=\"/icon.svg\" type=\"image/svg+xml\">"
+  "<link rel=\"icon\" type=\"image/svg+xml\" href=\"/favicon.svg\">"
   "<meta name=\"theme-color\" content=\"#0B0E14\"><title>DeepSeek Harness</title><style>"
   ":root{color-scheme:dark}*{margin:0;padding:0;box-sizing:border-box}html,body{height:100%}"
   "body{background:#0B0E14;color:#E8EAED;font:14px/1.6 -apple-system,BlinkMacSystemFont,\"PingFang SC\",sans-serif;"
@@ -738,13 +745,16 @@ static int write_all(int fd, const char *b, size_t n);
 #define CT_HTML     "text/html; charset=utf-8"
 #define CT_PLAIN    "text/plain; charset=utf-8"
 #define CT_JSON     "application/json"
-#define CT_MANIFEST "application/manifest+json"
-#define CT_SVG      "image/svg+xml"
 #define SEC_HEADERS \
   "X-Content-Type-Options: nosniff\r\n" \
   "Content-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; " \
   "style-src 'unsafe-inline'; connect-src 'self'; img-src 'self'; " \
   "manifest-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n"
+// 响应出口的**唯一**实现。头部构造与截断防护只此一份 —— 出口若分成多条,安全头会先分叉,
+// 而分叉没有行为症状。
+// 只发文本:守护不再自造任何二进制响应(PWA 图标已改为透传 dsh 官方资产,见「PWA 身份」段),
+// 故长度一律可由 strlen 得出。若将来又要发二进制,必须**另开一条按显式长度写出**的出口 ——
+// 含 NUL 的字节流用 strlen 度量会静默截断成半截文件。
 static void respond(int c, int code, const char *ct, const char *body) {
   // E6b:ct 现在是 CT_* 宏(编译期常量),但签名收的是 const char* —— 一旦将来传入
   // 运行期拼接的、含 CR/LF 的值即成响应头注入(可伪造额外响应头甚至提前结束头部)。
@@ -862,17 +872,6 @@ static void respond_health(int c) {
              ready ? "true" : "false", ready ? dsh_port : 0, pid);
   respond(c, 200, CT_JSON, body);
 }
-
-static const char MANIFEST[] =
-  "{\"name\":\"DeepSeek Harness\",\"short_name\":\"DSH\",\"id\":\"/\",\"scope\":\"/\","
-  "\"start_url\":\"/\",\"display\":\"standalone\",\"background_color\":\"#0B0E14\",\"theme_color\":\"#0B0E14\","
-  "\"icons\":[{\"src\":\"/icon.svg\",\"sizes\":\"any\",\"type\":\"image/svg+xml\"}]}";
-// 引导阶段应用图标(深色圆角 + 终端 glyph,守护自有资产;就绪后透传 dsh 自带 manifest/图标)
-static const char ICON_SVG[] =
-  "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 64 64\"><rect width=\"64\" height=\"64\" rx=\"14\" fill=\"#0B0E14\"/>"
-  "<rect x=\"1.5\" y=\"1.5\" width=\"61\" height=\"61\" rx=\"12.5\" fill=\"none\" stroke=\"#4D6BFE\" stroke-opacity=\".4\" stroke-width=\"2\"/>"
-  "<path d=\"M18 21l11 11-11 11\" fill=\"none\" stroke=\"#4D6BFE\" stroke-width=\"5.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>"
-  "<line x1=\"31\" y1=\"45\" x2=\"47\" y2=\"45\" stroke=\"#E8EAED\" stroke-width=\"5.5\" stroke-linecap=\"round\"/></svg>";
 
 // ---------- 透传 ----------
 // 返回 0 = 全部写出; -1 = 写失败或对端长时间不可写(已放弃)。
@@ -1180,11 +1179,16 @@ static void handle_conn(int c) {
     respond(c, 200, CT_JSON, "{\"ok\":true}");
     return;
   }
-  // ---- PWA 资产:守护永远自己应答,不透传 ----
-  // dsh 的 manifest(display/fullscreen、start_url 解析依其内部地址)会让「添加到程序坞」
-  // 生成的 PWA 绑定到错误行为;PWA 的安装身份必须始终由守护定义。
-  if (strcmp(path, "/manifest.webmanifest") == 0) { respond(c, 200, CT_MANIFEST, MANIFEST); return; }
-  if (strcmp(path, "/icon.svg") == 0) { respond(c, 200, CT_SVG, ICON_SVG); return; }
+  // ---- PWA 身份:**透传 dsh 官方资产**,守护不自造 ----
+  // 这里曾经拦下 /manifest.webmanifest 与图标、由守护自己发一份,理由是「dsh 的 manifest
+  // 会把 PWA 绑到它自己的内部端口」。该理由**不成立**:官方 manifest 的 id / start_url /
+  // scope 全是 origin 相对路径("/"),经透传自然绑定到本守护端口 —— dsh 的内部端口从不出现在
+  // manifest 里。而自造一份的代价是实打实的:图标在「添加到程序坞」那一刻被 Safari 烘进 app
+  // 包且**此后不再重绘**,于是「官方图标」与「包装器图标」谁生效取决于 Safari 的取用时机,
+  // 用户只能靠删掉重加来更正。故 PWA 的名称、图标、display 一律以 dsh 官方为准。
+  // 未就绪时这些路径会落到下面的引导页分支 —— 与其它非导航路径同待遇,且**自愈**:reload 进
+  // dsh 后会重新取一次。安装身份只在「添加到程序坞」那一刻被真正读取,而那时 dsh 必然已在
+  // 服务(用户正看着它的界面)。取舍与排查方法见 docs/PWA_ICON_NOTES.md。
 
   // ---- 未就绪(未启动 / 启动中尚不能服务 HTTP):引导页,绝不透传 → 根治 PWA 空白 ----
   if (!up || !dsh_ready()) {

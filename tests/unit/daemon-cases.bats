@@ -124,12 +124,55 @@ teardown() {
   assert_body_match '"dsh":false'
 }
 
-@test "GET /manifest.webmanifest serves daemon manifest without dsh" {
+@test "daemon does not author a PWA manifest or icon of its own" {
+  # PWA 身份以 dsh 官方 manifest 为准,守护只透传(见 docs/PWA_ICON_NOTES.md)。一旦有人加回
+  # 自造的 manifest / 图标,用户程序坞里就会变成一次**不可逆**的取用 —— 图标在「添加到程序坞」
+  # 那一刻被烘进 app 包且此后不再重绘,只能靠删掉重加来更正。故必须在源头挡。
+  # 为什么不只断言「某个路径没被自己应答」:透传分支根本没走到时它也会通过(空转门禁)。
+  # 故这里直接锚定**符号与路由**本身。
+  local src="$DSH_DAEMON_SRC" sym route
+  [ -f "$src" ] || { echo "守护源码不存在: $src" >&2; return 1; }
+  # 反空转(正):先证明抽取面是对的 —— 读得到确实存在的符号,否则下面的「不存在」恒真。
+  grep -q 'BOOT_PAGE' "$src" \
+    || { echo "抽取面异常:未读到 BOOT_PAGE,锚点漂移? ($src)" >&2; return 1; }
+  for sym in 'MANIFEST\[\]' 'ICON_SVG\[\]' 'ICON_PNG_B64\[\]'; do
+    if grep -qE "static const char $sym" "$src"; then
+      echo "  守护不应再自造 PWA 身份,却仍定义了 $sym" >&2
+      return 1
+    fi
+  done
+  for route in '/manifest\.webmanifest' '/favicon\.svg' '/icon\.svg' '/icon\.png'; do
+    if grep -qE "strcmp\(path, \"$route\"\)" "$src"; then
+      echo "  守护不应再拦截 PWA 资产路径,却仍有 $route 的路由分支" >&2
+      return 1
+    fi
+  done
+}
+
+@test "PWA asset paths are not intercepted (no upstream => boot page)" {
+  # 行为面复验上一条:没有上游时,这些路径应落到「未就绪 → 引导页」分支,而不是被守护拦下来
+  # 自己发一份 manifest / 图标。若有人加回拦截,这里立刻变红。
   start_daemon_env '{"node":"/nonexistent/dsh-unit-node","dsh":"/nonexistent/dsh-unit-dsh"}'
-  run curl -s "http://127.0.0.1:$PORT/manifest.webmanifest"
+  local p
+  for p in /manifest.webmanifest /favicon.svg /icon.svg /icon.png; do
+    run curl -s -D - --max-time 2 --noproxy '*' "http://127.0.0.1:$PORT$p"
+    [ "$status" -eq 0 ] || { echo "  $p: curl 失败 rc=$status" >&2; return 1; }
+    if ! printf '%s' "$output" | grep -qi '^Content-Type: text/html'; then
+      echo "  $p 被守护自己应答了(期望落到引导页):" >&2
+      printf '%s\n' "$output" | head -6 >&2
+      return 1
+    fi
+  done
+}
+
+@test "boot page points at the official manifest and favicon paths" {
+  # 引导页是包装器自己的 HTML,是本项目唯一可能把 PWA 身份写错的地方:它必须引用**官方路径**,
+  # 而不是自带一份资产 —— 自带就会出现两份图标,而谁生效取决于 Safari 的取用时机。
+  start_daemon_env '{"node":"/nonexistent/dsh-unit-node","dsh":"/nonexistent/dsh-unit-dsh"}'
+  run curl -s "http://127.0.0.1:$PORT/"
   [ "$status" -eq 0 ]
-  assert_body_match '"start_url":"/"'
-  assert_body_match '"display":"standalone"'
+  assert_body_match 'rel="manifest" href="/manifest.webmanifest"'
+  assert_body_match 'rel="icon" type="image/svg+xml" href="/favicon.svg"'
 }
 
 @test "GET / serves bootstrap page without dsh installed" {
@@ -828,6 +871,79 @@ PY
     "http://127.0.0.1:$PORT/api/x"
   [ "${lines[1]}" = "200" ] || { echo "  正确 Origin 的透传应 200,得到 ${lines[1]}" >&2; return 1; }
   assert_body_match '^apibod'
+}
+
+@test "PWA identity assets are relayed verbatim from upstream, not re-authored" {
+  # 「PWA 身份以官方为准」这条设计的**端到端**验证:守护必须把上游的 manifest 与 favicon
+  # 原样转发,而不是插自己的内容。上游桩发的是一份**形状与官方一致**的 manifest —— 关键在于
+  # 它的 id / start_url / scope 都是 origin 相对路径,透传后自然绑定守护端口,这正是「无需
+  # 自造」的依据(见 docs/PWA_ICON_NOTES.md)。
+  # display 特意取 fullscreen:守护过去自造的那份写的是 standalone,故这一条能直接区分
+  # 「透传到了上游」与「被守护换成了自己那份」。
+  PY="$(command -v python3 || true)"
+  [ -n "$PY" ] || { echo "  python3 不可用" >&2; return 1; }
+  cat > "$BATS_TEST_TMPDIR/fake-dsh-pwa.py" <<'PY'
+#!/usr/bin/env python3
+import os, socket, sys
+args = sys.argv
+port = 0
+for i in range(len(args) - 1):
+    if args[i] == "--port":
+        port = int(args[i + 1])
+sys.stdout.write("dsh web: http://127.0.0.1:%d/?token=pwaT0ken\n" % port)
+sys.stdout.flush()
+MANIFEST = (b'{"id":"/","name":"DeepSeek Harness","short_name":"DSH","start_url":"/",'
+            b'"scope":"/","display":"fullscreen","icons":[{"src":"/favicon.svg",'
+            b'"sizes":"any","type":"image/svg+xml","purpose":"any"}]}')
+FAVICON = b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 50 50"><path d="M1 2"/></svg>'
+ppid = os.getppid()
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port))
+s.listen(16)
+s.settimeout(1.0)
+while True:
+    if os.getppid() != ppid:
+        break
+    try:
+        c, _ = s.accept()
+    except socket.timeout:
+        continue
+    except OSError:
+        break
+    try:
+        req = c.recv(4096)
+        if b"/manifest.webmanifest" in req:
+            body = MANIFEST
+        elif b"/favicon.svg" in req:
+            body = FAVICON
+        else:
+            body = b"root"
+        c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(body) + body)
+    except OSError:
+        pass
+    c.close()
+PY
+  start_daemon_env "{\"node\":\"$PY\",\"dsh\":\"$BATS_TEST_TMPDIR/fake-dsh-pwa.py\"}"
+  run curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H "Origin: http://127.0.0.1:$PORT" "http://127.0.0.1:$PORT/wake"
+  assert_status "200"
+  daemon_wait_health "$PORT" true 5 || { echo "  伪 dsh 未就绪(日志见 $TMP_ENV/daemon.log)" >&2; return 1; }
+
+  run curl -s --max-time 3 --noproxy '*' "http://127.0.0.1:$PORT/manifest.webmanifest"
+  [ "$status" -eq 0 ] || { echo "  manifest 透传失败 rc=$status" >&2; return 1; }
+  assert_body_match '"display":"fullscreen"'
+  assert_body_match '"start_url":"/"'
+  assert_body_match '"src":"/favicon.svg"'
+
+  run curl -s --max-time 3 --noproxy '*' "http://127.0.0.1:$PORT/favicon.svg"
+  [ "$status" -eq 0 ] || { echo "  favicon 透传失败 rc=$status" >&2; return 1; }
+  assert_body_match 'viewBox="0 0 50 50"'
+  # 反向:守护过去自带的图标用的是 64 视框。它若出现,说明这条路径又被拦下来自己答了。
+  if printf '%s' "$output" | grep -q 'viewBox="0 0 64 64"'; then
+    echo "  /favicon.svg 被守护自带的图标替换了(上游那份未透传): $output" >&2
+    return 1
+  fi
 }
 
 # ---- Host 矩阵(host_ok):localhost 放行 / 无 Host 拒绝 / 前缀绕过拒绝 ----
@@ -1634,7 +1750,10 @@ tpl_needs() {
   printf '%s' "$t" | grep -qE '<script[^>]*src='     && n="$n script-src+self"
   printf '%s' "$t" | grep -qE 'rel=.stylesheet.'     && n="$n style-src+self"
   printf '%s' "$t" | grep -qE 'fetch\(|sendBeacon'   && n="$n connect-src+self"
-  printf '%s' "$t" | grep -q 'icon\.svg'             && n="$n img-src+self"
+  # img-src:任何 <link rel="icon"> / rel="apple-touch-icon"> 都要 img-src。刻意按**属性**推导
+  # 而不是按文件名(icon.svg)—— 按文件名推导时,模板把图标换成 favicon.svg 的那一刻门禁
+  # 不会响,而那正是本门禁存在的意义(模板加了新资源类型却忘了 CSP)。
+  printf '%s' "$t" | grep -qE 'rel="(icon|apple-touch-icon)"' && n="$n img-src+self"
   printf '%s' "$t" | grep -q 'manifest\.webmanifest' && n="$n manifest-src+self"
   printf '%s' "$n"
 }
@@ -1724,6 +1843,20 @@ tpl_needs() {
   # (误报和漏报同样是缺陷 —— 它会逼人放宽门禁,见技能里「false positive 与 miss 同类」)。
   printf '%s' "$needs" | grep -qE 'manifest-src|img-src|connect-src' \
     && { echo "  误报未出现的资源类型:[$needs]" >&2; return 1; }
+
+  # (d) rel="icon" 与 apple-touch-icon:同属 img-src 的两种来源,都必须推出。前者是引导页
+  #     当前使用的形态(favicon.svg),后者是 Safari 的回落档 —— 按文件名推导会漏掉「换名」,
+  #     按属性推导则两者都覆盖。
+  #     放在反向控制**之后**是有意的 —— 上面那条断言依赖 (c) 的 $needs,先赋值会把
+  #     反向控制变成对 (d) 的检查,而 (d) 本就该含 img-src,门禁会自相矛盾。
+  printf '%s\n' '<link rel="icon" href="/favicon.svg">' > "$probe"
+  needs="$(tpl_needs "$probe")"
+  printf '%s' "$needs" | grep -q 'img-src+self' \
+    || { echo "  未推出 img-src+self(rel=icon):[$needs]" >&2; return 1; }
+  printf '%s\n' '<link rel="apple-touch-icon" href="/apple-touch-icon.png">' > "$probe"
+  needs="$(tpl_needs "$probe")"
+  printf '%s' "$needs" | grep -q 'img-src+self' \
+    || { echo "  未推出 img-src+self(apple-touch-icon):[$needs]" >&2; return 1; }
   return 0
 }
 

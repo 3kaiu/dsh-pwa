@@ -9,7 +9,7 @@ macOS 上一键安装 [DeepSeek Harness](https://www.npmjs.com/package/@deepseek
 - **零常驻** — 空闲时不留任何进程，不占内存
 - **一键安装** — `curl | bash`，自动下载 Node.js、安装 dsh、注册 LaunchAgent
 - **自动更新** — 后台检查（12h 节流），用户不在场时更新，失败自动回滚
-- **PWA 体验** — Safari「添加到程序坞」即得全屏 Web App，支持通知与离线缓存
+- **PWA 体验** — Safari「添加到程序坞」即得 Web App：名称、图标、显示模式全部沿用 dsh 官方的 manifest，包装器不自造
 - **安全默认** — CSRF/Host 校验、0700/0600 权限、仅监听 127.0.0.1
 - **免本地编译** — 发行包为 arm64 + x86_64 双架构二进制
 
@@ -90,6 +90,10 @@ tail -50 ~/.local/state/dsh-runtime/logs/update.log   # 自动更新成功/失�
 launchctl print "gui/$(id -u)/com.dshpwa.daemon"      # launchd 注册状态
 ```
 
+程序坞图标/名称不对？图标在「添加到程序坞」那一刻就烘进 app 包了，之后改 manifest 不会重绘：
+删掉 `~/Applications/deepseek.app` 再重新添加，必要时 `killall Dock`。
+成因、排查顺序与复现命令见 [docs/PWA_ICON_NOTES.md](docs/PWA_ICON_NOTES.md)。
+
 ## Uninstallation
 
 ```bash
@@ -126,6 +130,10 @@ bats tests/unit/
 ```
 
 提交信息用 Conventional Commits，subject 用中文。开发工具链与详细指引见 [docs/TOOLS_INTEGRATION.md](docs/TOOLS_INTEGRATION.md)。
+
+PWA 的名称、图标与显示模式一律来自 dsh 官方的 manifest，守护只透传、不自造 —— 若在守护里
+再加一份自造的 manifest / 图标，用户程序坞里就会变成一次不可逆的取用（图标烘进 app 包后不会
+重绘，只能删掉重加）。相关取舍与排查见 [docs/PWA_ICON_NOTES.md](docs/PWA_ICON_NOTES.md)。
 
 本地若出现**未被跟踪**的 `.workbuddy-ai/`，那是开发笔记，已列入 `.gitignore`，克隆后不存在是正常的。
 
