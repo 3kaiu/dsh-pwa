@@ -130,7 +130,11 @@ DAEMON_PID="$(daemon_start_foreground "$RT_HOME/daemon" "$SMOKE_ROOT/daemon.log"
 daemon_wait_health "$SMOKE_PORT" any 5 || fail "daemon 未就绪"
 # GET / 返回引导页,同时已自动拉起 dsh(无需引导页 JS 的 /wake 往返)
 curl -fsS --max-time 5 --noproxy '*' "http://127.0.0.1:$SMOKE_PORT/" | grep -q "DeepSeek Harness" || fail "引导页异常"
-curl -fsS --max-time 5 --noproxy '*' "http://127.0.0.1:$SMOKE_PORT/manifest.webmanifest" | grep -q '"display"' || fail "manifest 异常"
+# PWA 资产不由守护自造:未就绪时 manifest 路径与其它非导航路径同待遇 → 回引导页。
+# 断言用 `<!DOCTYPE html>` 而**不是页面文案** —— 官方 manifest 的 name 也叫
+# "DeepSeek Harness",按文案判会同时匹配「引导页」与「官方 manifest」两种情形,等于没测。
+curl -fsS --max-time 5 --noproxy '*' "http://127.0.0.1:$SMOKE_PORT/manifest.webmanifest" | grep -q '<!DOCTYPE html>' \
+  || fail "未就绪时 manifest 路径应回引导页(守护不应自造 manifest)"
 # /health 报"就绪"(能服务 HTTP)而非"进程活着":启动窗口内必须为 false,
 # 引导页才不会过早切换(即 PWA 点开空白的根因)
 # 断言取 body:curl 失败时 body 为空 → 下面 grep 失败并打印空值,报错依然可读
@@ -162,9 +166,20 @@ if [ -n "$TOKEN" ]; then
   [ "$no_cookie" = "200" ] || fail "无 cookie 的 GET / 返回 $no_cookie(应为引导页 200,PWA 冷启动会 401)"
   curl -fsS --max-time 5 --noproxy '*' "http://127.0.0.1:$SMOKE_PORT/" | grep -q "DeepSeek Harness" \
     || fail "无 cookie 的 GET / 应返回引导页(供 PWA 完成 token 握手)"
-  # 就绪后 manifest 也必须是守护自己的(PWA 安装身份不得绑定 dsh 内部端口)
-  curl -fsS --max-time 5 --noproxy '*' "http://127.0.0.1:$SMOKE_PORT/manifest.webmanifest" | grep -q '"start_url":"/"' \
-    || fail "就绪后 manifest 未由守护应答(PWA 会绑到 dsh 行为)"
+  # 就绪后 manifest 必须是**透传的 dsh 官方那份**(守护不再自造身份,见 docs/PWA_ICON_NOTES.md)。
+  # 判据:官方 icons 指向它自己的 /favicon.svg —— 本项目自造的 manifest 从不引用这个文件,
+  # 故它出现即证明走的是上游。只认 token,不匹配缩进(上游可能改成紧凑格式)。
+  MANIFEST_BODY="$(curl -fsS --max-time 5 --noproxy '*' "http://127.0.0.1:$SMOKE_PORT/manifest.webmanifest" || true)"
+  printf '%s' "$MANIFEST_BODY" | grep -q 'favicon\.svg' \
+    || fail "就绪后 manifest 未透传 dsh 官方那份(缺官方图标 /favicon.svg): $MANIFEST_BODY"
+  printf '%s' "$MANIFEST_BODY" | grep -q '"start_url"' \
+    || fail "就绪后 manifest 缺少 start_url(安装身份不完整): $MANIFEST_BODY"
+  # 反证:守护过去自造的那份写的是 display:standalone。它若重新出现,说明拦截又回来了。
+  # 这条**有意绑定 dsh 当前的 display 取值** —— 上游改值时要同步改这里;有耦合的反证
+  # 仍好过没有反证(「必须没有」的断言不配反证,在修复前也会通过)。
+  if printf '%s' "$MANIFEST_BODY" | grep -q 'standalone'; then
+    fail "manifest 疑似守护自造(display:standalone),官方资产未被透传"
+  fi
   # 握手必须真的透传到 dsh 换取会话:只断言 200 测不出 F1 类死循环 bug(引导页也是 200),
   # 必须断言响应携带 Set-Cookie: dsh-auth(dsh 0.1.5+ 的持久会话 cookie)
   curl -fsS --max-time 5 --noproxy '*' -o /dev/null -D "$SMOKE_ROOT/handshake.headers" -c "$SMOKE_ROOT/cookies.txt" \
